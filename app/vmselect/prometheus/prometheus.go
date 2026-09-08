@@ -416,6 +416,7 @@ func exportHandler(qt *querytracer.Tracer, w http.ResponseWriter, cp *commonPara
 
 	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxExportSeries)
 	w.Header().Set("Content-Type", contentType)
+	sq.DownsampleField = cp.downsampleField
 
 	doneCh := make(chan error, 1)
 	if !reduceMemUsage {
@@ -765,10 +766,14 @@ var seriesDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/
 // See https://prometheus.io/docs/prometheus/latest/querying/api/#instant-queries
 func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	defer queryDuration.UpdateDuration(startTime)
+	field, err := getDownsampleQueryField(r)
+	if err != nil {
+		return err
+	}
 
 	ct := startTime.UnixNano() / 1e6
 	deadline := searchutil.GetDeadlineForQuery(r, startTime)
-	mayCache := !httputil.GetBool(r, "nocache")
+	mayCache := field == nil && !httputil.GetBool(r, "nocache")
 	query := r.FormValue("query")
 	if len(query) == 0 {
 		return httpserver.InvalidParamError(fmt.Errorf("missing `query` arg"))
@@ -819,10 +824,11 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 		filterss := searchutil.JoinTagFilterss(tagFilterss, etfs)
 
 		cp := &commonParams{
-			deadline: deadline,
-			start:    start,
-			end:      end,
-			filterss: filterss,
+			deadline:        deadline,
+			start:           start,
+			end:             end,
+			filterss:        filterss,
+			downsampleField: field,
 		}
 		if err := exportHandler(qt, w, cp, "promapi", 0, false); err != nil {
 			return fmt.Errorf("error when exporting data for query=%q on the time range (start=%d, end=%d): %w", childQuery, start, end, err)
@@ -848,7 +854,7 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 		start -= offset
 		end := start
 		start = end - window
-		if err := queryRangeHandler(qt, startTime, w, childQuery, start, end, step, lookbackDelta, r, ct, etfs); err != nil {
+		if err := queryRangeHandler(qt, startTime, w, childQuery, start, end, step, lookbackDelta, r, ct, etfs, field); err != nil {
 			return fmt.Errorf("error when executing query=%q on the time range (start=%d, end=%d, step=%d): %w", childQuery, start, end, step, err)
 		}
 		return nil
@@ -858,7 +864,7 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 	if err != nil {
 		return httpserver.InvalidParamError(err)
 	}
-	if !httputil.GetBool(r, "nocache") && ct-start < queryOffset && start-ct < queryOffset {
+	if mayCache && ct-start < queryOffset && start-ct < queryOffset {
 		// Adjust start time only if `nocache` arg isn't set.
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/241
 		startPrev := start
@@ -876,6 +882,7 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 		QuotedRemoteAddr:    httpserver.GetQuotedRemoteAddr(r),
 		Deadline:            deadline,
 		MayCache:            mayCache,
+		DownsampleField:     field,
 		LookbackDelta:       lookbackDelta,
 		RoundDigits:         getRoundDigits(r),
 		EnforcedTagFilterss: etfs,
@@ -926,6 +933,10 @@ var queryDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v
 // See https://prometheus.io/docs/prometheus/latest/querying/api/#range-queries
 func QueryRangeHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	defer queryRangeDuration.UpdateDuration(startTime)
+	field, err := getDownsampleQueryField(r)
+	if err != nil {
+		return err
+	}
 
 	ct := startTime.UnixNano() / 1e6
 	query := r.FormValue("query")
@@ -956,16 +967,16 @@ func QueryRangeHandler(qt *querytracer.Tracer, startTime time.Time, w http.Respo
 	if err != nil {
 		return httpserver.InvalidParamError(err)
 	}
-	if err := queryRangeHandler(qt, startTime, w, query, start, end, step, lookbackDelta, r, ct, etfs); err != nil {
+	if err := queryRangeHandler(qt, startTime, w, query, start, end, step, lookbackDelta, r, ct, etfs, field); err != nil {
 		return fmt.Errorf("error when executing query=%q on the time range (start=%d, end=%d, step=%d): %w", query, start, end, step, err)
 	}
 	return nil
 }
 
 func queryRangeHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWriter, query string,
-	start, end, step, lookbackDelta int64, r *http.Request, ct int64, etfs [][]storage.TagFilter) error {
+	start, end, step, lookbackDelta int64, r *http.Request, ct int64, etfs [][]storage.TagFilter, field *storage.DownsampleQueryField) error {
 	deadline := searchutil.GetDeadlineForQuery(r, startTime)
-	mayCache := !httputil.GetBool(r, "nocache")
+	mayCache := field == nil && !httputil.GetBool(r, "nocache")
 	optimizeRepeatedBinaryOpSubexprs := httputil.GetBool(r, "optimize_repeated_binary_op_subexprs")
 	if start > end {
 		end = start + defaultStep
@@ -986,6 +997,7 @@ func queryRangeHandler(qt *querytracer.Tracer, startTime time.Time, w http.Respo
 		QuotedRemoteAddr:                 httpserver.GetQuotedRemoteAddr(r),
 		Deadline:                         deadline,
 		MayCache:                         mayCache,
+		DownsampleField:                  field,
 		OptimizeRepeatedBinaryOpSubexprs: optimizeRepeatedBinaryOpSubexprs,
 		LookbackDelta:                    lookbackDelta,
 		RoundDigits:                      getRoundDigits(r),
@@ -1184,6 +1196,7 @@ type commonParams struct {
 	end              int64
 	currentTimestamp int64
 	filterss         [][]storage.TagFilter
+	downsampleField  *storage.DownsampleQueryField
 }
 
 func (cp *commonParams) IsDefaultTimeRange() bool {

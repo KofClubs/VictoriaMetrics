@@ -556,7 +556,7 @@ func (pt *partition) inmemoryPartsMerger() {
 			// Try merging additional parts.
 			continue
 		}
-		if errors.Is(err, errForciblyStopped) {
+		if errors.Is(err, errForciblyStopped) || errors.Is(err, errDownsampleNoSpace) {
 			// Nothing to do - finish the merger.
 			return
 		}
@@ -573,7 +573,7 @@ func (pt *partition) smallPartsMerger() {
 		maxOutBytes := pt.getMaxBigPartSize()
 
 		pt.partsLock.Lock()
-		pws := getPartsToMerge(pt.smallParts, maxOutBytes)
+		pws := pt.getFilePartsToMerge(pt.smallParts, maxOutBytes)
 		pt.partsLock.Unlock()
 
 		if len(pws) == 0 {
@@ -589,7 +589,7 @@ func (pt *partition) smallPartsMerger() {
 			// Try merging additional parts.
 			continue
 		}
-		if errors.Is(err, errForciblyStopped) {
+		if errors.Is(err, errForciblyStopped) || errors.Is(err, errDownsampleNoSpace) {
 			// Nothing to do - finish the merger.
 			return
 		}
@@ -606,7 +606,7 @@ func (pt *partition) bigPartsMerger() {
 		maxOutBytes := pt.getMaxBigPartSize()
 
 		pt.partsLock.Lock()
-		pws := getPartsToMerge(pt.bigParts, maxOutBytes)
+		pws := pt.getFilePartsToMerge(pt.bigParts, maxOutBytes)
 		pt.partsLock.Unlock()
 
 		if len(pws) == 0 {
@@ -622,7 +622,7 @@ func (pt *partition) bigPartsMerger() {
 			// Try merging additional parts.
 			continue
 		}
-		if errors.Is(err, errForciblyStopped) {
+		if errors.Is(err, errForciblyStopped) || errors.Is(err, errDownsampleNoSpace) {
 			// Nothing to do - finish the merger.
 			return
 		}
@@ -1042,6 +1042,10 @@ func (pt *partition) flushInmemoryPartsToFiles(isFinal bool) {
 	pt.partsLock.Unlock()
 
 	if err := pt.mergePartsToFiles(pws, nil, inmemoryPartsConcurrencyCh, false); err != nil {
+		// 周期 flush 空间不足时保留内存源，等待后续调度；关闭和 snapshot 不允许忽略失败。
+		if !isFinal && errors.Is(err, errDownsampleNoSpace) {
+			return
+		}
 		logger.Panicf("FATAL: cannot merge in-memory parts: %s", err)
 	}
 }
@@ -1054,6 +1058,9 @@ func (pt *partition) mergePartsToFiles(pws []*partWrapper, stopCh <-chan struct{
 	wg := getWaitGroup()
 	for len(pws) > 0 {
 		pwsToMerge, pwsRemaining := getPartsForOptimalMerge(pws)
+		if pt.s.downsamplingEnabled {
+			pwsToMerge, pwsRemaining = splitDownsampleMergeBatch(pwsToMerge, pwsRemaining)
+		}
 		concurrencyCh <- struct{}{}
 
 		wg.Go(func() {
@@ -1088,6 +1095,9 @@ func (pt *partition) ForceMergeAllParts(stopCh <-chan struct{}) error {
 
 	// Check whether there is enough disk space for merging pws.
 	newPartSize := getPartsSize(pws)
+	if pt.s.downsamplingEnabled {
+		newPartSize = estimateDownsamplePartSize(pws)
+	}
 	maxOutBytes := fs.MustGetFreeSpace(pt.bigPartsPath)
 	if newPartSize > maxOutBytes {
 		freeSpaceNeededBytes := newPartSize - maxOutBytes
@@ -1246,6 +1256,11 @@ func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isFi
 	mergeIdx := pt.nextMergeIdx()
 	dstPartPath := pt.getDstPartPath(dstPartType, mergeIdx)
 
+	// 在所有文件输出入口之前分派，包含单个 inmemory part 的直接 dump。
+	if pt.s.downsamplingEnabled && dstPartType != partInmemory {
+		return pt.mergeDownsampleParts(pws, dstPartType, dstPartPath, stopCh, startTime)
+	}
+
 	if !isDedupEnabled() && isFinal && len(pws) == 1 && pws[0].mp != nil {
 		// Fast path: flush a single in-memory part to disk.
 		mp := pws[0].mp
@@ -1351,6 +1366,15 @@ var (
 )
 
 func (pt *partition) getDstPartType(pws []*partWrapper, isFinal bool) partType {
+	dstPartType := pt.getRawDstPartType(pws, isFinal)
+	// 原始内存目标选择保持不变，仅复核文件目标的降采样空间上界。
+	if pt.s != nil && pt.s.downsamplingEnabled && dstPartType == partSmall && estimateDownsamplePartSize(pws) > pt.getMaxSmallPartSize() {
+		return partBig
+	}
+	return dstPartType
+}
+
+func (pt *partition) getRawDstPartType(pws []*partWrapper, isFinal bool) partType {
 	dstPartSize := getPartsSize(pws)
 	if dstPartSize > pt.getMaxSmallPartSize() {
 		return partBig
@@ -1594,14 +1618,14 @@ func (pt *partition) removeStaleParts() {
 		}
 	}
 	for _, pw := range pt.smallParts {
-		if !pw.isInMerge && pw.p.ph.MaxTimestamp < retentionDeadline {
+		if !pw.isInMerge && pt.filePartExpired(pw.p, retentionDeadline) {
 			pt.smallRowsDeleted.Add(pw.p.ph.RowsCount)
 			pw.isInMerge = true
 			pws = append(pws, pw)
 		}
 	}
 	for _, pw := range pt.bigParts {
-		if !pw.isInMerge && pw.p.ph.MaxTimestamp < retentionDeadline {
+		if !pw.isInMerge && pt.filePartExpired(pw.p, retentionDeadline) {
 			pt.bigRowsDeleted.Add(pw.p.ph.RowsCount)
 			pw.isInMerge = true
 			pws = append(pws, pw)

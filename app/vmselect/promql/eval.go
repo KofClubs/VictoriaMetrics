@@ -132,6 +132,9 @@ type EvalConfig struct {
 	// Whether the response can be cached.
 	MayCache bool
 
+	// DownsampleField 选择测试用磁盘摘要字段，并禁用结果缓存。
+	DownsampleField *storage.DownsampleQueryField
+
 	// Whether repeated cacheable binary op subexpressions can be optimized.
 	OptimizeRepeatedBinaryOpSubexprs bool
 
@@ -174,6 +177,7 @@ func copyEvalConfig(src *EvalConfig) *EvalConfig {
 	ec.MaxPointsPerSeries = src.MaxPointsPerSeries
 	ec.Deadline = src.Deadline
 	ec.MayCache = src.MayCache
+	ec.DownsampleField = src.DownsampleField
 	ec.OptimizeRepeatedBinaryOpSubexprs = src.OptimizeRepeatedBinaryOpSubexprs
 	ec.LookbackDelta = src.LookbackDelta
 	ec.RoundDigits = src.RoundDigits
@@ -196,6 +200,9 @@ func (ec *EvalConfig) validate() {
 }
 
 func (ec *EvalConfig) mayCache() bool {
+	if ec.DownsampleField != nil {
+		return false
+	}
 	if *disableCache {
 		return false
 	}
@@ -1830,6 +1837,7 @@ func evalRollupFuncNoCache(qt *querytracer.Tracer, ec *EvalConfig, funcName stri
 		minTimestamp -= ec.Step
 	}
 	sq := storage.NewSearchQuery(minTimestamp, ec.End, tfss, ec.MaxSeries)
+	sq.DownsampleField = ec.DownsampleField
 	rss, err := netstorage.ProcessSearchQuery(qt, sq, ec.Deadline)
 	if err != nil {
 		return nil, err

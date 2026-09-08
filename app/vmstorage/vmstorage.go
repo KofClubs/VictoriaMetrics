@@ -184,7 +184,7 @@ func (vms *VMStorage) initSearch(qt *querytracer.Tracer, sq *storage.SearchQuery
 	bi := getBlockIterator()
 	bi.marshal = marshal
 	bi.wgDone = vms.wg.Done
-	bi.sr.Init(qt, vms.s, tfss, tr, maxMetrics, deadline)
+	bi.sr.InitWithDownsampleField(qt, vms.s, tfss, tr, maxMetrics, deadline, sq.DownsampleField)
 	if err := bi.sr.Error(); err != nil {
 		bi.MustClose()
 		return nil, err
@@ -272,7 +272,7 @@ func (vms *VMStorage) GetSearch(qt *querytracer.Tracer, sq *storage.SearchQuery,
 	}
 
 	sr := getSearch()
-	maxSeriesCount := sr.Init(qt, vms.s, tfss, tr, sq.MaxMetrics, deadline)
+	maxSeriesCount := sr.InitWithDownsampleField(qt, vms.s, tfss, tr, sq.MaxMetrics, deadline, sq.DownsampleField)
 	return sr, maxSeriesCount, nil
 }
 
