@@ -187,6 +187,11 @@ func (s *Search) reset() {
 //
 // Init returns the upper bound on the number of found time series.
 func (s *Search) Init(qt *querytracer.Tracer, storage *Storage, tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) int {
+	return s.InitWithDownsampleField(qt, storage, tfss, tr, maxMetrics, deadline, nil)
+}
+
+// InitWithDownsampleField 为集群测试查询选择磁盘摘要字段；nil 保留原有查询行为。
+func (s *Search) InitWithDownsampleField(qt *querytracer.Tracer, storage *Storage, tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64, field *DownsampleQueryField) int {
 	qt = qt.NewChild("init series search: filters=%s, timeRange=%s, maxMetrics=%d", tfss, &tr, maxMetrics)
 	defer qt.Done()
 
@@ -209,7 +214,7 @@ func (s *Search) Init(qt *querytracer.Tracer, storage *Storage, tfss []*TagFilte
 	// It is ok to call Init on non-nil err.
 	// Init must be called before returning because it will fail
 	// on Search.MustClose otherwise.
-	s.ts.Init(storage.tb, tsids, tr)
+	s.ts.initWithDownsampleField(storage.tb, tsids, tr, field)
 	qt.Printf("search for parts with data for %d series", len(tsids))
 	if err != nil {
 		s.err = err
@@ -314,6 +319,9 @@ type SearchQuery struct {
 
 	// The maximum number of time series the search query can return.
 	MaxMetrics int
+
+	// DownsampleField 由 search_downsampling_v2 传递；原生查询编解码不携带该字段。
+	DownsampleField *DownsampleQueryField
 }
 
 // GetTimeRange returns time range for the given sq.
@@ -518,6 +526,8 @@ func (sq *SearchQuery) MarshalWithoutTenant(dst []byte) []byte {
 
 // Unmarshal unmarshals sq from src and returns the tail.
 func (sq *SearchQuery) Unmarshal(src []byte) ([]byte, error) {
+	// 原生查询协议不携带摘要字段，复用对象时必须清除上一次查询的选择。
+	sq.DownsampleField = nil
 	if len(src) < 4 {
 		return src, fmt.Errorf("cannot unmarshal AccountID: too short src len: %d; must be at least %d bytes", len(src), 4)
 	}

@@ -1982,12 +1982,13 @@ func processBlocksInternal(qt *querytracer.Tracer, sns []*storageNode, denyParti
 	})
 
 	// Collect results.
-	isPartial, err := snr.collectResults(partialSearchResults, func(result any) error {
+	consumeResult := func(result any) error {
 		if result != nil {
 			return result.(error)
 		}
 		return nil
-	})
+	}
+	isPartial, err := snr.collectDataSearchResults(sq.DownsampleField, consumeResult)
 	// Make sure that processBlock is no longer called after the exit from processBlocks() function.
 	for i := range wgs {
 		muwg := &wgs[i]
@@ -2487,13 +2488,13 @@ func (sn *storageNode) processSearchMetricNames(qt *querytracer.Tracer, requestD
 	return metricNames, nil
 }
 
-func (sn *storageNode) processSearchQuery(qt *querytracer.Tracer, requestData []byte, processBlock func(rawBlock []byte, workerID uint) error,
+func (sn *storageNode) processSearchQuery(qt *querytracer.Tracer, rpcName string, requestData []byte, processBlock func(rawBlock []byte, workerID uint) error,
 	workerID uint, deadline searchutil.Deadline,
 ) error {
 	f := func(bc *handshake.BufferedConn) error {
 		return sn.processSearchQueryOnConn(bc, requestData, processBlock, workerID)
 	}
-	return sn.execOnConnWithPossibleRetry(qt, "search_v7", f, deadline)
+	return sn.execOnConnWithPossibleRetry(qt, rpcName, f, deadline)
 }
 
 func (sn *storageNode) execOnConnWithPossibleRetry(qt *querytracer.Tracer, funcName string, f func(bc *handshake.BufferedConn) error, deadline searchutil.Deadline) error {
@@ -3385,14 +3386,18 @@ func execSearchQueryRequest(qt *querytracer.Tracer, sq *storage.SearchQuery, wor
 	var requestData []byte
 
 	for i := range sq.TenantTokens {
-		requestData = sq.TenantTokens[i].Marshal(requestData)
-		requestData = sq.MarshalWithoutTenant(requestData)
+		var rpcName string
+		var err error
+		requestData, rpcName, err = marshalDataSearchQuery(requestData, sq, sq.TenantTokens[i])
+		if err != nil {
+			return err
+		}
 		qtL := qt
 		if sq.IsMultiTenant && qt.Enabled() {
 			qtL = qt.NewChild("query for tenant: %s", sq.TenantTokens[i].String())
 		}
 		sn.searchRequests.Inc()
-		if err := sn.processSearchQuery(qtL, requestData, f, workerID, deadline); err != nil {
+		if err := sn.processSearchQuery(qtL, rpcName, requestData, f, workerID, deadline); err != nil {
 			sn.searchErrors.Inc()
 			if sq.IsMultiTenant {
 				qtL.Done()

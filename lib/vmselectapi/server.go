@@ -371,10 +371,20 @@ func (ctx *vmselectRequestCtx) readAccountIDProjectID() (uint32, uint32, error) 
 const maxSearchQuerySize = 5 * 1024 * 1024
 
 func (ctx *vmselectRequestCtx) readSearchQuery() error {
+	return ctx.readSearchQueryVersion(false)
+}
+
+func (ctx *vmselectRequestCtx) readSearchQueryVersion(downsample bool) error {
 	if err := ctx.readDataBufBytes(maxSearchQuerySize); err != nil {
 		return fmt.Errorf("cannot read searchQuery: %w", err)
 	}
-	tail, err := ctx.sq.Unmarshal(ctx.dataBuf)
+	var tail []byte
+	var err error
+	if downsample {
+		tail, err = ctx.sq.UnmarshalDownsample(ctx.dataBuf)
+	} else {
+		tail, err = ctx.sq.Unmarshal(ctx.dataBuf)
+	}
 	if err != nil {
 		return fmt.Errorf("cannot unmarshal SearchQuery: %w", err)
 	}
@@ -558,7 +568,9 @@ func (s *Server) endConcurrentRequest() {
 func (s *Server) processRPC(ctx *vmselectRequestCtx, rpcName string) error {
 	switch rpcName {
 	case "search_v7":
-		return s.processSearch(ctx)
+		return s.processSearch(ctx, false)
+	case "search_downsampling_v2":
+		return s.processSearch(ctx, true)
 	case "searchMetricNames_v3":
 		return s.processSearchMetricNames(ctx)
 	case "labelValues_v5":
@@ -1007,11 +1019,11 @@ func (s *Server) processSearchMetricNames(ctx *vmselectRequestCtx) error {
 	return nil
 }
 
-func (s *Server) processSearch(ctx *vmselectRequestCtx) error {
+func (s *Server) processSearch(ctx *vmselectRequestCtx, downsample bool) error {
 	s.searchRequests.Inc()
 
 	// Read request.
-	if err := ctx.readSearchQuery(); err != nil {
+	if err := ctx.readSearchQueryVersion(downsample); err != nil {
 		return err
 	}
 	if err := s.beginConcurrentRequest(ctx); err != nil {

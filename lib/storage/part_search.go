@@ -39,9 +39,19 @@ type partSearch struct {
 	indexBuf           []byte
 
 	err error
+
+	dsReader      *downsampleReader
+	dsField       DownsampleQueryField
+	dsFilterReady bool
 }
 
 func (ps *partSearch) reset() {
+	if ps.dsReader != nil {
+		putDownsampleReader(ps.dsReader)
+		ps.dsReader = nil
+	}
+	ps.dsField = DownsampleQueryField{}
+	ps.dsFilterReady = false
 	ps.BlockRef.reset()
 	ps.p = nil
 	ps.tsids = nil
@@ -62,6 +72,10 @@ var isInTest = func() bool {
 // tsids must be sorted.
 // tsids cannot be modified after the Init call, since it is owned by ps.
 func (ps *partSearch) Init(p *part, tsids []TSID, tr TimeRange) {
+	ps.initWithDownsampleField(p, tsids, tr, nil)
+}
+
+func (ps *partSearch) initWithDownsampleField(p *part, tsids []TSID, tr TimeRange, field *DownsampleQueryField) {
 	ps.reset()
 	ps.p = p
 
@@ -74,6 +88,25 @@ func (ps *partSearch) Init(p *part, tsids []TSID, tr TimeRange) {
 	}
 	ps.tr = tr
 	ps.metaindex = p.metaindex
+	if field != nil {
+		if !field.valid() {
+			ps.err = fmt.Errorf("invalid downsampling query field")
+			return
+		}
+		// 指定字段时只查询磁盘摘要，防止原始值冒充 sum 或 count。
+		if p.dsMetadata == nil {
+			ps.err = io.EOF
+			return
+		}
+		ps.dsField = *field
+		ps.dsReader = getDownsampleReader()
+		ps.err = ps.dsReader.Init(p, field.ResolutionMs)
+		return
+	}
+	if p.dsMetadata != nil {
+		ps.err = io.EOF
+		return
+	}
 
 	// Advance to the first tsid. There is no need in checking
 	// the returned result, since it will be checked in NextBlock.
@@ -87,6 +120,9 @@ func (ps *partSearch) Init(p *part, tsids []TSID, tr TimeRange) {
 // The blocks are sorted by (TDIS, MinTimestamp). Two subsequent blocks
 // for the same TSID may contain overlapped time ranges.
 func (ps *partSearch) NextBlock() bool {
+	if ps.dsReader != nil {
+		return ps.err == nil && ps.nextDownsampleBlock()
+	}
 	for {
 		if ps.err != nil {
 			return false

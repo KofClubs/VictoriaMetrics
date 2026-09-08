@@ -73,6 +73,7 @@ type Storage struct {
 	futureRetentionMsecs        int64
 	maxBackfillAgeMsecs         int64
 	denyQueriesOutsideRetention bool
+	downsamplingEnabled         bool
 
 	// lock file for exclusive access to the storage on the given path.
 	flockF *os.File
@@ -190,6 +191,8 @@ type OpenOptions struct {
 	TrackMetricNamesStats       bool
 	IDBPrefillStart             time.Duration
 	LogNewSeries                bool
+	// DownsamplingEnabled 启用固定 5m 和 1h 分辨率的文件降采样；与非零 dedup interval 互斥。
+	DownsamplingEnabled bool
 }
 
 // MustOpenStorage opens storage on the given path with the given retentionMsecs.
@@ -221,6 +224,7 @@ func MustOpenStorage(path string, opts OpenOptions) *Storage {
 		futureRetentionMsecs:        futureRetention.Milliseconds(),
 		maxBackfillAgeMsecs:         maxBackfillAge.Milliseconds(),
 		denyQueriesOutsideRetention: opts.DenyQueriesOutsideRetention,
+		downsamplingEnabled:         opts.DownsamplingEnabled,
 		stopCh:                      make(chan struct{}),
 		idbPrefillStartSeconds:      idbPrefillStart.Milliseconds() / 1000,
 	}
@@ -247,6 +251,13 @@ func MustOpenStorage(path string, opts OpenOptions) *Storage {
 	restoreLockF := filepath.Join(path, backupnames.RestoreInProgressFilename)
 	if fs.IsPathExist(restoreLockF) {
 		logger.Panicf("FATAL: incomplete vmrestore run; run vmrestore again or remove lock file %q", restoreLockF)
+	}
+
+	// 在打开 IndexDB 和启动 partition 后台任务前，只读检查全部活动 part。
+	if err := checkDownsamplingOpen(path, opts); err != nil {
+		fs.MustClose(s.flockF)
+		s.flockF = nil
+		logger.Panicf("FATAL: cannot open storage at %q: %s", path, err)
 	}
 
 	// Pre-create snapshots directory if it is missing.

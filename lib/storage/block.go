@@ -187,6 +187,11 @@ func (b *Block) rowsCount() int {
 
 // MarshalData marshals the block into binary representation.
 func (b *Block) MarshalData(timestampsBlockOffset, valuesBlockOffset uint64) ([]byte, []byte, []byte) {
+	return b.marshalDataWithTimestampPrecision(timestampsBlockOffset, valuesBlockOffset, b.bh.PrecisionBits)
+}
+
+// marshalDataWithTimestampPrecision 允许共享时间戳使用独立精度，其余状态转换与原始 Block 一致。
+func (b *Block) marshalDataWithTimestampPrecision(timestampsBlockOffset, valuesBlockOffset uint64, timestampPrecisionBits uint8) ([]byte, []byte, []byte) {
 	if len(b.values) == 0 {
 		// The data has been already marshaled.
 
@@ -232,7 +237,7 @@ func (b *Block) MarshalData(timestampsBlockOffset, valuesBlockOffset uint64) ([]
 	b.bh.ValuesBlockSize = uint32(len(b.valuesData))
 	b.values = b.values[:0]
 
-	b.timestampsData, b.bh.TimestampsMarshalType, b.bh.MinTimestamp = encoding.MarshalTimestamps(b.timestampsData[:0], timestamps, b.bh.PrecisionBits)
+	b.timestampsData, b.bh.TimestampsMarshalType, b.bh.MinTimestamp = encoding.MarshalTimestamps(b.timestampsData[:0], timestamps, timestampPrecisionBits)
 	b.bh.TimestampsBlockOffset = timestampsBlockOffset
 	b.bh.TimestampsBlockSize = uint32(len(b.timestampsData))
 	b.bh.MaxTimestamp = timestamps[len(timestamps)-1]
@@ -248,6 +253,11 @@ func (b *Block) MarshalData(timestampsBlockOffset, valuesBlockOffset uint64) ([]
 
 // UnmarshalData unmarshals block data.
 func (b *Block) UnmarshalData() error {
+	return b.unmarshalDataWithTimestampPrecision(b.bh.PrecisionBits)
+}
+
+// unmarshalDataWithTimestampPrecision 使用共享时间戳的精度执行原有解码、排序修复及状态转换。
+func (b *Block) unmarshalDataWithTimestampPrecision(timestampPrecisionBits uint8) error {
 	// blockHeader (b.bh) must be already unmarshaled.
 
 	if len(b.values) > 0 {
@@ -271,7 +281,7 @@ func (b *Block) UnmarshalData() error {
 	if err != nil {
 		return err
 	}
-	if b.bh.PrecisionBits < 64 {
+	if timestampPrecisionBits < 64 {
 		// Recover timestamps order after lossy compression.
 		encoding.EnsureNonDecreasingSequence(b.timestamps, b.bh.MinTimestamp, b.bh.MaxTimestamp)
 	} else if b.bh.TimestampsMarshalType.NeedsValidation() {

@@ -77,6 +77,7 @@ var (
 		"If set to 2h, then the indexdb rotation is performed at 4am EET time (the timezone with +2h offset)")
 	minScrapeInterval = flag.Duration("dedup.minScrapeInterval", 0, "Leave only the last sample in every time series per each discrete interval "+
 		"equal to -dedup.minScrapeInterval > 0. See also -streamAggr.dedupInterval and https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#deduplication")
+	downsamplingEnabled       = flag.Bool("storage.downsampling.enabled", false, "启用固定 5m 和 1h 分辨率的文件降采样，保存 last、sum、count、min、max；要求 -dedup.minScrapeInterval=0")
 	inmemoryDataFlushInterval = flag.Duration("inmemoryDataFlushInterval", 5*time.Second, "The interval for guaranteed saving of in-memory data to disk. "+
 		"The saved data survives unclean shutdowns such as OOM crash, hardware reset, SIGKILL, etc. "+
 		"Bigger intervals may help increase the lifetime of flash storage with limited write cycles (e.g. Raspberry PI). "+
@@ -155,6 +156,9 @@ func main() {
 	logger.Init()
 
 	storage.SetDedupInterval(*minScrapeInterval)
+	if *downsamplingEnabled && storage.GetDedupInterval() != 0 {
+		logger.Fatalf("-storage.downsampling.enabled requires -dedup.minScrapeInterval=0; got %s", *minScrapeInterval)
+	}
 	storage.SetDataFlushInterval(*inmemoryDataFlushInterval)
 	storage.LegacySetRetentionTimezoneOffset(*retentionTimezoneOffset)
 	storage.SetFreeDiskSpaceLimit(minFreeDiskSpaceBytes.N)
@@ -196,6 +200,7 @@ func main() {
 		TrackMetricNamesStats:       *trackMetricNamesStats,
 		IDBPrefillStart:             *idbPrefillStart,
 		LogNewSeries:                *logNewSeries,
+		DownsamplingEnabled:         *downsamplingEnabled,
 	}
 	strg := storage.MustOpenStorage(*storageDataPath, opts)
 	vmStorage := newVMStorage(strg, *vmselectMaxConcurrentRequests)
