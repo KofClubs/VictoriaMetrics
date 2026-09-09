@@ -252,6 +252,8 @@ try:
         save_manifest()
     run_step("python-ut", python + ["-W", "error::ResourceWarning", "-m", "unittest", "discover", "-s", tests,
                                    "-p", "test_downsampling_*.py", "-v"])
+    # spill 与最终 filestream 的故障/清理测试属于独立库，不受 storage 的测试名称过滤。
+    run_step("go-io-ut", ["go", "test", "-p", "4", "./lib/filestream", "-count=1"])
     # 新格式每列独立成组。160 条 E2E 时间线不保证超过同列 736 header/index；
     # 固定 Go fixture 必须独立通过，不能把 feature 切换算作同列跨 index。
     run_step("go-layout-ut", ["go", "test", "-p", "4", "./lib/storage", "-run", layout_tests, "-count=1", "-v"])

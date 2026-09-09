@@ -2,6 +2,7 @@ package filestream
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -154,20 +155,20 @@ func (r *Reader) Read(p []byte) (int, error) {
 }
 
 type statReader struct {
-	*os.File
+	r io.Reader
 }
 
 func (sr *statReader) Read(p []byte) (int, error) {
 	startTime := time.Now()
 	readCallsReal.Inc()
-	n, err := sr.File.Read(p)
+	n, err := sr.r.Read(p)
 	d := time.Since(startTime).Seconds()
 	readDuration.Add(d)
 	readBytesReal.Add(n)
 	return n, err
 }
 
-func getBufioReader(f *os.File) *bufio.Reader {
+func getBufioReader(f io.Reader) *bufio.Reader {
 	sr := &statReader{f}
 	v := brPool.Get()
 	if v == nil {
@@ -179,6 +180,7 @@ func getBufioReader(f *os.File) *bufio.Reader {
 }
 
 func putBufioReader(br *bufio.Reader) {
+	br.Reset(nil)
 	brPool.Put(br)
 }
 
@@ -186,14 +188,27 @@ var brPool sync.Pool
 
 // Writer implements buffered file writer.
 type Writer struct {
-	f  *os.File
-	bw *bufio.Writer
-	st streamTracker
+	f        writerFile
+	bw       *bufio.Writer
+	st       streamTracker
+	path     string
+	err      error // First write or flush error; subsequent writes must fail.
+	closeErr error // Result of the first Close or Abort call.
 }
 
-// Path returns the path to r
+// writerFile is the file functionality needed by Writer.
+// Production writers use *os.File; tests can inject failures per file.
+type writerFile interface {
+	io.Writer
+	Name() string
+	Fd() uintptr
+	Sync() error
+	Close() error
+}
+
+// Path returns the path to w, including after it has been closed.
 func (w *Writer) Path() string {
-	return w.f.Name()
+	return w.path
 }
 
 // OpenWriterAt opens the file at path in nocache mode for writing at the given offset.
@@ -222,17 +237,41 @@ func OpenWriterAt(path string, offset int64, nocache bool) (*Writer, error) {
 //
 // If nocache is set, the writer doesn't pollute OS page cache.
 func MustCreate(path string, nocache bool) *Writer {
-	f, err := os.Create(path)
+	w, err := Create(path, nocache)
 	if err != nil {
 		logger.Panicf("FATAL: cannot create file %q: %s", path, err)
 	}
-	return newWriter(f, nocache)
+	return w
 }
 
-func newWriter(f *os.File, nocache bool) *Writer {
+// Create creates or truncates the file at path with permissions 0666 (before umask).
+//
+// If nocache is set, the writer doesn't pollute OS page cache.
+func Create(path string, nocache bool) (*Writer, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	return newWriter(f, nocache), nil
+}
+
+// CreateExclusive creates the file at path with permissions 0666 (before umask).
+// It returns an error if the path already exists.
+//
+// If nocache is set, the writer doesn't pollute OS page cache.
+func CreateExclusive(path string, nocache bool) (*Writer, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0666)
+	if err != nil {
+		return nil, err
+	}
+	return newWriter(f, nocache), nil
+}
+
+func newWriter(f writerFile, nocache bool) *Writer {
 	w := &Writer{
-		f:  f,
-		bw: getBufioWriter(f),
+		f:    f,
+		bw:   getBufioWriter(f),
+		path: f.Name(),
 	}
 	if nocache {
 		w.st.fd = f.Fd()
@@ -243,38 +282,79 @@ func newWriter(f *os.File, nocache bool) *Writer {
 
 // MustClose syncs the underlying file to storage and then closes it.
 func (w *Writer) MustClose() {
-	w.flush()
+	if err := w.Close(); err != nil {
+		logger.Panicf("FATAL: cannot close file %q: %s", w.path, err)
+	}
+}
 
+// Close flushes buffered data, syncs the file to storage, and releases all resources.
+// It attempts every cleanup step even after an error, and returns earlier write errors too.
+// Repeated Close or Abort calls return the same result without closing resources again.
+func (w *Writer) Close() error {
+	return w.close(true)
+}
+
+// Abort discards buffered data and releases all resources without flushing or syncing.
+// It returns earlier write errors as well as cleanup errors.
+// Repeated Close or Abort calls return the same result without closing resources again.
+func (w *Writer) Abort() error {
+	return w.close(false)
+}
+
+func (w *Writer) close(flushAndSync bool) error {
+	if w.f == nil {
+		return w.closeErr
+	}
+	errs := []error{w.err}
+	if flushAndSync {
+		if err := w.flush(); err != nil && (errs[0] == nil || !errors.Is(err, errs[0])) {
+			errs = append(errs, err)
+		}
+		errs = append(errs, w.sync())
+	}
 	putBufioWriter(w.bw)
 	w.bw = nil
-
-	w.sync()
 	if err := w.st.close(); err != nil {
-		logger.Panicf("FATAL: cannot close streamTracker for file %q: %s", w.f.Name(), err)
+		errs = append(errs, fmt.Errorf("cannot close streamTracker for file %q: %w", w.path, err))
 	}
 	if err := w.f.Close(); err != nil {
-		logger.Panicf("FATAL: cannot close file %q: %s", w.f.Name(), err)
+		errs = append(errs, fmt.Errorf("cannot close file %q: %w", w.path, err))
 	}
 	w.f = nil
-
+	w.st = streamTracker{}
 	writersCount.Dec()
+	w.closeErr = errors.Join(errs...)
+	return w.closeErr
 }
 
-func (w *Writer) flush() {
-	if err := w.bw.Flush(); err != nil {
-		logger.Panicf("FATAL: cannot flush buffered data to file %q: %s", w.f.Name(), err)
+func (w *Writer) flush() error {
+	if w.f == nil {
+		return fmt.Errorf("cannot flush closed file %q: %w", w.path, os.ErrClosed)
 	}
+	if err := w.bw.Flush(); err != nil {
+		err = fmt.Errorf("cannot flush buffered data to file %q: %w", w.path, err)
+		w.setError(err)
+		return err
+	}
+	return nil
 }
 
-func (w *Writer) sync() {
+func (w *Writer) sync() error {
 	if !fsutil.IsFsyncDisabled() {
 		startTime := time.Now()
 		if err := w.f.Sync(); err != nil {
-			logger.Panicf("FATAL: cannot sync file %q: %s", w.f.Name(), err)
+			return fmt.Errorf("cannot sync file %q: %w", w.path, err)
 		}
 		d := time.Since(startTime).Seconds()
 		fsyncDuration.Add(d)
 		fsyncCalls.Inc()
+	}
+	return nil
+}
+
+func (w *Writer) setError(err error) {
+	if w.err == nil {
+		w.err = err
 	}
 }
 
@@ -292,14 +372,23 @@ var (
 
 // Write writes p to the underlying file.
 func (w *Writer) Write(p []byte) (int, error) {
+	if w.f == nil {
+		return 0, fmt.Errorf("cannot write to closed file %q: %w", w.path, os.ErrClosed)
+	}
+	if w.err != nil {
+		return 0, w.err
+	}
 	writeCallsBuffered.Inc()
 	n, err := w.bw.Write(p)
 	writtenBytesBuffered.Add(n)
 	if err != nil {
+		w.setError(err)
 		return n, err
 	}
 	if err := w.st.adviseDontNeed(n, true); err != nil {
-		return n, fmt.Errorf("advise error for %q: %w", w.f.Name(), err)
+		err = fmt.Errorf("advise error for %q: %w", w.path, err)
+		w.setError(err)
+		return n, err
 	}
 	return n, nil
 }
@@ -308,27 +397,34 @@ func (w *Writer) Write(p []byte) (int, error) {
 //
 // if isSync is true, then the flushed data is fsynced to the underlying storage.
 func (w *Writer) MustFlush(isSync bool) {
-	w.flush()
+	if err := w.flush(); err != nil {
+		logger.Panicf("FATAL: %s", err)
+	}
+	if w.err != nil {
+		logger.Panicf("FATAL: cannot flush file %q after a failed write: %s", w.path, w.err)
+	}
 	if isSync {
-		w.sync()
+		if err := w.sync(); err != nil {
+			logger.Panicf("FATAL: %s", err)
+		}
 	}
 }
 
 type statWriter struct {
-	*os.File
+	w io.Writer
 }
 
 func (sw *statWriter) Write(p []byte) (int, error) {
 	startTime := time.Now()
 	writeCallsReal.Inc()
-	n, err := sw.File.Write(p)
+	n, err := sw.w.Write(p)
 	d := time.Since(startTime).Seconds()
 	writeDuration.Add(d)
 	writtenBytesReal.Add(n)
 	return n, err
 }
 
-func getBufioWriter(f *os.File) *bufio.Writer {
+func getBufioWriter(f io.Writer) *bufio.Writer {
 	sw := &statWriter{f}
 	v := bwPool.Get()
 	if v == nil {
@@ -340,6 +436,7 @@ func getBufioWriter(f *os.File) *bufio.Writer {
 }
 
 func putBufioWriter(bw *bufio.Writer) {
+	bw.Reset(io.Discard)
 	bwPool.Put(bw)
 }
 

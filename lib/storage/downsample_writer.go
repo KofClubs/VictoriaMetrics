@@ -13,18 +13,26 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
 )
+
+// 最终文件沿用 filestream 的写入接口，但可恢复的降采样失败不能调用 MustClose。
+type downsampleFileWriter interface {
+	filestream.WriteCloser
+	Close() error
+	Abort() error
+}
 
 // downsampleWriter 在全部列与索引同步完成后才返回可发布的 partHeader。
 type downsampleWriter struct {
 	path          string
-	files         [4]*os.File
+	files         [4]downsampleFileWriter
 	offsets       [3]uint64
 	compressLevel int
 	ph            partHeader
 	previous      blockHeader
 	resolution    int64
-	spills        [countOfDownsampleFeatures]*os.File
+	spills        [countOfDownsampleFeatures]*filestream.SpillWriter
 	spillData     []byte
 	// indexLimit 可在测试中缩小，生产默认 maxBlockSize。
 	indexLimit    int
@@ -52,9 +60,9 @@ func (w *downsampleWriter) Init(path string, compressLevel int) error {
 	w.compressLevel = compressLevel
 	w.ph.Reset()
 	for i, name := range []string{timestampsFilename, valuesFilename, indexFilename, metaindexFilename} {
-		f, err := os.OpenFile(filepath.Join(path, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		f, err := filestream.CreateExclusive(filepath.Join(path, name), false)
 		if err != nil {
-			return errors.Join(err, w.Abort())
+			return w.fail(err)
 		}
 		w.files[i] = f
 	}
@@ -62,12 +70,18 @@ func (w *downsampleWriter) Init(path string, compressLevel int) error {
 }
 
 func (w *downsampleWriter) WriteBlock(b *downsampleBatch) (err error) {
-	if w.path == "" || w.finished {
-		return fmt.Errorf("降采样 writer 尚未初始化或已关闭")
-	}
 	if w.err != nil {
 		return w.err
 	}
+	if w.path == "" || w.finished {
+		return fmt.Errorf("降采样 writer 尚未初始化或已关闭")
+	}
+	// 验证失败也取消整个未发布目标，不能把先前成功写入的批次单独发布。
+	defer func() {
+		if err != nil {
+			err = w.fail(err)
+		}
+	}()
 	if b == nil {
 		return fmt.Errorf("降采样批次为空")
 	}
@@ -95,12 +109,6 @@ func (w *downsampleWriter) WriteBlock(b *downsampleBatch) (err error) {
 	if err := checkDownsampleWriteSpace(filepath.Dir(w.path), n); err != nil {
 		return err
 	}
-	// 从此处开始可能改变磁盘状态，任何错误都必须阻止后续 Finish 发布。
-	defer func() {
-		if err != nil {
-			w.err = err
-		}
-	}()
 	if w.hasPrevious && b.resolution != w.resolution {
 		if err := w.flushResolution(); err != nil {
 			return err
@@ -134,11 +142,7 @@ func (w *downsampleWriter) WriteBlock(b *downsampleBatch) (err error) {
 	}
 	for i := range w.blocks {
 		if w.spills[i] == nil {
-			f, err := os.CreateTemp(w.path, ".downsample-spill-*")
-			if err != nil {
-				return err
-			}
-			w.spills[i] = f
+			w.spills[i] = filestream.NewSpillWriter(w.path)
 		}
 		fb := &w.blocks[i]
 		if err := writeDownsampleData(w.spills[i], fb.headerData); err != nil {
@@ -175,11 +179,7 @@ func (w *downsampleWriter) flushResolution() error {
 			continue
 		}
 		spillCount++
-		st, err := f.Stat()
-		if err != nil {
-			return err
-		}
-		pending = addDownsampleSpace(pending, uint64(st.Size()))
+		pending = addDownsampleSpace(pending, f.Size())
 	}
 	if spillCount == 0 {
 		return nil
@@ -193,77 +193,72 @@ func (w *downsampleWriter) flushResolution() error {
 	header := make([]byte, marshaledBlockHeaderSize)
 	var expectedBlocks, expectedRows uint64
 	for feature, f := range w.spills {
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-		var previous blockHeader
-		var blocks, rows uint64
-		for {
-			n, err := io.ReadFull(f, header)
-			if err == io.EOF && n == 0 {
-				break
-			}
-			if err != nil {
-				return err
-			}
-			var h blockHeader
-			if _, err := h.Unmarshal(header); err != nil {
-				return err
-			}
-			if err := validateDownsampleHeader(&h); err != nil {
-				return err
-			}
-			if err := checkDownsampleExtent(h.TimestampsBlockOffset, h.TimestampsBlockSize, w.offsets[0]); err != nil {
-				return err
-			}
-			if blocks > 0 && (!downsampleHeadersOrdered(&previous, &h) || h.TimestampsBlockOffset != previous.TimestampsBlockOffset+uint64(previous.TimestampsBlockSize)) {
-				return fmt.Errorf("降采样 spill 排序或时间戳连续性错误")
-			}
-			previous = h
-			blocks++
-			rows += uint64(h.RowsCount)
-			if len(w.indexData)+marshaledBlockHeaderSize > limit || (w.mr.BlockHeadersCount > 0 && !sameDownsampleTenant(&h.TSID, &w.mr.TSID)) {
-				if err := w.flushIndex(); err != nil {
+		err := f.ReadAll(func(r io.Reader) error {
+			var previous blockHeader
+			var blocks, rows uint64
+			for {
+				n, err := io.ReadFull(r, header)
+				if err == io.EOF && n == 0 {
+					break
+				}
+				if err != nil {
 					return err
 				}
+				var h blockHeader
+				if _, err := h.Unmarshal(header); err != nil {
+					return err
+				}
+				if err := validateDownsampleHeader(&h); err != nil {
+					return err
+				}
+				if err := checkDownsampleExtent(h.TimestampsBlockOffset, h.TimestampsBlockSize, w.offsets[0]); err != nil {
+					return err
+				}
+				if blocks > 0 && (!downsampleHeadersOrdered(&previous, &h) || h.TimestampsBlockOffset != previous.TimestampsBlockOffset+uint64(previous.TimestampsBlockSize)) {
+					return fmt.Errorf("降采样 spill 排序或时间戳连续性错误")
+				}
+				previous = h
+				blocks++
+				rows += uint64(h.RowsCount)
+				if len(w.indexData)+marshaledBlockHeaderSize > limit || (w.mr.BlockHeadersCount > 0 && !sameDownsampleTenant(&h.TSID, &w.mr.TSID)) {
+					if err := w.flushIndex(); err != nil {
+						return err
+					}
+				}
+				if err := checkDownsampleWriteSpace(filepath.Dir(w.path), int(h.RowsCount)); err != nil {
+					return err
+				}
+				if cap(w.spillData) < int(h.ValuesBlockSize) {
+					w.spillData = make([]byte, h.ValuesBlockSize)
+				}
+				w.spillData = w.spillData[:h.ValuesBlockSize]
+				if _, err := io.ReadFull(r, w.spillData); err != nil {
+					return err
+				}
+				h.ValuesBlockOffset = w.offsets[1]
+				if err := w.writePayload(1, w.spillData); err != nil {
+					return err
+				}
+				w.indexData = h.Marshal(w.indexData)
+				w.mr.ResolutionMs, w.mr.feature = w.resolution, uint8(feature)
+				w.mr.RegisterBlockHeader(&h)
+				w.mr.LastTSID = h.TSID
+				w.mr.RowsCount += uint64(h.RowsCount)
 			}
-			if err := checkDownsampleWriteSpace(filepath.Dir(w.path), int(h.RowsCount)); err != nil {
-				return err
+			if feature == 0 {
+				expectedBlocks, expectedRows = blocks, rows
+			} else if blocks != expectedBlocks || rows != expectedRows {
+				return fmt.Errorf("降采样 spill 特征列统计不一致")
 			}
-			if cap(w.spillData) < int(h.ValuesBlockSize) {
-				w.spillData = make([]byte, h.ValuesBlockSize)
+			if blocks == 0 {
+				return fmt.Errorf("降采样 spill 为空")
 			}
-			w.spillData = w.spillData[:h.ValuesBlockSize]
-			if _, err := io.ReadFull(f, w.spillData); err != nil {
-				return err
-			}
-			h.ValuesBlockOffset = w.offsets[1]
-			if err := w.writePayload(1, w.spillData); err != nil {
-				return err
-			}
-			w.indexData = h.Marshal(w.indexData)
-			w.mr.ResolutionMs, w.mr.feature = w.resolution, uint8(feature)
-			w.mr.RegisterBlockHeader(&h)
-			w.mr.LastTSID = h.TSID
-			w.mr.RowsCount += uint64(h.RowsCount)
-		}
-		if feature == 0 {
-			expectedBlocks, expectedRows = blocks, rows
-		} else if blocks != expectedBlocks || rows != expectedRows {
-			return fmt.Errorf("降采样 spill 特征列统计不一致")
-		}
-		if blocks == 0 {
-			return fmt.Errorf("降采样 spill 为空")
-		}
-		if err := w.flushIndex(); err != nil {
+			return w.flushIndex()
+		})
+		if err != nil {
 			return err
 		}
-		name := f.Name()
-		err := f.Close()
 		w.spills[feature] = nil
-		if err = errors.Join(err, os.Remove(name)); err != nil {
-			return err
-		}
 	}
 	return nil
 }
@@ -323,15 +318,15 @@ func (w *downsampleWriter) flushIndex() error {
 }
 
 func (w *downsampleWriter) Finish() (_ partHeader, err error) {
-	if w.path == "" || w.finished {
-		return partHeader{}, fmt.Errorf("降采样 writer 尚未初始化或已完成")
-	}
 	if w.err != nil {
 		return partHeader{}, w.err
 	}
+	if w.path == "" || w.finished {
+		return partHeader{}, fmt.Errorf("降采样 writer 尚未初始化或已完成")
+	}
 	defer func() {
 		if err != nil {
-			w.err = err
+			err = w.fail(err)
 		}
 	}()
 	if w.ph.RowsCount > 0 {
@@ -363,23 +358,21 @@ func (w *downsampleWriter) Finish() (_ partHeader, err error) {
 		if err != nil {
 			return partHeader{}, err
 		}
-		f, err := os.OpenFile(filepath.Join(w.path, metadataFilename), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		f, err := filestream.CreateExclusive(filepath.Join(w.path, metadataFilename), false)
 		if err != nil {
 			return partHeader{}, err
 		}
-		err = writeDownsampleData(f, b)
-		if err == nil {
-			err = f.Sync()
+		if err := writeDownsampleData(f, b); err != nil {
+			return partHeader{}, errors.Join(err, f.Abort())
 		}
-		err = errors.Join(err, f.Close())
-		if err != nil {
+		if err := f.Close(); err != nil {
 			return partHeader{}, err
 		}
 	}
 	var errs []error
 	for i, f := range w.files {
 		if f != nil {
-			errs = append(errs, f.Sync(), f.Close())
+			errs = append(errs, f.Close())
 			w.files[i] = nil
 		}
 	}
@@ -404,18 +397,22 @@ func syncDownsampleDir(path string) error {
 	return errors.Join(f.Sync(), f.Close())
 }
 
+func (w *downsampleWriter) fail(err error) error {
+	w.err = errors.Join(err, w.Abort())
+	return w.err
+}
+
 // Abort 删除由本 writer 创建的未发布目标，包括 Finish 已完成但尚未发布的目标。
 func (w *downsampleWriter) Abort() error {
 	var errs []error
-	for i, f := range w.spills {
+	for _, f := range w.spills {
 		if f != nil {
 			errs = append(errs, f.Close())
-			w.spills[i] = nil
 		}
 	}
 	for i, f := range w.files {
 		if f != nil {
-			errs = append(errs, f.Close())
+			errs = append(errs, f.Abort())
 			w.files[i] = nil
 		}
 	}
@@ -427,6 +424,7 @@ func (w *downsampleWriter) Abort() error {
 			return w.err // 保留路径，允许调用方再次清理。
 		}
 	}
+	clear(w.spills[:])
 	w.path = ""
 	return errors.Join(errs...)
 }

@@ -254,9 +254,15 @@ writer 仍须显式比较租户并切 row，不能仅依赖 index 大小阈值�
 2. 分辨率变化时先 `flushResolution()` 完成上一分辨率；不允许回到较小分辨率。
 3. 五列分别调用原生 `Block.MarshalData`，比较时间戳编码字节及描述一致性。**当前是五次编码校验、一次磁盘写入**，不是只编码一次。
 4. 将第一列的 timestamps payload 按生成顺序追加到 `timestamps.bin`，五个 header 引用同一最终 offset/size。
-5. 每列向自己的 `.downsample-spill-*` 临时文件追加「89 字节原生 header + values payload」。spill 不保存 timestamps payload；其中 values offset 是占位值，输出时重算。
+5. 每列向自己的 `filestream.SpillWriter` 追加「89 字节原生 header + values payload」。spill 不保存 timestamps payload；其中 values offset 是占位值，输出时重算。
 
-writer 只保留当前批次的五个 Block、单列 spill 读取缓冲、当前 index 和有上限的 metaindex；不在内存中积累全部批次。
+writer 只保留当前批次的五个 Block、单列 spill 读取缓冲、固定大小的文件缓冲、当前 index 和有上限的 metaindex；不在内存中积累全部批次。
+
+`SpillWriter` 位于 `lib/filestream/spill.go`，接口为 `Write([]byte)`、`ReadAll(func(io.Reader) error)`、`Size()` 和 `Close()`。
+`ReadAll` 按流读取，回调必须消费全部逻辑字节；不把整个 spill 载入内存。开始读回即封存，禁止继续写入或再次读取。
+临时文件在第一次非空写入时创建，位于目标目录内由 spill 独占的 `.spill-*` 子目录；文件模式为 `0666 & umask`，与 `filestream.Create` 一致，子目录为 `0700 & umask`。
+spill 复用 filestream 的 bufio 池及 I/O 统计。临时数据不 fsync；正常读完或发生错误后关闭并删除，`Close` 直接丢弃尚未消费的缓冲。
+删除失败返回清理错误并保留路径，允许再次 `Close` 重试。
 
 ### 5.2 flushResolution：保证整个 part 的全局顺序
 
@@ -278,8 +284,16 @@ writer 只保留当前批次的五个 Block、单列 spill 读取缓冲、当前
 
 - timestamps offset 在 `WriteBlock` 中确定，转置时不改写、不重复写入。
 - values offset 在消费 spill 时确定；index offset/size 在 `flushIndex` 压缩并追加时确定。
-- `Finish` 完成 spill、index、metaindex、metadata 的写入及文件/目录同步后才返回可发布的 partHeader。
-- 部分写入失败会锁定 writer 错误，禁止继续发布；`Abort` 关闭句柄并删除未发布目标及 spill。
+- 最终 timestamps、values、index、metaindex 和 metadata 使用 `filestream.CreateExclusive`；沿用 `filestream.WriteCloser` 的写入约定，通过新增的 `Close() error` / `Abort() error` 处理正常关闭和取消。既有 `MustCreate` / `MustClose` 调用方式保持兼容。
+- `Finish` 完成 spill、index、metaindex、metadata 的写入及文件/目录同步后才返回可发布的 partHeader。`Close` 即使某一步失败也继续释放其余资源，返回刷缓冲、同步和关闭错误；`Abort` 不再刷入缓冲数据。
+- `WriteBlock` 的验证或写入失败、`Finish` 的读回或关闭失败，均锁定错误并立即 `Abort`：释放所有句柄、删除本次目标目录及全部 spill，后续 `WriteBlock` / `Finish` 继续返回原错误。目标目录已存在时拒绝初始化，不删除他人文件。
+- reader 只关闭自己为 raw 源打开的文件，并聚合全部关闭错误；借用摘要 part 的文件仍由 part 管理。merger 在换源、换分辨率及返回前检查 reader 清理结果，任何关闭失败都在 `Finish` 和发布前返回；清理 reader 不清空取消信号。
+- 发布前使用可返回错误的方式打开并校验目标，再写入临时 `parts.json`。以 manifest 的原子 rename 为提交点；提交前失败保持源 part、旧 manifest 和活动集合不变，删除未发布目标及临时 manifest。
+- rename 后目标已完整发布，此时目录同步失败不能删除目标；内存集合与新 manifest 保持一致，并保留旧磁盘源文件。此边界不属于可回滚的部分输出。
+- 降采样自己的 writer、reader、merger 返回的错误传到调度层并结束本次作业，不转成 panic。周期 flush 保留源；关闭或快照所需的 final flush 对仍在内存的失败源走原有 raw 持久化路径，不改变共享降采样配置。
+- final flush 在持有 `partsLock` 时重新同步清单目录，即使已没有剩余内存源也不能跳过。若 raw 回退或这一步最终持久化仍失败，沿用原 storage 的 FATAL 语义，不把它当作可忽略的降采样失败。
+- `lib/fs` 保持原实现；磁盘空间查询、通用 part 关闭和已提交源 part 回收继续沿用既有 Must 接口及语义。本次不扩展这些接口，也不捕获其 panic。
+- 文件系统若持续拒绝删除，返回值包含清理失败，保留路径用于重试；不能将“已请求删除”当作“已清理成功”。引用计数等程序不变量仍按 BUG 处理。
 
 ### 5.4 空间上界与溢出
 

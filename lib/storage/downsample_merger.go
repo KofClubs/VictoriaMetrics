@@ -2,6 +2,7 @@ package storage
 
 import (
 	"container/heap"
+	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -63,12 +64,8 @@ type downsampleMerger struct {
 }
 
 // Reset 释放借用对象与源引用；正常工作缓冲可供下一次作业复用。
-func (m *downsampleMerger) Reset() {
-	m.resetCursors()
-	if m.reader != nil {
-		putDownsampleReader(m.reader)
-		m.reader = nil
-	}
+func (m *downsampleMerger) Reset() error {
+	err := m.closeReaders()
 	if m.input != nil {
 		putDownsampleBatch(m.input)
 		m.input = nil
@@ -97,25 +94,49 @@ func (m *downsampleMerger) Reset() {
 	if cap(m.states) > downsampleWindowBuckets {
 		m.states = nil
 	}
+	return err
 }
 
-func (m *downsampleMerger) resetCursors() {
+func (m *downsampleMerger) resetCursors() error {
+	var err error
 	for i := range m.cursors {
 		c := &m.cursors[i]
 		if c.reader != nil {
-			putDownsampleReader(c.reader)
+			err = errors.Join(err, putDownsampleReader(c.reader))
 		}
 		*c = downsampleMergeCursor{}
 	}
 	m.cursors = m.cursors[:0]
 	clear(m.heap)
 	m.heap = m.heap[:0]
+	return err
+}
+
+// closeReaders 在 Merge 返回前释放源文件，但保留统计和取消信号供 Finish/发布前检查。
+func (m *downsampleMerger) closeReaders() error {
+	err := m.resetCursors()
+	if m.reader != nil {
+		err = errors.Join(err, putDownsampleReader(m.reader))
+		m.reader = nil
+	}
+	return err
 }
 
 // Merge 不关闭 writer；调用方在成功后 Finish，失败或取消时 Abort。
+// 所有自有 reader 均在返回前关闭，关闭失败与归并错误一起返回，不能发布部分结果。
 // pws 的引用由调用方持有，必须覆盖整个归并和目标发布过程。
-func (m *downsampleMerger) Merge(pws []*partWrapper, w *downsampleWriter, stopCh <-chan struct{}, dmis *uint64set.Set, retentionDeadline int64, windowBuckets int) (downsampleMergeStats, error) {
-	m.Reset()
+func (m *downsampleMerger) Merge(pws []*partWrapper, w *downsampleWriter, stopCh <-chan struct{}, dmis *uint64set.Set, retentionDeadline int64, windowBuckets int) (_ downsampleMergeStats, err error) {
+	if err := m.Reset(); err != nil {
+		return m.stats, err
+	}
+	defer func() {
+		closeErr := m.closeReaders()
+		if closeErr != nil {
+			// 取消本身可静默退出，但同时发生的 reader 关闭失败不能被隐藏。
+			downsampleMergeLogger.Warnf("cannot close downsampling readers: %s", closeErr)
+		}
+		err = errors.Join(err, closeErr)
+	}()
 	if len(pws) > downsampleMaxMergeSources {
 		return m.stats, fmt.Errorf("downsampling merge has %d sources; maximum is %d", len(pws), downsampleMaxMergeSources)
 	}
@@ -177,7 +198,9 @@ func (m *downsampleMerger) checkStopped() error {
 }
 
 func (m *downsampleMerger) initSources(pws []*partWrapper, resolution int64) error {
-	m.resetCursors()
+	if err := m.resetCursors(); err != nil {
+		return err
+	}
 	if cap(m.cursors) < len(pws) {
 		m.cursors = make([]downsampleMergeCursor, len(pws))
 	} else {
@@ -387,9 +410,10 @@ func downsampleSourceRowWidth(p *part) uint64 {
 	return 1
 }
 
-func putDownsampleMerger(m *downsampleMerger) {
-	m.Reset()
+func putDownsampleMerger(m *downsampleMerger) error {
+	err := m.Reset()
 	downsampleMergerPool.Put(m)
+	return err
 }
 
 var downsampleMergerPool sync.Pool

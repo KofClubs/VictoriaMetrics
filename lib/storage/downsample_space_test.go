@@ -187,11 +187,7 @@ func TestDownsampleSpaceBoundCoversEncodedParts(t *testing.T) {
 				if f == nil {
 					t.Fatalf("missing spill for feature %d", feature)
 				}
-				info, err := f.Stat()
-				if err != nil {
-					t.Fatal(err)
-				}
-				spillBytes += uint64(info.Size())
+				spillBytes += f.Size()
 			}
 			wantSpill := valuesBytes + uint64(tc.blockCount)*5*89
 			if spillBytes != wantSpill {

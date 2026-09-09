@@ -14,7 +14,8 @@
 | 模块 | 当前行为 |
 |---|---|
 | codec | 集群版 index 条目为 89 字节原生 `blockHeader`；113 字节 `downsampleMetaindexRow` 嵌入原生 `metaindexRow`，追加 feature、resolution、LastTSID、RowsCount；版本在 magic/metadata 中 |
-| writer | 五路磁盘 spill 保存各列 header+values；分辨率结束时依次消费五列，最终 values/index/metaindex 按 `(resolution, feature, TSID.Less, MinTimestamp)` 全局排列 |
+| writer | 五个 `filestream.SpillWriter` 保存各列 header+values，封装临时文件与流式读回；最终文件通过 filestream 写入，values/index/metaindex 按 `(resolution, feature, TSID.Less, MinTimestamp)` 全局排列 |
+| 失败处理 | 降采样 writer/reader/merger 的验证、I/O 或提交前失败返回错误并删除未发布目标、spill 和临时清单；调度结束本次降采样并保留源；final flush 必要时将剩余内存源按 raw 落盘 |
 | timestamps | 五个原生 Block 分别编码并校验一致性，按批次生成顺序只写一次；五列共享同一 offset/size，不进入 spill |
 | index 分块 | 大小阈值、租户变化或 feature 结束时 flush；每 row 只含同分辨率、同特征、同租户，可含多个 TSID |
 | 打开校验 | 有界五路遍历全部 index，校验列齐全、共享时间戳描述、排序、统计及 timestamps/values 全文件连续覆盖；不积累全量 header/offset 集合，不解码数值 payload |
@@ -30,8 +31,9 @@
 
 ## 验证状态与范围
 
+- 本次错误处理范围为 spill 及降采样自己的 writer/reader/merger；`lib/fs`、通用 part 关闭和源 part 回收保持原实现。回退后的验证结果见测试说明，本次 E2E 待用户运行。
 - 当前 Go 布局/损坏测试采用 89/113 字节及 feature 0..4。完整 storage、降采样跨包定向及 storage 定向 race 已通过，详见测试说明。
 - Python `downsampling_inspect.py` 已适配当前格式；检查器 UT 和 Go writer 实盘交叉验证用于核对新解析器。
 - 一键入口单独运行布局与遍历 Go UT，保证同一 `(resolution, feature)` 内跨 index 的覆盖；160 条时间线的集群长周期场景如实报告实际覆盖，不将 feature 切换计为同列跨 index。
-- 当前格式的完整一键集群测试已通过：15 个阶段、1670 项 E2E，最大绝对误差为 0；重启前后二十组快照、780 个查询点严格一致。证据：`/private/var/folders/tk/llwph05x6_xgbmqxbxkq_6m40000gn/T/vm-downsampling-e2e-8n7u6mcp/manifest.json`。历史旧布局结果单独保留在测试说明中。
+- spill 重构前的当前格式完整一键集群测试已通过：15 个阶段、1670 项 E2E，最大绝对误差为 0；重启前后二十组快照、780 个查询点严格一致。证据：`/private/var/folders/tk/llwph05x6_xgbmqxbxkq_6m40000gn/T/vm-downsampling-e2e-8n7u6mcp/manifest.json`。本次 spill/错误处理重构的 E2E 由用户重新运行，不能沿用上述结果。
 - 跨未归并 part 查询侧再聚合、raw/摘要混合查询、多节点副本故障及崩溃恢复仍不在本次验证范围内。

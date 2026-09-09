@@ -88,6 +88,9 @@ type partition struct {
 	// the path to directory with IndexDB parts.
 	indexDBPartsPath string
 
+	// 仅测试使用；每个 partition 独立注入发布前后故障，不影响其他作业。
+	downsampleTestHook func(stage, path string) error
+
 	// The parent storage.
 	// TODO(@rtm0): Do not depend on Storage, pass only what is required.
 	s *Storage
@@ -556,7 +559,7 @@ func (pt *partition) inmemoryPartsMerger() {
 			// Try merging additional parts.
 			continue
 		}
-		if errors.Is(err, errForciblyStopped) || errors.Is(err, errDownsampleNoSpace) {
+		if errors.Is(err, errForciblyStopped) || errors.Is(err, errDownsampleMergeFailed) {
 			// Nothing to do - finish the merger.
 			return
 		}
@@ -589,7 +592,7 @@ func (pt *partition) smallPartsMerger() {
 			// Try merging additional parts.
 			continue
 		}
-		if errors.Is(err, errForciblyStopped) || errors.Is(err, errDownsampleNoSpace) {
+		if errors.Is(err, errForciblyStopped) || errors.Is(err, errDownsampleMergeFailed) {
 			// Nothing to do - finish the merger.
 			return
 		}
@@ -622,7 +625,7 @@ func (pt *partition) bigPartsMerger() {
 			// Try merging additional parts.
 			continue
 		}
-		if errors.Is(err, errForciblyStopped) || errors.Is(err, errDownsampleNoSpace) {
+		if errors.Is(err, errForciblyStopped) || errors.Is(err, errDownsampleMergeFailed) {
 			// Nothing to do - finish the merger.
 			return
 		}
@@ -1029,6 +1032,40 @@ func (pt *partition) flushInmemoryRowsToFiles() {
 }
 
 func (pt *partition) flushInmemoryPartsToFiles(isFinal bool) {
+	err := pt.flushInmemoryPartsToFilesWithDownsampling(isFinal, pt.s.downsamplingEnabled)
+	if errors.Is(err, errDownsampleMergeFailed) {
+		if !isFinal {
+			// 保留全部失败源，结束本轮周期 flush。
+			return
+		}
+		// 关闭和 snapshot 必须保全待落盘样本。降采样作业已退出；
+		// 对仍在内存的源执行独立的原始落盘，不改变共享降采样配置。
+		downsampleMergeLogger.Warnf("falling back to raw final flush for partition %q after downsampling failure: %s", pt.name, err)
+		err = pt.flushInmemoryPartsToFilesWithDownsampling(true, false)
+	}
+	if err != nil {
+		logger.Panicf("FATAL: cannot merge in-memory parts: %s", err)
+	}
+	if isFinal && pt.s.downsamplingEnabled {
+		// rename 后的目录同步失败可能已移除了全部内存源。最终持久化
+		// 不能以“没有剩余源”判断成功，必须重新确保当前 manifest 已落盘。
+		func() {
+			pt.partsLock.Lock()
+			defer pt.partsLock.Unlock()
+			if pt.downsampleTestHook != nil {
+				err = pt.downsampleTestHook("sync-final-dir", pt.smallPartsPath)
+			}
+			if err == nil {
+				err = syncDownsampleDir(pt.smallPartsPath)
+			}
+		}()
+		if err != nil {
+			logger.Panicf("FATAL: cannot sync final part manifest for %q: %s", pt.name, err)
+		}
+	}
+}
+
+func (pt *partition) flushInmemoryPartsToFilesWithDownsampling(isFinal, downsampling bool) error {
 	currentTime := time.Now()
 	var pws []*partWrapper
 
@@ -1041,16 +1078,14 @@ func (pt *partition) flushInmemoryPartsToFiles(isFinal bool) {
 	}
 	pt.partsLock.Unlock()
 
-	if err := pt.mergePartsToFiles(pws, nil, inmemoryPartsConcurrencyCh, false); err != nil {
-		// 周期 flush 空间不足时保留内存源，等待后续调度；关闭和 snapshot 不允许忽略失败。
-		if !isFinal && errors.Is(err, errDownsampleNoSpace) {
-			return
-		}
-		logger.Panicf("FATAL: cannot merge in-memory parts: %s", err)
-	}
+	return pt.mergePartsToFilesWithDownsampling(pws, nil, inmemoryPartsConcurrencyCh, false, downsampling)
 }
 
 func (pt *partition) mergePartsToFiles(pws []*partWrapper, stopCh <-chan struct{}, concurrencyCh chan struct{}, useSparseCache bool) error {
+	return pt.mergePartsToFilesWithDownsampling(pws, stopCh, concurrencyCh, useSparseCache, pt.s.downsamplingEnabled)
+}
+
+func (pt *partition) mergePartsToFilesWithDownsampling(pws []*partWrapper, stopCh <-chan struct{}, concurrencyCh chan struct{}, useSparseCache, downsampling bool) error {
 	pwsLen := len(pws)
 
 	var errGlobal error
@@ -1058,13 +1093,24 @@ func (pt *partition) mergePartsToFiles(pws []*partWrapper, stopCh <-chan struct{
 	wg := getWaitGroup()
 	for len(pws) > 0 {
 		pwsToMerge, pwsRemaining := getPartsForOptimalMerge(pws)
-		if pt.s.downsamplingEnabled {
+		if downsampling {
 			pwsToMerge, pwsRemaining = splitDownsampleMergeBatch(pwsToMerge, pwsRemaining)
 		}
 		concurrencyCh <- struct{}{}
+		if downsampling {
+			errGlobalLock.Lock()
+			failed := errGlobal != nil
+			errGlobalLock.Unlock()
+			if failed {
+				<-concurrencyCh
+				pt.releasePartsToMerge(pwsToMerge)
+				pt.releasePartsToMerge(pwsRemaining)
+				break
+			}
+		}
 
 		wg.Go(func() {
-			if err := pt.mergeParts(pwsToMerge, stopCh, true, useSparseCache); err != nil && !errors.Is(err, errForciblyStopped) {
+			if err := pt.mergePartsWithDownsampling(pwsToMerge, stopCh, true, useSparseCache, downsampling); err != nil && (downsampling || !errors.Is(err, errForciblyStopped)) {
 				errGlobalLock.Lock()
 				if errGlobal == nil {
 					errGlobal = err
@@ -1242,6 +1288,10 @@ func getMinDedupInterval(pws []*partWrapper) int64 {
 // All the parts inside pws must have isInMerge field set to true.
 // The isInMerge field inside pws parts is set to false before returning from the function.
 func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isFinal, useSparseCache bool) error {
+	return pt.mergePartsWithDownsampling(pws, stopCh, isFinal, useSparseCache, pt.s.downsamplingEnabled)
+}
+
+func (pt *partition) mergePartsWithDownsampling(pws []*partWrapper, stopCh <-chan struct{}, isFinal, useSparseCache, downsampling bool) error {
 	if len(pws) == 0 {
 		logger.Panicf("BUG: empty pws cannot be passed to mergeParts()")
 	}
@@ -1252,12 +1302,17 @@ func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isFi
 	startTime := time.Now()
 
 	// Initialize destination paths.
-	dstPartType := pt.getDstPartType(pws, isFinal)
+	var dstPartType partType
+	if downsampling {
+		dstPartType = pt.getDstPartType(pws, isFinal)
+	} else {
+		dstPartType = pt.getRawDstPartType(pws, isFinal)
+	}
 	mergeIdx := pt.nextMergeIdx()
 	dstPartPath := pt.getDstPartPath(dstPartType, mergeIdx)
 
 	// 在所有文件输出入口之前分派，包含单个 inmemory part 的直接 dump。
-	if pt.s.downsamplingEnabled && dstPartType != partInmemory {
+	if downsampling && dstPartType != partInmemory {
 		return pt.mergeDownsampleParts(pws, dstPartType, dstPartPath, stopCh, startTime)
 	}
 

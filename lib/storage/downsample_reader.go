@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -53,16 +54,17 @@ func (r *downsampleReader) Init(p *part, resolution int64, features ...uint8) er
 		feature = features[0]
 	}
 	if p == nil || !validDownsampleResolution(resolution) || feature >= countOfDownsampleFeatures || len(features) > 1 {
-		r.reset()
-		return fmt.Errorf("无效降采样源或分辨率")
+		return errors.Join(fmt.Errorf("无效降采样源或分辨率"), r.reset())
 	}
 	// part 不可变，同一源的窗口切换复用文件句柄和工作缓冲。
 	if r.p == p {
 		r.resolution, r.feature = resolution, feature
 		r.SetFilter(nil, minUnixMilli, maxUnixMilli)
-		return nil
+		return r.err
 	}
-	r.reset()
+	if err := r.reset(); err != nil {
+		return err
+	}
 	r.p = p
 	r.resolution, r.feature = resolution, feature
 	if p.dsMetadata != nil {
@@ -73,14 +75,12 @@ func (r *downsampleReader) Init(p *part, resolution int64, features ...uint8) er
 		for i, name := range []string{timestampsFilename, valuesFilename, indexFilename} {
 			f, err := os.Open(filepath.Join(p.path, name))
 			if err != nil {
-				r.reset()
-				return err
+				return errors.Join(err, r.reset())
 			}
 			r.files[i] = f
 			st, err := f.Stat()
 			if err != nil {
-				r.reset()
-				return err
+				return errors.Join(err, r.reset())
 			}
 			r.fileSizes[i] = uint64(st.Size())
 		}
@@ -88,21 +88,21 @@ func (r *downsampleReader) Init(p *part, resolution int64, features ...uint8) er
 		for i, f := range []fs.MustReadAtCloser{p.timestampsFile, p.valuesFile, p.indexFile} {
 			b, ok := f.(*chunkedbuffer.Buffer)
 			if !ok {
-				r.reset()
-				return fmt.Errorf("不支持的 inmemory 原始缓冲")
+				return errors.Join(fmt.Errorf("不支持的 inmemory 原始缓冲"), r.reset())
 			}
 			r.fileSizes[i] = uint64(b.SizeBytes())
 		}
 	}
 	r.SetFilter(nil, minUnixMilli, maxUnixMilli)
-	return nil
+	return r.err
 }
 
 // SetFilter 重置索引游标；筛选相交 block，不提前过滤 block 内的样本贡献。
 func (r *downsampleReader) SetFilter(tsid *TSID, minTimestamp, maxTimestamp int64) {
+	var closeErr error
 	for i, peer := range r.peers {
 		if peer != nil {
-			putDownsampleReader(peer)
+			closeErr = errors.Join(closeErr, putDownsampleReader(peer))
 			r.peers[i] = nil
 		}
 	}
@@ -125,9 +125,9 @@ func (r *downsampleReader) SetFilter(tsid *TSID, minTimestamp, maxTimestamp int6
 	r.previousValuesEnd = 0
 	r.previousIndexHeader = blockHeader{}
 	r.hasPreviousIndex = false
-	r.err = nil
+	r.err = closeErr
 	if minTimestamp > maxTimestamp {
-		r.err = fmt.Errorf("无效降采样读取窗口")
+		r.err = errors.Join(r.err, fmt.Errorf("无效降采样读取窗口"))
 		return
 	}
 	if r.p == nil {
@@ -539,11 +539,18 @@ func (r *downsampleReader) readRawBlock(b *downsampleBatch, h *blockHeader) erro
 	return nil
 }
 
-func (r *downsampleReader) reset() {
+// Close 释放 reader 自己打开的原始源文件；下采样 part 的文件由引用持有者管理。
+// 即使一个文件关闭失败，也尝试其余文件，并清除句柄以避免重复关闭。
+func (r *downsampleReader) Close() error {
+	return r.reset()
+}
+
+func (r *downsampleReader) reset() error {
+	var closeErr error
 	if r.ownFiles {
 		for _, f := range r.files {
 			if f != nil {
-				_ = f.Close()
+				closeErr = errors.Join(closeErr, f.Close())
 			}
 		}
 	}
@@ -553,6 +560,8 @@ func (r *downsampleReader) reset() {
 	r.ownFiles = false
 	r.resolution = 0
 	r.SetFilter(nil, 0, 0)
+	closeErr = errors.Join(closeErr, r.err)
+	r.err = nil
 	for _, p := range []*[]byte{&r.indexData, &r.compressed} {
 		if cap(*p) > downsampleMaxIndexSize {
 			*p = nil
@@ -566,6 +575,7 @@ func (r *downsampleReader) reset() {
 		r.decompressed = r.decompressed[:0]
 	}
 	r.block.Reset()
+	return closeErr
 }
 
 func getDownsampleReader() *downsampleReader {
@@ -574,9 +584,10 @@ func getDownsampleReader() *downsampleReader {
 	}
 	return &downsampleReader{}
 }
-func putDownsampleReader(r *downsampleReader) {
-	r.reset()
+func putDownsampleReader(r *downsampleReader) error {
+	err := r.Close()
 	downsampleReaderPool.Put(r)
+	return err
 }
 
 var downsampleReaderPool sync.Pool

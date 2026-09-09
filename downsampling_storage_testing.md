@@ -1,6 +1,34 @@
 # 降采样存储测试说明
 
-## 当前布局与本次验证（2026-09-09）
+## Spill 与失败清理重构（2026-09-10）
+
+本次修改生产 Go 代码，保持下述 89/113 字节布局不变。新增独立的 `filestream.SpillWriter`，最终文件使用 filestream，并补齐降采样错误返回、未发布文件清理及调度退出。
+重构后的 E2E 由用户运行；2026-09-09 的通过记录属于重构前代码。
+
+故障测试覆盖：spill 创建、写入/短写、flush、seek、读错误/截断/无进展、消费不完整、回调错误、关闭和删除重试；最终四个二进制文件逐个注入写入/短写/关闭/取消错误，metadata 创建失败、下一批数据验证失败。
+断言包含原错误传播、全部句柄释放、整个未发布目标目录消失、禁止后续发布、实例可重新初始化；文件权限与同进程 `os.Create` 对比，不修改进程 umask。
+发布与调度测试覆盖提交前保留源和 manifest、提交后同步失败保留完整目标、周期 flush 退出，以及关闭/快照实际生命周期的 raw 回退和最终清单同步。
+reader/merger 测试覆盖自有 raw 文件全部关闭、借用摘要文件保持打开、换源关闭失败，以及归并返回时关闭失败与写入失败或取消同时发生；断言错误聚合、取消信号保留和未发布目标清理。
+
+本次范围为 spill 及降采样自己的 writer、reader、merger。`lib/fs` 的生产代码和测试均保持 HEAD 原样，通用 part 关闭、磁盘空间查询和提交后源 part 回收沿用既有 Must 接口及语义，不捕获底层 panic。
+
+一键入口新增独立 `go-io-ut` 阶段，运行 filestream 完整 UT；原有 storage 布局及降采样 UT 继续执行。完整成功运行现在为 16 个阶段，仍须总 `status=passed` 且每阶段退出码为 0。
+
+回退后的当前代码已完成以下验证：
+
+| 验证命令 | 结果 |
+|---|---|
+| `DISABLE_FSYNC_FOR_TESTING=false go test ./lib/filestream -count=1 -timeout=3m` | 通过，0.833s |
+| `go test ./lib/storage -count=1 -timeout=10m` | 通过，23.230s |
+| `DISABLE_FSYNC_FOR_TESTING=false go test -race ./lib/filestream ./lib/storage -run '^Test(Spill\|Writer\|Downsample\|Downsampling\|CheckDownsampling\|MustOpenStorageDownsampling\|EstimateDownsample\|ReserveDownsample)' -count=1 -timeout=5m` | 通过；filestream 1.927s，storage 10.596s |
+| `go test -p 4 ./lib/vmselectapi ./app/vmstorage ./app/vmselect/netstorage ./app/vmselect/prometheus -run 'Test(Downsample\|Downsampling\|CheckDownsampling\|MustOpenStorageDownsampling)' -count=1 -timeout=3m` | 全部通过；vmstorage 无匹配测试，完成编译 |
+| `go vet ./lib/filestream ./lib/storage` | 通过 |
+| `git diff --exit-code HEAD -- lib/fs lib/storage/part.go lib/storage/downsample_part.go lib/storage/downsample_space.go` | 通过；这些文件与 HEAD 一致，`lib/fs` 也无新增文件 |
+
+当前验证清单为 `/tmp/codex-downsampling-scoped-validation.json`，记录命令、日志、工作区文件 SHA256 和范围检查。日志前缀为 `/tmp/codex-downsampling-scoped-`；入口 shell/内嵌 Python 语法检查及 `git diff --check` 也已通过。
+回退前的 `/tmp/codex-downsampling-refactor-validation.json` 仅为历史验证记录，不能代表本次收缩范围后的代码。E2E 仍由用户运行，在仓库根目录执行 `./lib/storage/testdata/downsampling_e2e.sh`。
+
+## 当前布局及重构前验证（2026-09-09）
 
 当前生产实现以 [文件布局](downsampling_storage_file_layout.md) 为准：集群版 89 字节原生 header、113 字节嵌入式 metaindex；
 五路磁盘 spill 在分辨率结束时按 feature 完整输出，values/index/metaindex 全局按 resolution/feature/TSID/时间排列。
@@ -8,8 +36,7 @@ timestamps 按生成顺序只写一次（五列分别编码并校验一致性）
 `TSID.Less` 先比较 AccountID、ProjectID；租户变化仍须切 row。分段 index flush 不得导致 feature 从 4 回退到 0。
 
 **当前 feature 编号为 0..4。旧 99/112 字节格式，以及 `ae899eded` 的 89/113 字节、feature 1..5 格式都不兼容，且无迁移。** 版本号和 magic 仍为 2，不能据此复用旧摘要目录。
-检查器已适配当前格式；下文历史集群与一键结果仍属于旧布局，不代表当前布局已通过 E2E。
-本次更新文档、检查器和一键验证入口，不修改生产 Go 代码；用户已完成当前布局的一键集群测试，结果及产物已复核通过。
+检查器已适配当前格式。2026-09-09 更新了文档、检查器和一键验证入口，用户完成当前布局的一键集群测试，结果及产物已复核通过；文末更早的历史记录仍属于旧布局。
 
 当前空间测试覆盖：
 
@@ -44,7 +71,7 @@ timestamps 按生成顺序只写一次（五列分别编码并校验一致性）
 交叉验证证据：`/var/folders/tk/llwph05x6_xgbmqxbxkq_6m40000gn/T/vm-downsampling-inspector-check-m0jx8mk8/cross_validation.json`；同目录保留 Go overlay、fixture 清单、各组 `inspection.json`、`python-ut.log` 和含脚本 SHA256 的 `validation.json`。
 `feature_switch` 单独报告；跨 TSID、同 TSID 延续和多个 index 的覆盖只在同一 `(resolution, feature)` 内计算。
 
-## 当前布局一键结果
+## 当前布局一键结果（spill 重构前）
 
 证据目录：`/private/var/folders/tk/llwph05x6_xgbmqxbxkq_6m40000gn/T/vm-downsampling-e2e-8n7u6mcp`，总清单为其中的 `manifest.json`。本次于 2026-09-09 运行，15 个阶段均为 `passed`、退出码均为 0。
 候选为 `dcb40bdc9774d39ff696ea7449aad26247e93def` 加本次文档和测试工具更新。复核时 HEAD、工作区 diff 与清单记录一致，12 个测试脚本的快照/工作区 SHA256 和两套共六个二进制 SHA256 全部匹配。
@@ -132,6 +159,7 @@ Python UT 使用手算结果验证五特征、格子边界、共享时间戳、�
 
 ```sh
 python3 -B -W error::ResourceWarning -m unittest discover -s lib/storage/testdata -p 'test_downsampling_*.py' -v
+go test -p 4 ./lib/filestream -count=1
 go test -p 4 ./lib/storage ./lib/vmselectapi ./app/vmstorage ./app/vmselect/netstorage ./app/vmselect/prometheus -run 'Test(Downsample|Downsampling|CheckDownsampling|MustOpenStorageDownsampling|EstimateDownsample|ReserveDownsample)' -count=1
 ```
 
