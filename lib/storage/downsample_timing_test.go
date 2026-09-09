@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-var downsampleBenchmarkPoint downsamplePoint
+var downsampleBenchmarkPoint downsampleSample
 
 func BenchmarkDownsampleAccumulator(b *testing.B) {
 	const rowsCount = 8192
@@ -18,10 +18,10 @@ func BenchmarkDownsampleAccumulator(b *testing.B) {
 			name = "Summary"
 		}
 		b.Run(name, func(b *testing.B) {
-			points := make([]downsamplePoint, rowsCount)
+			points := make([]downsampleSample, rowsCount)
 			for i := range points {
 				v := float64(i%17 - 8)
-				points[i] = downsamplePoint{minUnixMilli + int64(i), [5]float64{v, v * 16, 16, v - 2, v + 2}}
+				points[i] = downsampleSample{minUnixMilli + int64(i), [5]float64{v, v * 16, 16, v - 2, v + 2}}
 			}
 			var a downsampleAccumulator
 			b.ReportAllocs()
@@ -32,12 +32,12 @@ func BenchmarkDownsampleAccumulator(b *testing.B) {
 					if summary {
 						a.AddSummary(&points[j])
 					} else {
-						a.AddRaw(points[j].timestamp, points[j].values[downsampleFeatureLast])
+						a.AddRawRow(points[j].timestamp, points[j].values[downsampleFeatureLast])
 					}
 				}
 			}
 			b.StopTimer()
-			downsampleBenchmarkPoint = a.point
+			downsampleBenchmarkPoint = a.sample
 			reportDownsampleBenchmarkRows(b, rowsCount)
 		})
 	}

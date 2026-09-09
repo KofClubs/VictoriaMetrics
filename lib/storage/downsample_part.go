@@ -34,7 +34,7 @@ func (m *downsamplePartMetadata) validate() error {
 	if m.FormatVersion != downsampleVersion || m.SemanticsVersion != downsampleVersion || m.Mode != "downsampling" || len(m.Resolutions) != 2 || m.Resolutions[0] != 300000 || m.Resolutions[1] != 3600000 || m.BucketOrigin != 0 || m.NumericCodec != "decimal-values" || m.Retention != "bucket-end" || m.MinDedupInterval != 0 {
 		return fmt.Errorf("不支持或矛盾的降采样格式、分辨率或语义元数据")
 	}
-	if m.RowsCount%downsampleFeaturesCount != 0 || m.BlocksCount%downsampleFeaturesCount != 0 {
+	if m.RowsCount%countOfDownsampleFeatures != 0 || m.BlocksCount%countOfDownsampleFeatures != 0 {
 		return fmt.Errorf("降采样物理行数和 Block 数量必须按五个特征成组")
 	}
 	if m.MinTimestamp < minUnixMilli || m.MaxTimestamp > maxUnixMilli {

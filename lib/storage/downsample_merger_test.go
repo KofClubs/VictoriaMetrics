@@ -262,12 +262,12 @@ func TestDownsampleMergerSpecialValues(t *testing.T) {
 		{TSID: TSID{MetricID: 8}, Timestamp: base + 60000, Value: decimal.StaleNaN, PrecisionBits: 64},
 		{TSID: TSID{MetricID: 8}, Timestamp: base + 120000, Value: 5, PrecisionBits: 64},
 	}
-	want := make(map[downsampleTestKey]downsamplePoint)
+	want := make(map[downsampleTestKey]downsampleSample)
 	for _, resolution := range downsampleResolutions {
-		want[downsampleTestKey{TSID{MetricID: 7}, resolution, base / resolution}] = downsamplePoint{
+		want[downsampleTestKey{TSID{MetricID: 7}, resolution, base / resolution}] = downsampleSample{
 			base + 120000, [5]float64{math.Inf(-1), decimal.StaleNaN, 2, math.Inf(-1), math.Inf(1)},
 		}
-		want[downsampleTestKey{TSID{MetricID: 8}, resolution, base / resolution}] = downsamplePoint{
+		want[downsampleTestKey{TSID{MetricID: 8}, resolution, base / resolution}] = downsampleSample{
 			base + 120000, [5]float64{5, decimal.StaleNaN, 2, decimal.StaleNaN, decimal.StaleNaN},
 		}
 	}
@@ -420,7 +420,7 @@ func TestDownsampleMergerSharedPrecisionAndColumnScales(t *testing.T) {
 		}()
 	}
 	// 参考结果以原 codec 解码后的输入为基准，再独立执行摘要运算和输出编码。
-	points := make(map[int64]downsamplePoint)
+	points := make(map[int64]downsampleSample)
 	for _, block := range decoded {
 		for row, timestamp := range block.timestamps {
 			bucket := timestamp / block.resolution
@@ -530,10 +530,10 @@ func roundTripDownsampleTestReferenceBlock(t *testing.T, source *downsampleBatch
 	return result
 }
 
-func downsampleTestBlockRows(block *downsampleBatch) map[downsampleTestKey]downsamplePoint {
-	rows := make(map[downsampleTestKey]downsamplePoint)
+func downsampleTestBlockRows(block *downsampleBatch) map[downsampleTestKey]downsampleSample {
+	rows := make(map[downsampleTestKey]downsampleSample)
 	for row, timestamp := range block.timestamps {
-		point := downsamplePoint{timestamp: timestamp}
+		point := downsampleSample{timestamp: timestamp}
 		for feature := range point.values {
 			point.values[feature] = block.values[feature][row]
 		}
@@ -609,9 +609,9 @@ func runDownsampleTestMergeWindow(t *testing.T, m *downsampleMerger, sources []*
 	return pw, stats
 }
 
-func readDownsampleTestPart(t *testing.T, p *part) map[downsampleTestKey]downsamplePoint {
+func readDownsampleTestPart(t *testing.T, p *part) map[downsampleTestKey]downsampleSample {
 	t.Helper()
-	result := make(map[downsampleTestKey]downsamplePoint)
+	result := make(map[downsampleTestKey]downsampleSample)
 	r := getDownsampleReader()
 	defer putDownsampleReader(r)
 	b := getDownsampleBatch()
@@ -629,7 +629,7 @@ func readDownsampleTestPart(t *testing.T, p *part) map[downsampleTestKey]downsam
 				if _, ok := result[key]; ok {
 					t.Fatalf("multiple rows for target bucket %+v", key)
 				}
-				point := downsamplePoint{timestamp: timestamp}
+				point := downsampleSample{timestamp: timestamp}
 				for feature := range point.values {
 					point.values[feature] = b.values[feature][i]
 				}
@@ -643,7 +643,7 @@ func readDownsampleTestPart(t *testing.T, p *part) map[downsampleTestKey]downsam
 	return result
 }
 
-func referenceDownsampleTestRows(rows []rawRow, deleted *uint64set.Set, deadline int64) map[downsampleTestKey]downsamplePoint {
+func referenceDownsampleTestRows(rows []rawRow, deleted *uint64set.Set, deadline int64) map[downsampleTestKey]downsampleSample {
 	groups := make(map[downsampleTestKey][]downsampleTestSample)
 	for _, row := range rows {
 		if deleted != nil && deleted.Has(row.TSID.MetricID) {
@@ -658,14 +658,14 @@ func referenceDownsampleTestRows(rows []rawRow, deleted *uint64set.Set, deadline
 			groups[key] = append(groups[key], downsampleTestSample{row.Timestamp, row.Value})
 		}
 	}
-	result := make(map[downsampleTestKey]downsamplePoint)
+	result := make(map[downsampleTestKey]downsampleSample)
 	for key, samples := range groups {
 		result[key] = referenceDownsampleTestPoint(samples)
 	}
 	return result
 }
 
-func assertDownsampleTestRows(t *testing.T, got, want map[downsampleTestKey]downsamplePoint) {
+func assertDownsampleTestRows(t *testing.T, got, want map[downsampleTestKey]downsampleSample) {
 	t.Helper()
 	if len(got) != len(want) {
 		t.Fatalf("unexpected summary rows; got %d; want %d\ngot: %+v\nwant: %+v", len(got), len(want), got, want)

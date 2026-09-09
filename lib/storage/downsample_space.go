@@ -29,8 +29,8 @@ func estimateDownsamplePartSize(pws []*partWrapper) uint64 {
 		} else {
 			// 完整摘要每行对应五个单值 Block 行；非整除统计保守向上取整。
 			physicalRows := n
-			n /= downsampleFeaturesCount
-			if physicalRows%downsampleFeaturesCount != 0 {
+			n /= countOfDownsampleFeatures
+			if physicalRows%countOfDownsampleFeatures != 0 {
 				n++
 			}
 		}
@@ -46,7 +46,7 @@ func estimateDownsamplePartSize(pws []*partWrapper) uint64 {
 // estimateDownsampleOutputSize 以摘要行与五 Block 批次数计算共享时间戳、五值列及索引上界。
 func estimateDownsampleOutputSize(rows, blocks uint64) uint64 {
 	// 每个 int64 的 varint 最多十字节；MarshalValues/MarshalTimestamps 在压缩无效时退回原始 varint。
-	payload := multiplyDownsampleSpace(rows, 10*uint64(downsampleFeaturesCount+1))
+	payload := multiplyDownsampleSpace(rows, 10*uint64(countOfDownsampleFeatures+1))
 	index := addDownsampleSpace(multiplyDownsampleSpace(uint64(downsampleBlockHeaderSize), 2), 256+uint64(len(downsampleIndexMagic)))
 	metaindex := addDownsampleSpace(multiplyDownsampleSpace(uint64(downsampleMetaindexRowSize), 2), 256+uint64(len(downsampleMetaindexMagic)))
 	indexBytes := multiplyDownsampleSpace(blocks, addDownsampleSpace(index, metaindex))

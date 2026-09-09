@@ -375,11 +375,11 @@ func assertDownsampleTestStorageFormats(t *testing.T, s *Storage, requireRaw, re
 	}
 }
 
-func assertDownsampleTestStorageRows(t *testing.T, s *Storage, want map[downsampleTestKey]downsamplePoint) {
+func assertDownsampleTestStorageRows(t *testing.T, s *Storage, want map[downsampleTestKey]downsampleSample) {
 	t.Helper()
 	ptws := s.tb.GetAllPartitions(nil)
 	defer s.tb.PutPartitions(ptws)
-	got := make(map[downsampleTestKey]downsamplePoint)
+	got := make(map[downsampleTestKey]downsampleSample)
 	for _, ptw := range ptws {
 		func() {
 			parts := ptw.pt.GetParts(nil, true)

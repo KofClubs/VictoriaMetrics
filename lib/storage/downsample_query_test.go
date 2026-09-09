@@ -53,7 +53,7 @@ func TestDownsampleQueryFieldBlockRef(t *testing.T) {
 	var ps partSearch
 	defer ps.reset()
 	for _, resolution := range downsampleResolutions {
-		for feature := uint8(0); feature < downsampleFeaturesCount; feature++ {
+		for feature := uint8(0); feature < countOfDownsampleFeatures; feature++ {
 			t.Run(fmt.Sprintf("%d/%d", resolution, feature), func(t *testing.T) {
 				q := DownsampleQueryField{ResolutionMs: resolution, Feature: feature}
 				ps.initWithDownsampleField(p, []TSID{{MetricID: 1}, {MetricID: 10}, {MetricID: 25}, {MetricID: 30}, {MetricID: 40}}, tr, &q)
@@ -109,7 +109,7 @@ func TestDownsampleQueryFieldRawIsolationAndReset(t *testing.T) {
 	defer ps.reset()
 	tsids := []TSID{{MetricID: 10}}
 	tr := TimeRange{MinTimestamp: 0, MaxTimestamp: 200}
-	for feature := uint8(0); feature < downsampleFeaturesCount; feature++ {
+	for feature := uint8(0); feature < countOfDownsampleFeatures; feature++ {
 		ps.initWithDownsampleField(p, tsids, tr, &DownsampleQueryField{ResolutionMs: 300000, Feature: feature})
 		if ps.NextBlock() || ps.Error() != nil {
 			t.Fatalf("原始数据冒充字段 %d: %v", feature, ps.Error())
@@ -142,7 +142,7 @@ func TestDownsampleQueryFieldSharedPrecision(t *testing.T) {
 	var ps partSearch
 	defer ps.reset()
 	tr := TimeRange{MinTimestamp: minUnixMilli, MaxTimestamp: maxUnixMilli}
-	for feature := uint8(0); feature < downsampleFeaturesCount; feature++ {
+	for feature := uint8(0); feature < countOfDownsampleFeatures; feature++ {
 		q := DownsampleQueryField{ResolutionMs: 300000, Feature: feature}
 		ps.initWithDownsampleField(p, []TSID{b.tsid}, tr, &q)
 		if !ps.NextBlock() {

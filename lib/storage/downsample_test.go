@@ -81,100 +81,100 @@ func TestDownsampleAccumulatorRaw(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		samples []downsampleTestSample
-		want    downsamplePoint
+		want    downsampleSample
 	}{
 		{
 			name:    "single",
 			samples: []downsampleTestSample{{1, -2.5}},
-			want:    downsamplePoint{1, [5]float64{-2.5, -2.5, 1, -2.5, -2.5}},
+			want:    downsampleSample{1, [5]float64{-2.5, -2.5, 1, -2.5, -2.5}},
 		},
 		{
 			name:    "duplicates",
 			samples: []downsampleTestSample{{1, 8}, {1, 8}, {1, 3}, {2, 5}},
-			want:    downsamplePoint{2, [5]float64{5, 24, 4, 3, 8}},
+			want:    downsampleSample{2, [5]float64{5, 24, 4, 3, 8}},
 		},
 		{
 			name:    "timestamp-before-value",
 			samples: []downsampleTestSample{{4, 3}, {1, 100}, {4, 8}},
-			want:    downsamplePoint{4, [5]float64{8, 111, 3, 3, 100}},
+			want:    downsampleSample{4, [5]float64{8, 111, 3, 3, 100}},
 		},
 		{
 			name:    "latest-stale",
 			samples: []downsampleTestSample{{4, stale}, {1, 2}, {2, 3}},
-			want:    downsamplePoint{4, [5]float64{stale, stale, 3, stale, stale}},
+			want:    downsampleSample{4, [5]float64{stale, stale, 3, stale, stale}},
 		},
 		{
 			name:    "earlier-stale",
 			samples: []downsampleTestSample{{1, stale}, {2, 3}},
-			want:    downsamplePoint{2, [5]float64{3, stale, 2, stale, stale}},
+			want:    downsampleSample{2, [5]float64{3, stale, 2, stale, stale}},
 		},
 		{
 			name:    "same-timestamp-number-first",
 			samples: []downsampleTestSample{{1, 2}, {1, stale}, {1, 3}},
-			want:    downsamplePoint{1, [5]float64{3, stale, 3, stale, stale}},
+			want:    downsampleSample{1, [5]float64{3, stale, 3, stale, stale}},
 		},
 		{
 			name:    "same-timestamp-stale-first",
 			samples: []downsampleTestSample{{1, nan}, {1, -2}, {1, stale}},
-			want:    downsamplePoint{1, [5]float64{-2, stale, 3, stale, stale}},
+			want:    downsampleSample{1, [5]float64{-2, stale, 3, stale, stale}},
 		},
 		{
 			name:    "all-stale",
 			samples: []downsampleTestSample{{1, nan}, {2, stale}},
-			want:    downsamplePoint{2, [5]float64{stale, stale, 2, stale, stale}},
+			want:    downsampleSample{2, [5]float64{stale, stale, 2, stale, stale}},
 		},
 		{
 			name:    "opposite-infinities",
 			samples: []downsampleTestSample{{1, math.Inf(1)}, {2, math.Inf(-1)}, {1, 5}},
-			want:    downsamplePoint{2, [5]float64{math.Inf(-1), stale, 3, math.Inf(-1), math.Inf(1)}},
+			want:    downsampleSample{2, [5]float64{math.Inf(-1), stale, 3, math.Inf(-1), math.Inf(1)}},
 		},
 		{
 			name:    "infinity-and-stale-at-same-time",
 			samples: []downsampleTestSample{{1, stale}, {1, math.Inf(-1)}, {1, math.Inf(1)}},
-			want:    downsamplePoint{1, [5]float64{math.Inf(1), stale, 3, stale, stale}},
+			want:    downsampleSample{1, [5]float64{math.Inf(1), stale, 3, stale, stale}},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var a downsampleAccumulator
 			for _, sample := range tc.samples {
-				a.AddRaw(minUnixMilli+sample.timestamp, sample.value)
+				a.AddRawRow(minUnixMilli+sample.timestamp, sample.value)
 			}
 			if !a.initialized {
 				t.Fatal("accumulator wasn't initialized")
 			}
 			tc.want.timestamp += minUnixMilli
-			assertDownsamplePoint(t, &a.point, &tc.want)
+			assertDownsamplePoint(t, &a.sample, &tc.want)
 		})
 	}
 }
 
 func TestDownsampleAccumulatorSummary(t *testing.T) {
-	aPoint := downsamplePoint{minUnixMilli + 4, [5]float64{8, 20.5, 1.25, -2, 10}}
-	bPoint := downsamplePoint{minUnixMilli + 4, [5]float64{3, 12, 2.5, -5, 20}}
+	aPoint := downsampleSample{minUnixMilli + 4, [5]float64{8, 20.5, 1.25, -2, 10}}
+	bPoint := downsampleSample{minUnixMilli + 4, [5]float64{3, 12, 2.5, -5, 20}}
 	var a downsampleAccumulator
 	a.AddSummary(&aPoint)
 	a.AddSummary(&bPoint)
-	want := downsamplePoint{minUnixMilli + 4, [5]float64{8, 32.5, 3.75, -5, 20}}
-	assertDownsamplePoint(t, &a.point, &want)
+	want := downsampleSample{minUnixMilli + 4, [5]float64{8, 32.5, 3.75, -5, 20}}
+	assertDownsamplePoint(t, &a.sample, &want)
 
 	// 同一份摘要再次输入仍增加 sum/count；此层不识别或删除重复贡献。
 	a.AddSummary(&aPoint)
 	want.values[downsampleFeatureSum] = 53
 	want.values[downsampleFeatureCount] = 5
-	assertDownsamplePoint(t, &a.point, &want)
+	assertDownsamplePoint(t, &a.sample, &want)
 
 	// 输入可与 accumulator 当前 point 共用存储，不得读到已更新的半行状态。
-	a.AddSummary(&a.point)
+	a.AddSummary(&a.sample)
 	want.values[downsampleFeatureSum] = 106
 	want.values[downsampleFeatureCount] = 10
-	assertDownsamplePoint(t, &a.point, &want)
+	assertDownsamplePoint(t, &a.sample, &want)
 }
 
 func TestDownsampleAccumulatorNaNColumns(t *testing.T) {
-	for feature := 0; feature < downsampleFeaturesCount; feature++ {
+	for feature := 0; feature < countOfDownsampleFeatures; feature++ {
 		for _, markerFirst := range []bool{false, true} {
-			base := downsamplePoint{minUnixMilli + 1, [5]float64{3, 10, 2, 1, 9}}
-			marked := downsamplePoint{minUnixMilli + 2, [5]float64{4, 20, 3, 2, 12}}
+			base := downsampleSample{minUnixMilli + 1, [5]float64{3, 10, 2, 1, 9}}
+			marked := downsampleSample{minUnixMilli + 2, [5]float64{4, 20, 3, 2, 12}}
 			marked.values[feature] = math.Float64frombits(0xfff8000000001234)
 			originalBits := math.Float64bits(marked.values[feature])
 			var a downsampleAccumulator
@@ -185,9 +185,9 @@ func TestDownsampleAccumulatorNaNColumns(t *testing.T) {
 				a.AddSummary(&base)
 				a.AddSummary(&marked)
 			}
-			want := downsamplePoint{minUnixMilli + 2, [5]float64{4, 30, 5, 1, 12}}
+			want := downsampleSample{minUnixMilli + 2, [5]float64{4, 30, 5, 1, 12}}
 			want.values[feature] = decimal.StaleNaN
-			assertDownsamplePoint(t, &a.point, &want)
+			assertDownsamplePoint(t, &a.sample, &want)
 			if math.Float64bits(marked.values[feature]) != originalBits {
 				t.Fatalf("source column %d was modified", feature)
 			}
@@ -195,29 +195,29 @@ func TestDownsampleAccumulatorNaNColumns(t *testing.T) {
 	}
 
 	// NaN 的算术来源不增加状态，也不影响其他列。
-	left := downsamplePoint{minUnixMilli, [5]float64{2, math.Inf(1), 1, 2, 2}}
-	right := downsamplePoint{minUnixMilli + 1, [5]float64{3, math.Inf(-1), 1, 3, 3}}
+	left := downsampleSample{minUnixMilli, [5]float64{2, math.Inf(1), 1, 2, 2}}
+	right := downsampleSample{minUnixMilli + 1, [5]float64{3, math.Inf(-1), 1, 3, 3}}
 	var a downsampleAccumulator
 	a.AddSummary(&left)
 	a.AddSummary(&right)
-	want := downsamplePoint{minUnixMilli + 1, [5]float64{3, decimal.StaleNaN, 2, 2, 3}}
-	assertDownsamplePoint(t, &a.point, &want)
+	want := downsampleSample{minUnixMilli + 1, [5]float64{3, decimal.StaleNaN, 2, 2, 3}}
+	assertDownsamplePoint(t, &a.sample, &want)
 }
 
 func TestDownsampleAccumulatorReset(t *testing.T) {
 	var a downsampleAccumulator
-	if a.initialized || a.point != (downsamplePoint{}) {
+	if a.initialized || a.sample != (downsampleSample{}) {
 		t.Fatal("zero accumulator must be empty")
 	}
-	a.AddRaw(minUnixMilli, decimal.StaleNaN)
+	a.AddRawRow(minUnixMilli, decimal.StaleNaN)
 	a.Reset()
 	a.Reset()
-	if a.initialized || a.point != (downsamplePoint{}) {
+	if a.initialized || a.sample != (downsampleSample{}) {
 		t.Fatal("reset retained summary state")
 	}
-	a.AddRaw(minUnixMilli+1, -3)
-	want := downsamplePoint{minUnixMilli + 1, [5]float64{-3, -3, 1, -3, -3}}
-	assertDownsamplePoint(t, &a.point, &want)
+	a.AddRawRow(minUnixMilli+1, -3)
+	want := downsampleSample{minUnixMilli + 1, [5]float64{-3, -3, 1, -3, -3}}
+	assertDownsamplePoint(t, &a.sample, &want)
 }
 
 func TestDownsampleAccumulatorRandomizedReference(t *testing.T) {
@@ -247,28 +247,28 @@ func TestDownsampleAccumulatorRandomizedReference(t *testing.T) {
 				if part[bucket] == nil {
 					part[bucket] = &downsampleAccumulator{}
 				}
-				part[bucket].AddRaw(sample.timestamp, sample.value)
+				part[bucket].AddRawRow(sample.timestamp, sample.value)
 			}
 			for bucket, raw := range rawBuckets {
 				want := referenceDownsampleTestPoint(raw)
 				var direct downsampleAccumulator
 				for _, sample := range raw {
-					direct.AddRaw(sample.timestamp, sample.value)
+					direct.AddRawRow(sample.timestamp, sample.value)
 				}
-				assertDownsamplePoint(t, &direct.point, &want)
+				assertDownsamplePoint(t, &direct.sample, &want)
 				var level1 [3]downsampleAccumulator
 				for _, i := range rng.Perm(len(parts)) {
 					if partial := parts[i][bucket]; partial != nil {
-						level1[rng.Intn(len(level1))].AddSummary(&partial.point)
+						level1[rng.Intn(len(level1))].AddSummary(&partial.sample)
 					}
 				}
 				var merged downsampleAccumulator
 				for _, i := range rng.Perm(len(level1)) {
 					if level1[i].initialized {
-						merged.AddSummary(&level1[i].point)
+						merged.AddSummary(&level1[i].sample)
 					}
 				}
-				assertDownsamplePoint(t, &merged.point, &want)
+				assertDownsamplePoint(t, &merged.sample, &want)
 			}
 		}
 
@@ -277,17 +277,17 @@ func TestDownsampleAccumulatorRandomizedReference(t *testing.T) {
 		for _, raw := range groupDownsampleTestSamples(samples, downsampleResolution5m) {
 			var fine downsampleAccumulator
 			for _, sample := range raw {
-				fine.AddRaw(sample.timestamp, sample.value)
+				fine.AddRawRow(sample.timestamp, sample.value)
 			}
-			bucket := fine.point.timestamp / downsampleResolution1h
+			bucket := fine.sample.timestamp / downsampleResolution1h
 			if coarse[bucket] == nil {
 				coarse[bucket] = &downsampleAccumulator{}
 			}
-			coarse[bucket].AddSummary(&fine.point)
+			coarse[bucket].AddSummary(&fine.sample)
 		}
 		for bucket, raw := range groupDownsampleTestSamples(samples, downsampleResolution1h) {
 			want := referenceDownsampleTestPoint(raw)
-			assertDownsamplePoint(t, &coarse[bucket].point, &want)
+			assertDownsamplePoint(t, &coarse[bucket].sample, &want)
 		}
 	}
 }
@@ -302,8 +302,8 @@ func groupDownsampleTestSamples(samples []downsampleTestSample, resolution int64
 }
 
 // referenceDownsampleTestPoint 分别扫描原始样本，独立计算有限小整数的参考统计。
-func referenceDownsampleTestPoint(samples []downsampleTestSample) downsamplePoint {
-	var p downsamplePoint
+func referenceDownsampleTestPoint(samples []downsampleTestSample) downsampleSample {
+	var p downsampleSample
 	for _, sample := range samples {
 		if sample.timestamp > p.timestamp {
 			p.timestamp = sample.timestamp
@@ -324,7 +324,7 @@ func referenceDownsampleTestPoint(samples []downsampleTestSample) downsamplePoin
 	return p
 }
 
-func assertDownsamplePoint(t *testing.T, got, want *downsamplePoint) {
+func assertDownsamplePoint(t *testing.T, got, want *downsampleSample) {
 	t.Helper()
 	if got.timestamp != want.timestamp {
 		t.Fatalf("unexpected timestamp; got %d; want %d", got.timestamp, want.timestamp)

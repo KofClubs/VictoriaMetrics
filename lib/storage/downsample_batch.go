@@ -7,7 +7,7 @@ type downsampleBatch struct {
 	tsid       TSID
 	resolution int64
 	timestamps []int64
-	values     [downsampleFeaturesCount][]float64
+	values     [countOfDownsampleFeatures][]float64
 	// 时间戳和五个 value 列共用 raw 的精度，默认 64。
 	precisionBits uint8
 }

@@ -20,19 +20,19 @@ const (
 	downsampleFeatureCount
 	downsampleFeatureMin
 	downsampleFeatureMax
-	downsampleFeaturesCount
+	countOfDownsampleFeatures
 )
 
-// downsamplePoint 保存一个区间的一份摘要；五个特征共享 timestamp。
-type downsamplePoint struct {
+// downsampleSample 保存一个区间的一份摘要；五个特征共享 timestamp。
+type downsampleSample struct {
 	timestamp int64
-	values    [downsampleFeaturesCount]float64
+	values    [countOfDownsampleFeatures]float64
 }
 
 // downsampleAccumulator 归并同一 TSID、目标分辨率和区间的全部输入。
 // 调用方负责分桶、选源和 retention；此处不删除重复输入。
 type downsampleAccumulator struct {
-	point       downsamplePoint
+	sample      downsampleSample
 	initialized bool
 }
 
@@ -41,30 +41,20 @@ func (a *downsampleAccumulator) Reset() {
 	*a = downsampleAccumulator{}
 }
 
-// AddRaw 将一条原始样本提升为摘要；标记同样贡献一次 count。
-func (a *downsampleAccumulator) AddRaw(timestamp int64, value float64) {
-	value = normalizeDownsampleValue(value)
-	p := downsamplePoint{
-		timestamp: timestamp,
-		values:    [downsampleFeaturesCount]float64{value, value, 1, value, value},
-	}
-	a.AddSummary(&p)
-}
-
 // AddSummary 合并一份源摘要，不改变输入，也不将摘要行重新计为一个样本。
-func (a *downsampleAccumulator) AddSummary(p *downsamplePoint) {
+func (a *downsampleAccumulator) AddSummary(s *downsampleSample) {
 	// 复制后再归并，保证输入与当前状态共用存储时仍只读取一份完整源贡献。
-	src := *p
+	src := *s
 	for i, v := range src.values {
 		src.values[i] = normalizeDownsampleValue(v)
 	}
 	if !a.initialized {
-		a.point = src
+		a.sample = src
 		a.initialized = true
 		return
 	}
 
-	dst := &a.point
+	dst := &a.sample
 	if src.timestamp > dst.timestamp {
 		dst.timestamp = src.timestamp
 		dst.values[downsampleFeatureLast] = src.values[downsampleFeatureLast]

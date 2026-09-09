@@ -28,7 +28,7 @@ type downsampleWriter struct {
 	indexData     []byte
 	metaindexData []byte
 	compressed    []byte
-	blocks        [downsampleFeaturesCount]Block
+	blocks        [countOfDownsampleFeatures]Block
 	integers      []int64
 	normalized    []float64
 	finished      bool
@@ -118,7 +118,7 @@ func (w *downsampleWriter) WriteBlock(b *downsampleBatch) error {
 			return err
 		}
 	}
-	if ^uint64(0)-w.ph.RowsCount < uint64(n)*downsampleFeaturesCount || ^uint64(0)-w.ph.BlocksCount < downsampleFeaturesCount {
+	if ^uint64(0)-w.ph.RowsCount < uint64(n)*countOfDownsampleFeatures || ^uint64(0)-w.ph.BlocksCount < countOfDownsampleFeatures {
 		return fmt.Errorf("降采样 part 行数溢出")
 	}
 	w.indexData = h.marshal(w.indexData)
@@ -128,10 +128,10 @@ func (w *downsampleWriter) WriteBlock(b *downsampleBatch) error {
 	w.mr.LastTSID = h.TSID
 	w.mr.MinTimestamp = min(w.mr.MinTimestamp, h.MinTimestamp)
 	w.mr.MaxTimestamp = max(w.mr.MaxTimestamp, h.MaxTimestamp)
-	w.mr.BlockHeadersCount += downsampleFeaturesCount
-	w.mr.RowsCount += uint64(n) * downsampleFeaturesCount
-	w.ph.RowsCount += uint64(n) * downsampleFeaturesCount
-	w.ph.BlocksCount += downsampleFeaturesCount
+	w.mr.BlockHeadersCount += countOfDownsampleFeatures
+	w.mr.RowsCount += uint64(n) * countOfDownsampleFeatures
+	w.ph.RowsCount += uint64(n) * countOfDownsampleFeatures
+	w.ph.BlocksCount += countOfDownsampleFeatures
 	w.ph.MinTimestamp = min(w.ph.MinTimestamp, h.MinTimestamp)
 	w.ph.MaxTimestamp = max(w.ph.MaxTimestamp, h.MaxTimestamp)
 	w.previous = h

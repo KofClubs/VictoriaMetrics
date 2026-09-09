@@ -26,7 +26,7 @@ var downsampleFieldHeaderSize = func() int {
 	return len(h.marshal(nil))
 }()
 
-var downsampleBlockHeaderSize = downsampleFeaturesCount * downsampleFieldHeaderSize
+var downsampleBlockHeaderSize = countOfDownsampleFeatures * downsampleFieldHeaderSize
 
 var downsampleMetaindexRowSize = func() int {
 	var m downsampleMetaindexRow
@@ -54,7 +54,7 @@ type downsampleBlockHeader struct {
 	MinTimestamp int64
 	MaxTimestamp int64
 	Timestamps   downsampleColumnHeader
-	Columns      [downsampleFeaturesCount]downsampleColumnHeader
+	Columns      [countOfDownsampleFeatures]downsampleColumnHeader
 	// raw 格式适配只在内存中使用，不进入文件序列化。
 	raw       bool
 	rawHeader blockHeader
@@ -95,7 +95,7 @@ func (h *downsampleFieldHeader) unmarshal(src []byte) error {
 	h.ResolutionMs = encoding.UnmarshalInt64(src)
 	h.Feature = src[8]
 	h.TimestampPrecisionBits = src[9]
-	if !validDownsampleResolution(h.ResolutionMs) || h.Feature < 1 || h.Feature > downsampleFeaturesCount || h.TimestampPrecisionBits < 1 || h.TimestampPrecisionBits > 64 {
+	if !validDownsampleResolution(h.ResolutionMs) || h.Feature < 1 || h.Feature > countOfDownsampleFeatures || h.TimestampPrecisionBits < 1 || h.TimestampPrecisionBits > 64 {
 		return fmt.Errorf("单特征 block 标识或时间戳精度无效")
 	}
 	if _, err := h.BlockHeader.Unmarshal(src[10:]); err != nil {
@@ -212,7 +212,7 @@ func (m *downsampleMetaindexRow) unmarshal(src []byte) error {
 	m.IndexBlockOffset = encoding.UnmarshalUint64(tail[20:])
 	m.IndexBlockSize = encoding.UnmarshalUint32(tail[28:])
 	m.RowsCount = encoding.UnmarshalUint64(tail[32:])
-	if !validDownsampleResolution(m.ResolutionMs) || m.LastTSID.Less(&m.TSID) || m.MinTimestamp > m.MaxTimestamp || m.MinTimestamp < minUnixMilli || m.MaxTimestamp > maxUnixMilli || m.BlockHeadersCount == 0 || m.BlockHeadersCount%downsampleFeaturesCount != 0 || m.RowsCount < uint64(m.BlockHeadersCount) || m.RowsCount > uint64(m.BlockHeadersCount)*maxRowsPerBlock || uint64(m.BlockHeadersCount) > uint64(maxBlockSize/downsampleBlockHeaderSize*downsampleFeaturesCount) || m.IndexBlockSize < uint32(len(downsampleIndexMagic)) || m.IndexBlockSize > downsampleMaxIndexSize {
+	if !validDownsampleResolution(m.ResolutionMs) || m.LastTSID.Less(&m.TSID) || m.MinTimestamp > m.MaxTimestamp || m.MinTimestamp < minUnixMilli || m.MaxTimestamp > maxUnixMilli || m.BlockHeadersCount == 0 || m.BlockHeadersCount%countOfDownsampleFeatures != 0 || m.RowsCount < uint64(m.BlockHeadersCount) || m.RowsCount > uint64(m.BlockHeadersCount)*maxRowsPerBlock || uint64(m.BlockHeadersCount) > uint64(maxBlockSize/downsampleBlockHeaderSize*countOfDownsampleFeatures) || m.IndexBlockSize < uint32(len(downsampleIndexMagic)) || m.IndexBlockSize > downsampleMaxIndexSize {
 		return fmt.Errorf("无效降采样 metaindex 行")
 	}
 	return nil

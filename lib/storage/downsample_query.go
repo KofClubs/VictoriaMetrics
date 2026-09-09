@@ -49,7 +49,7 @@ func ParseDownsampleQueryField(s string) (*DownsampleQueryField, error) {
 }
 
 func (q *DownsampleQueryField) valid() bool {
-	return q != nil && validDownsampleResolution(q.ResolutionMs) && q.Feature < downsampleFeaturesCount
+	return q != nil && validDownsampleResolution(q.ResolutionMs) && q.Feature < countOfDownsampleFeatures
 }
 
 // nextDownsampleBlock 只读取选定字段的 header，负载继续由 BlockRef 和 Block 处理。

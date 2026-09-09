@@ -286,8 +286,8 @@ func (m *downsampleMerger) mergeTSID(tsid *TSID, resolution, minTimestamp, reten
 				}
 			}
 			b.precisionBits = s.precisionBits
-			b.timestamps = append(b.timestamps, s.acc.point.timestamp)
-			for feature, value := range s.acc.point.values {
+			b.timestamps = append(b.timestamps, s.acc.sample.timestamp)
+			for feature, value := range s.acc.sample.values {
 				b.values[feature] = append(b.values[feature], value)
 			}
 			if len(b.timestamps) == maxRowsPerBlock {
@@ -361,7 +361,7 @@ func (m *downsampleMerger) readWindow(p *part, tsid *TSID, resolution, firstBuck
 			} else if s.precisionBits != b.precisionBits {
 				return fmt.Errorf("同一降采样 bucket 的源精度不一致: %d vs %d", s.precisionBits, b.precisionBits)
 			}
-			point := downsamplePoint{timestamp: timestamp}
+			point := downsampleSample{timestamp: timestamp}
 			for feature := range point.values {
 				point.values[feature] = b.values[feature][i]
 			}
@@ -382,7 +382,7 @@ func getDownsampleMerger() *downsampleMerger {
 // 原始样本只有一个值，摘要在同一分辨率下分别保存五个特征 Block。
 func downsampleSourceRowWidth(p *part) uint64 {
 	if p.dsMetadata != nil {
-		return downsampleFeaturesCount
+		return countOfDownsampleFeatures
 	}
 	return 1
 }

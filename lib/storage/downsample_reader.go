@@ -304,7 +304,7 @@ func (r *downsampleReader) validateIndex(m *downsampleMetaindexRow) error {
 		} else if !previous.less(&h) {
 			return fmt.Errorf("index block 排序错误")
 		}
-		if pos > 0 && (h.Timestamps.Offset != previous.Timestamps.Offset+uint64(previous.Timestamps.Size) || h.Columns[0].Offset != previous.Columns[downsampleFeaturesCount-1].Offset+uint64(previous.Columns[downsampleFeaturesCount-1].Size)) {
+		if pos > 0 && (h.Timestamps.Offset != previous.Timestamps.Offset+uint64(previous.Timestamps.Size) || h.Columns[0].Offset != previous.Columns[countOfDownsampleFeatures-1].Offset+uint64(previous.Columns[countOfDownsampleFeatures-1].Size)) {
 			return fmt.Errorf("相邻降采样 block 负载不连续")
 		}
 		if pos == 0 && m.IndexBlockOffset == 0 && (h.Timestamps.Offset != 0 || h.Columns[0].Offset != 0) {
@@ -312,7 +312,7 @@ func (r *downsampleReader) validateIndex(m *downsampleMetaindexRow) error {
 		}
 		last = h.TSID
 		previous = h
-		rows += uint64(h.RowsCount) * downsampleFeaturesCount
+		rows += uint64(h.RowsCount) * countOfDownsampleFeatures
 		minTime = min(minTime, h.MinTimestamp)
 		maxTime = max(maxTime, h.MaxTimestamp)
 		if err := checkDownsampleExtent(h.Timestamps.Offset, h.Timestamps.Size, r.fileSizes[0]); err != nil {
@@ -324,7 +324,7 @@ func (r *downsampleReader) validateIndex(m *downsampleMetaindexRow) error {
 			}
 		}
 	}
-	if m.IndexBlockOffset+uint64(m.IndexBlockSize) == r.fileSizes[2] && (previous.Timestamps.Offset+uint64(previous.Timestamps.Size) != r.fileSizes[0] || previous.Columns[downsampleFeaturesCount-1].Offset+uint64(previous.Columns[downsampleFeaturesCount-1].Size) != r.fileSizes[1]) {
+	if m.IndexBlockOffset+uint64(m.IndexBlockSize) == r.fileSizes[2] && (previous.Timestamps.Offset+uint64(previous.Timestamps.Size) != r.fileSizes[0] || previous.Columns[countOfDownsampleFeatures-1].Offset+uint64(previous.Columns[countOfDownsampleFeatures-1].Size) != r.fileSizes[1]) {
 		return fmt.Errorf("降采样负载存在截断或未引用尾部")
 	}
 	if rows != m.RowsCount || first != m.TSID || last != m.LastTSID || minTime != m.MinTimestamp || maxTime != m.MaxTimestamp {
@@ -332,7 +332,7 @@ func (r *downsampleReader) validateIndex(m *downsampleMetaindexRow) error {
 	}
 	r.previousIndexEnd = m.IndexBlockOffset + uint64(m.IndexBlockSize)
 	r.previousTimestampEnd = previous.Timestamps.Offset + uint64(previous.Timestamps.Size)
-	r.previousValuesEnd = previous.Columns[downsampleFeaturesCount-1].Offset + uint64(previous.Columns[downsampleFeaturesCount-1].Size)
+	r.previousValuesEnd = previous.Columns[countOfDownsampleFeatures-1].Offset + uint64(previous.Columns[countOfDownsampleFeatures-1].Size)
 	r.hasPreviousIndex = true
 	return nil
 }
@@ -385,7 +385,7 @@ func (r *downsampleReader) readAt(dst []byte, file int, off uint64, size uint32)
 
 // FieldHeader 返回单个特征的原生 header，供现有 BlockRef 读取链路使用。
 func (r *downsampleReader) FieldHeader(feature uint8) (blockHeader, error) {
-	if r.p == nil || r.current.RowsCount == 0 || feature >= downsampleFeaturesCount {
+	if r.p == nil || r.current.RowsCount == 0 || feature >= countOfDownsampleFeatures {
 		return blockHeader{}, fmt.Errorf("降采样 reader 未定位 Block 或特征无效")
 	}
 	if r.current.raw {
@@ -397,7 +397,7 @@ func (r *downsampleReader) FieldHeader(feature uint8) (blockHeader, error) {
 
 // ReadFieldBlock 读取一个分辨率、一个特征对应的原生 Block，并完成其解码状态转换。
 func (r *downsampleReader) ReadFieldBlock(dst *Block, feature uint8) error {
-	if r.p == nil || r.current.RowsCount == 0 || feature >= downsampleFeaturesCount {
+	if r.p == nil || r.current.RowsCount == 0 || feature >= countOfDownsampleFeatures {
 		return fmt.Errorf("降采样 reader 未定位 Block 或特征无效")
 	}
 	if r.current.raw {
@@ -474,7 +474,7 @@ func (r *downsampleReader) readRawBlock(b *downsampleBatch, h *blockHeader) erro
 			v = decimal.StaleNaN
 			b.values[0][j] = v
 		}
-		for i := 1; i < downsampleFeaturesCount; i++ {
+		for i := 1; i < countOfDownsampleFeatures; i++ {
 			x := v
 			if i == downsampleFeatureCount {
 				x = 1
