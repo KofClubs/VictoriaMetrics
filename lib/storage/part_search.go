@@ -100,7 +100,7 @@ func (ps *partSearch) initWithDownsampleField(p *part, tsids []TSID, tr TimeRang
 		}
 		ps.dsField = *field
 		ps.dsReader = getDownsampleReader()
-		ps.err = ps.dsReader.Init(p, field.ResolutionMs)
+		ps.err = ps.dsReader.Init(p, field.ResolutionMs, field.Feature)
 		return
 	}
 	if p.dsMetadata != nil {

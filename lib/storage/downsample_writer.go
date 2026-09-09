@@ -22,7 +22,12 @@ type downsampleWriter struct {
 	offsets       [3]uint64
 	compressLevel int
 	ph            partHeader
-	previous      downsampleBlockHeader
+	previous      blockHeader
+	resolution    int64
+	spills        [countOfDownsampleFeatures]*os.File
+	spillData     []byte
+	// indexLimit 可在测试中缩小，生产默认 maxBlockSize。
+	indexLimit    int
 	hasPrevious   bool
 	mr            downsampleMetaindexRow
 	indexData     []byte
@@ -32,10 +37,14 @@ type downsampleWriter struct {
 	integers      []int64
 	normalized    []float64
 	finished      bool
+	err           error // 部分写入失败后禁止重试或发布；只能 Abort/reset。
 }
 
 func (w *downsampleWriter) Init(path string, compressLevel int) error {
 	w.reset()
+	if w.path != "" {
+		return fmt.Errorf("无法清理先前降采样目标 %q: %w", w.path, w.err)
+	}
 	if err := os.Mkdir(path, 0755); err != nil {
 		return err
 	}
@@ -45,22 +54,24 @@ func (w *downsampleWriter) Init(path string, compressLevel int) error {
 	for i, name := range []string{timestampsFilename, valuesFilename, indexFilename, metaindexFilename} {
 		f, err := os.OpenFile(filepath.Join(path, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 		if err != nil {
-			_ = w.Abort()
-			return err
+			return errors.Join(err, w.Abort())
 		}
 		w.files[i] = f
 	}
 	return nil
 }
 
-func (w *downsampleWriter) WriteBlock(b *downsampleBatch) error {
+func (w *downsampleWriter) WriteBlock(b *downsampleBatch) (err error) {
 	if w.path == "" || w.finished {
 		return fmt.Errorf("降采样 writer 尚未初始化或已关闭")
 	}
-	n := len(b.timestamps)
-	if err := checkDownsampleWriteSpace(filepath.Dir(w.path), n); err != nil {
-		return err
+	if w.err != nil {
+		return w.err
 	}
+	if b == nil {
+		return fmt.Errorf("降采样批次为空")
+	}
+	n := len(b.timestamps)
 	if !validDownsampleResolution(b.resolution) || n == 0 || n > maxRowsPerBlock || b.precisionBits < 1 || b.precisionBits > 64 {
 		return fmt.Errorf("无效降采样 block 分辨率、行数或精度")
 	}
@@ -74,20 +85,28 @@ func (w *downsampleWriter) WriteBlock(b *downsampleBatch) error {
 			return fmt.Errorf("编码前的降采样时间戳或 bucket 顺序错误")
 		}
 	}
-	h := downsampleBlockHeader{TSID: b.tsid, ResolutionMs: b.resolution, RowsCount: uint32(n), MinTimestamp: b.timestamps[0], MaxTimestamp: b.timestamps[n-1]}
-	if w.hasPrevious && (h.less(&w.previous) || (h.ResolutionMs == w.previous.ResolutionMs && h.TSID == w.previous.TSID && h.MinTimestamp/h.ResolutionMs <= w.previous.MaxTimestamp/h.ResolutionMs)) {
+	h := blockHeader{TSID: b.tsid, RowsCount: uint32(n), MinTimestamp: b.timestamps[0], MaxTimestamp: b.timestamps[n-1]}
+	if w.hasPrevious && (b.resolution < w.resolution || (b.resolution == w.resolution && (downsampleHeaderLess(&h, &w.previous) || (h.TSID == w.previous.TSID && h.MinTimestamp/b.resolution <= w.previous.MaxTimestamp/b.resolution)))) {
 		return fmt.Errorf("降采样 block 排序错误或编码前 bucket 重复")
 	}
-	if w.hasPrevious && h.ResolutionMs != w.previous.ResolutionMs {
-		if err := w.flushIndex(); err != nil {
+	if ^uint64(0)-w.ph.RowsCount < uint64(n)*countOfDownsampleFeatures || ^uint64(0)-w.ph.BlocksCount < countOfDownsampleFeatures {
+		return fmt.Errorf("降采样 part 行数溢出")
+	}
+	if err := checkDownsampleWriteSpace(filepath.Dir(w.path), n); err != nil {
+		return err
+	}
+	// 从此处开始可能改变磁盘状态，任何错误都必须阻止后续 Finish 发布。
+	defer func() {
+		if err != nil {
+			w.err = err
+		}
+	}()
+	if w.hasPrevious && b.resolution != w.resolution {
+		if err := w.flushResolution(); err != nil {
 			return err
 		}
 	}
-	if len(w.indexData)+downsampleBlockHeaderSize > maxBlockSize {
-		if err := w.flushIndex(); err != nil {
-			return err
-		}
-	}
+	w.resolution = b.resolution
 	sharedTimestampOffset := w.offsets[0]
 	for i := range b.values {
 		w.normalized = w.normalized[:0]
@@ -102,34 +121,33 @@ func (w *downsampleWriter) WriteBlock(b *downsampleBatch) error {
 		// 每个特征拥有独立的原生 Block，时间戳和 values 均沿用 raw 的精度。
 		fb := &w.blocks[i]
 		fb.Init(&b.tsid, b.timestamps, w.integers, scale, b.precisionBits)
-		_, timestampsData, valuesData := fb.MarshalData(sharedTimestampOffset, w.offsets[1])
-		if i == 0 {
-			// 时间戳负载只写入一次，后续特征引用相同的 offset 和 size。
-			h.Timestamps = downsampleColumnHeader{Feature: downsampleTimestampFeature, Offset: w.offsets[0], Size: fb.bh.TimestampsBlockSize, FirstValue: fb.bh.MinTimestamp, PrecisionBits: b.precisionBits, MarshalType: fb.bh.TimestampsMarshalType}
-			if err := w.writePayload(0, timestampsData); err != nil {
-				return err
-			}
-		} else if !bytes.Equal(timestampsData, w.blocks[0].timestampsData) {
+		_, timestampsData, _ := fb.MarshalData(sharedTimestampOffset, 0)
+		if i > 0 && (!bytes.Equal(timestampsData, w.blocks[0].timestampsData) || !sameDownsampleTimestamps(&fb.bh, &w.blocks[0].bh)) {
 			return fmt.Errorf("同一批次的 Block 时间戳编码不一致")
 		}
-		bh := &fb.bh
-		h.Columns[i] = downsampleColumnHeader{Feature: uint8(i + 1), Offset: bh.ValuesBlockOffset, Size: bh.ValuesBlockSize, FirstValue: bh.FirstValue, Scale: bh.Scale, PrecisionBits: bh.PrecisionBits, MarshalType: bh.ValuesMarshalType}
-		if err := w.writePayload(1, valuesData); err != nil {
+		if err := validateDownsampleHeader(&fb.bh); err != nil {
 			return err
 		}
 	}
-	if ^uint64(0)-w.ph.RowsCount < uint64(n)*countOfDownsampleFeatures || ^uint64(0)-w.ph.BlocksCount < countOfDownsampleFeatures {
-		return fmt.Errorf("降采样 part 行数溢出")
+	if err := w.writePayload(0, w.blocks[0].timestampsData); err != nil {
+		return err
 	}
-	w.indexData = h.marshal(w.indexData)
-	if w.mr.BlockHeadersCount == 0 {
-		w.mr = downsampleMetaindexRow{ResolutionMs: h.ResolutionMs, TSID: h.TSID, MinTimestamp: h.MinTimestamp, MaxTimestamp: h.MaxTimestamp}
+	for i := range w.blocks {
+		if w.spills[i] == nil {
+			f, err := os.CreateTemp(w.path, ".downsample-spill-*")
+			if err != nil {
+				return err
+			}
+			w.spills[i] = f
+		}
+		fb := &w.blocks[i]
+		if err := writeDownsampleData(w.spills[i], fb.headerData); err != nil {
+			return err
+		}
+		if err := writeDownsampleData(w.spills[i], fb.valuesData); err != nil {
+			return err
+		}
 	}
-	w.mr.LastTSID = h.TSID
-	w.mr.MinTimestamp = min(w.mr.MinTimestamp, h.MinTimestamp)
-	w.mr.MaxTimestamp = max(w.mr.MaxTimestamp, h.MaxTimestamp)
-	w.mr.BlockHeadersCount += countOfDownsampleFeatures
-	w.mr.RowsCount += uint64(n) * countOfDownsampleFeatures
 	w.ph.RowsCount += uint64(n) * countOfDownsampleFeatures
 	w.ph.BlocksCount += countOfDownsampleFeatures
 	w.ph.MinTimestamp = min(w.ph.MinTimestamp, h.MinTimestamp)
@@ -139,11 +157,122 @@ func (w *downsampleWriter) WriteBlock(b *downsampleBatch) error {
 	return nil
 }
 
+// flushResolution 是有界外部转置：每个 spill 已按 TSID/MinTimestamp 排序，
+// 依次消费五个文件即可保证整个 part 的 resolution/feature 全局顺序。
+func (w *downsampleWriter) flushResolution() error {
+	limit := w.indexLimit
+	if limit == 0 {
+		limit = maxBlockSize
+	}
+	if limit < marshaledBlockHeaderSize || limit > maxBlockSize {
+		return fmt.Errorf("无效降采样 index 大小上限")
+	}
+	// spill 尚未删除时，最终 values/index/metaindex 仍需额外空间。
+	var pending uint64
+	var spillCount int
+	for _, f := range w.spills {
+		if f == nil {
+			continue
+		}
+		spillCount++
+		st, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		pending = addDownsampleSpace(pending, uint64(st.Size()))
+	}
+	if spillCount == 0 {
+		return nil
+	}
+	if spillCount != countOfDownsampleFeatures {
+		return fmt.Errorf("降采样 spill 特征列缺失")
+	}
+	if err := checkDownsamplePathSpace(filepath.Dir(w.path), pending); err != nil {
+		return err
+	}
+	header := make([]byte, marshaledBlockHeaderSize)
+	var expectedBlocks, expectedRows uint64
+	for feature, f := range w.spills {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		var previous blockHeader
+		var blocks, rows uint64
+		for {
+			n, err := io.ReadFull(f, header)
+			if err == io.EOF && n == 0 {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			var h blockHeader
+			if _, err := h.Unmarshal(header); err != nil {
+				return err
+			}
+			if err := validateDownsampleHeader(&h); err != nil {
+				return err
+			}
+			if err := checkDownsampleExtent(h.TimestampsBlockOffset, h.TimestampsBlockSize, w.offsets[0]); err != nil {
+				return err
+			}
+			if blocks > 0 && (!downsampleHeadersOrdered(&previous, &h) || h.TimestampsBlockOffset != previous.TimestampsBlockOffset+uint64(previous.TimestampsBlockSize)) {
+				return fmt.Errorf("降采样 spill 排序或时间戳连续性错误")
+			}
+			previous = h
+			blocks++
+			rows += uint64(h.RowsCount)
+			if len(w.indexData)+marshaledBlockHeaderSize > limit || (w.mr.BlockHeadersCount > 0 && !sameDownsampleTenant(&h.TSID, &w.mr.TSID)) {
+				if err := w.flushIndex(); err != nil {
+					return err
+				}
+			}
+			if err := checkDownsampleWriteSpace(filepath.Dir(w.path), int(h.RowsCount)); err != nil {
+				return err
+			}
+			if cap(w.spillData) < int(h.ValuesBlockSize) {
+				w.spillData = make([]byte, h.ValuesBlockSize)
+			}
+			w.spillData = w.spillData[:h.ValuesBlockSize]
+			if _, err := io.ReadFull(f, w.spillData); err != nil {
+				return err
+			}
+			h.ValuesBlockOffset = w.offsets[1]
+			if err := w.writePayload(1, w.spillData); err != nil {
+				return err
+			}
+			w.indexData = h.Marshal(w.indexData)
+			w.mr.ResolutionMs, w.mr.feature = w.resolution, uint8(feature+1)
+			w.mr.RegisterBlockHeader(&h)
+			w.mr.LastTSID = h.TSID
+			w.mr.RowsCount += uint64(h.RowsCount)
+		}
+		if feature == 0 {
+			expectedBlocks, expectedRows = blocks, rows
+		} else if blocks != expectedBlocks || rows != expectedRows {
+			return fmt.Errorf("降采样 spill 特征列统计不一致")
+		}
+		if blocks == 0 {
+			return fmt.Errorf("降采样 spill 为空")
+		}
+		if err := w.flushIndex(); err != nil {
+			return err
+		}
+		name := f.Name()
+		err := f.Close()
+		w.spills[feature] = nil
+		if err = errors.Join(err, os.Remove(name)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (w *downsampleWriter) writePayload(file int, b []byte) error {
 	if len(b) > downsampleMaxColumnSize {
 		return fmt.Errorf("降采样编码列超过大小上限")
 	}
-	if uint64(len(b)) > uint64(math.MaxInt64)-w.offsets[file] {
+	if w.offsets[file] > uint64(math.MaxInt64) || uint64(len(b)) > uint64(math.MaxInt64)-w.offsets[file] {
 		return fmt.Errorf("降采样文件偏移溢出")
 	}
 	if err := writeDownsampleData(w.files[file], b); err != nil {
@@ -171,6 +300,12 @@ func (w *downsampleWriter) flushIndex() error {
 	if len(w.metaindexData)+downsampleMetaindexRowSize > downsampleMaxMetaindexSize {
 		return fmt.Errorf("降采样 metaindex 超过内存上限")
 	}
+	if len(w.indexData) > maxBlockSize || len(w.indexData) != int(w.mr.BlockHeadersCount)*marshaledBlockHeaderSize {
+		return fmt.Errorf("降采样 index 长度或条目数错误")
+	}
+	if err := checkDownsampleFinishSpace(filepath.Dir(w.path), len(w.indexData), len(w.metaindexData)); err != nil {
+		return err
+	}
 	w.compressed = append(w.compressed[:0], downsampleIndexMagic...)
 	w.compressed = encoding.CompressZSTDLevel(w.compressed, w.indexData, w.compressLevel)
 	if len(w.compressed) > downsampleMaxIndexSize || len(w.compressed) > 2*len(w.indexData)+256+len(downsampleIndexMagic) {
@@ -178,19 +313,35 @@ func (w *downsampleWriter) flushIndex() error {
 	}
 	w.mr.IndexBlockOffset = w.offsets[2]
 	w.mr.IndexBlockSize = uint32(len(w.compressed))
-	if err := writeDownsampleData(w.files[2], w.compressed); err != nil {
+	if err := w.writePayload(2, w.compressed); err != nil {
 		return err
 	}
-	w.offsets[2] += uint64(len(w.compressed))
 	w.metaindexData = w.mr.marshal(w.metaindexData)
 	w.indexData = w.indexData[:0]
 	w.mr = downsampleMetaindexRow{}
 	return nil
 }
 
-func (w *downsampleWriter) Finish() (partHeader, error) {
+func (w *downsampleWriter) Finish() (_ partHeader, err error) {
 	if w.path == "" || w.finished {
 		return partHeader{}, fmt.Errorf("降采样 writer 尚未初始化或已完成")
+	}
+	if w.err != nil {
+		return partHeader{}, w.err
+	}
+	defer func() {
+		if err != nil {
+			w.err = err
+		}
+	}()
+	if w.ph.RowsCount > 0 {
+		m := newDownsamplePartMetadata(w.ph)
+		if err := m.validate(); err != nil {
+			return partHeader{}, err
+		}
+	}
+	if err := w.flushResolution(); err != nil {
+		return partHeader{}, err
 	}
 	if err := checkDownsampleFinishSpace(filepath.Dir(w.path), len(w.indexData), len(w.metaindexData)); err != nil {
 		return partHeader{}, err
@@ -256,6 +407,12 @@ func syncDownsampleDir(path string) error {
 // Abort 删除由本 writer 创建的未发布目标，包括 Finish 已完成但尚未发布的目标。
 func (w *downsampleWriter) Abort() error {
 	var errs []error
+	for i, f := range w.spills {
+		if f != nil {
+			errs = append(errs, f.Close())
+			w.spills[i] = nil
+		}
+	}
 	for i, f := range w.files {
 		if f != nil {
 			errs = append(errs, f.Close())
@@ -263,7 +420,12 @@ func (w *downsampleWriter) Abort() error {
 		}
 	}
 	if w.path != "" {
-		errs = append(errs, os.RemoveAll(w.path))
+		if err := os.RemoveAll(w.path); err != nil {
+			errs = append(errs, err)
+			w.err = errors.Join(errs...)
+			w.finished = false
+			return w.err // 保留路径，允许调用方再次清理。
+		}
 	}
 	w.path = ""
 	return errors.Join(errs...)
@@ -271,17 +433,23 @@ func (w *downsampleWriter) Abort() error {
 
 func (w *downsampleWriter) reset() {
 	if !w.finished {
-		_ = w.Abort()
+		if err := w.Abort(); err != nil && w.path != "" {
+			return
+		}
 	} else {
 		w.path = ""
 	}
 	w.offsets = [3]uint64{}
 	w.compressLevel = 0
 	w.ph.Reset()
-	w.previous = downsampleBlockHeader{}
+	w.previous = blockHeader{}
+	w.resolution = 0
+	w.indexLimit = 0
+	w.spillData = nil
 	w.hasPrevious = false
 	w.mr = downsampleMetaindexRow{}
 	w.finished = false
+	w.err = nil
 	for i := range w.blocks {
 		w.blocks[i].Reset()
 	}
@@ -315,6 +483,11 @@ func getDownsampleWriter() *downsampleWriter {
 	}
 	return &downsampleWriter{}
 }
-func putDownsampleWriter(w *downsampleWriter) { w.reset(); downsampleWriterPool.Put(w) }
+func putDownsampleWriter(w *downsampleWriter) {
+	w.reset()
+	if w.path == "" {
+		downsampleWriterPool.Put(w)
+	}
+}
 
 var downsampleWriterPool sync.Pool

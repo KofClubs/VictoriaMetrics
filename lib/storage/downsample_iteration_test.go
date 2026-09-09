@@ -9,7 +9,7 @@ import (
 
 const (
 	downsampleIterationSeries = 180
-	// 第 132 个批次恰好填满首个 index，使该序列的两个批次分处相邻 index。
+	// fixture 将每个 feature 的 index 限为 132 个原生 header，使长序列跨 index。
 	downsampleIterationWideSeries = 131
 	downsampleIterationWideRows   = 8192 + 37
 )
@@ -59,6 +59,7 @@ func newDownsampleIterationPart(t *testing.T) *part {
 	if err := w.Init(path, 1); err != nil {
 		t.Fatal(err)
 	}
+	w.indexLimit = (downsampleIterationWideSeries + 1) * marshaledBlockHeaderSize
 	b := getDownsampleBatch()
 	defer putDownsampleBatch(b)
 	var expectedRows uint64
@@ -94,14 +95,17 @@ func newDownsampleIterationPart(t *testing.T) *part {
 	if p.ph.RowsCount != expectedRows || p.ph.BlocksCount != 181*2*5 {
 		t.Fatalf("fixture 物理统计错误: %+v", p.ph)
 	}
-	if len(p.dsMetaindex) != 4 {
-		t.Fatalf("fixture 未形成两个分辨率各两个 index: %d", len(p.dsMetaindex))
+	if len(p.dsMetaindex) != 2*5*2 {
+		t.Fatalf("fixture 未形成两个分辨率、五个 feature 各两个 index: %d", len(p.dsMetaindex))
 	}
 	wide := downsampleIterationTSID(downsampleIterationWideSeries)
 	for i, resolution := range []int64{300000, 3600000} {
-		left, right := &p.dsMetaindex[i*2], &p.dsMetaindex[i*2+1]
-		if left.ResolutionMs != resolution || right.ResolutionMs != resolution || left.LastTSID != wide || right.TSID != wide {
-			t.Fatalf("分辨率 %d 的长序列未跨 index: 左=%+v，右=%+v", resolution, left, right)
+		for feature := 0; feature < 5; feature++ {
+			pos := (i*5 + feature) * 2
+			left, right := &p.dsMetaindex[pos], &p.dsMetaindex[pos+1]
+			if left.ResolutionMs != resolution || right.ResolutionMs != resolution || left.feature != uint8(feature+1) || right.feature != uint8(feature+1) || left.LastTSID != wide || right.TSID != wide || left.BlockHeadersCount != 132 || right.BlockHeadersCount != 49 {
+				t.Fatalf("分辨率 %d 特征 %d 的长序列未跨 index: 左=%+v，右=%+v", resolution, feature, left, right)
+			}
 		}
 	}
 	return p
@@ -250,8 +254,11 @@ func checkDownsampleIterationReader(t *testing.T, r *downsampleReader, p *part, 
 		if err != nil {
 			t.Fatal(err)
 		}
-		if r.Header().ResolutionMs != resolution {
-			t.Fatalf("读取了其他分辨率: %d", r.Header().ResolutionMs)
+		if r.resolution != resolution {
+			t.Fatalf("读取了其他分辨率: %d", r.resolution)
+		}
+		if h.TimestampsBlockOffset != r.Header().TimestampsBlockOffset || h.TimestampsBlockSize != r.Header().TimestampsBlockSize || h.PrecisionBits != r.Header().PrecisionBits {
+			t.Fatal("跨 feature 读取未共享时间戳定位或精度")
 		}
 		var br BlockRef
 		br.init(p, &h)

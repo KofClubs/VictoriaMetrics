@@ -33,31 +33,38 @@ type downsampleReader struct {
 	compressed   []byte
 	decompressed []byte
 	block        Block
-	current      downsampleBlockHeader
-	previous     downsampleBlockHeader
+	current      blockHeader
+	previous     blockHeader
+	feature      uint8
+	peers        [countOfDownsampleFeatures]*downsampleReader
 	hasPrevious  bool
 	// 仅比较已经读取且在 index.bin 中相邻的 index，过滤跳过的区间不补读。
 	previousIndexEnd     uint64
 	previousTimestampEnd uint64
 	previousValuesEnd    uint64
+	previousIndexHeader  blockHeader
 	hasPreviousIndex     bool
 	err                  error
 }
 
-func (r *downsampleReader) Init(p *part, resolution int64) error {
-	if p == nil || !validDownsampleResolution(resolution) {
+func (r *downsampleReader) Init(p *part, resolution int64, features ...uint8) error {
+	feature := uint8(0)
+	if len(features) > 0 {
+		feature = features[0]
+	}
+	if p == nil || !validDownsampleResolution(resolution) || feature >= countOfDownsampleFeatures || len(features) > 1 {
 		r.reset()
 		return fmt.Errorf("无效降采样源或分辨率")
 	}
 	// part 不可变，同一源的窗口切换复用文件句柄和工作缓冲。
 	if r.p == p {
-		r.resolution = resolution
+		r.resolution, r.feature = resolution, feature
 		r.SetFilter(nil, minUnixMilli, maxUnixMilli)
 		return nil
 	}
 	r.reset()
 	r.p = p
-	r.resolution = resolution
+	r.resolution, r.feature = resolution, feature
 	if p.dsMetadata != nil {
 		r.files = p.dsFiles
 		r.fileSizes = p.dsFileSizes
@@ -93,6 +100,12 @@ func (r *downsampleReader) Init(p *part, resolution int64) error {
 
 // SetFilter 重置索引游标；筛选相交 block，不提前过滤 block 内的样本贡献。
 func (r *downsampleReader) SetFilter(tsid *TSID, minTimestamp, maxTimestamp int64) {
+	for i, peer := range r.peers {
+		if peer != nil {
+			putDownsampleReader(peer)
+			r.peers[i] = nil
+		}
+	}
 	r.hasFilter = tsid != nil
 	r.filterTSID = TSID{}
 	if tsid != nil {
@@ -104,12 +117,13 @@ func (r *downsampleReader) SetFilter(tsid *TSID, minTimestamp, maxTimestamp int6
 	r.metaEnd = 0
 	r.indexPos = 0
 	r.indexData = r.indexData[:0]
-	r.current = downsampleBlockHeader{}
-	r.previous = downsampleBlockHeader{}
+	r.current = blockHeader{}
+	r.previous = blockHeader{}
 	r.hasPrevious = false
 	r.previousIndexEnd = 0
 	r.previousTimestampEnd = 0
 	r.previousValuesEnd = 0
+	r.previousIndexHeader = blockHeader{}
 	r.hasPreviousIndex = false
 	r.err = nil
 	if minTimestamp > maxTimestamp {
@@ -121,10 +135,14 @@ func (r *downsampleReader) SetFilter(tsid *TSID, minTimestamp, maxTimestamp int6
 	}
 	if r.p.dsMetadata != nil {
 		rows := r.p.dsMetaindex
-		start := sort.Search(len(rows), func(i int) bool { return rows[i].ResolutionMs >= r.resolution })
-		end := start + sort.Search(len(rows)-start, func(i int) bool { return rows[start+i].ResolutionMs > r.resolution })
+		start := sort.Search(len(rows), func(i int) bool {
+			return rows[i].ResolutionMs > r.resolution || (rows[i].ResolutionMs == r.resolution && rows[i].feature >= r.feature+1)
+		})
+		end := start + sort.Search(len(rows)-start, func(i int) bool {
+			return rows[start+i].ResolutionMs > r.resolution || rows[start+i].feature > r.feature+1
+		})
 		if r.hasFilter {
-			// 同一分辨率下 LastTSID 单调，保留所有可能包含目标的边界 index。
+			// 同一分辨率、特征下 LastTSID 单调，保留所有可能包含目标的边界 index。
 			start += sort.Search(end-start, func(i int) bool { return !rows[start+i].LastTSID.Less(&r.filterTSID) })
 		}
 		r.metaPos = start
@@ -143,7 +161,7 @@ func (r *downsampleReader) SetFilter(tsid *TSID, minTimestamp, maxTimestamp int6
 	}
 }
 
-func (r *downsampleReader) Header() *downsampleBlockHeader {
+func (r *downsampleReader) Header() *blockHeader {
 	return &r.current
 }
 
@@ -152,6 +170,7 @@ func (r *downsampleReader) Error() error {
 }
 
 func (r *downsampleReader) NextHeader() bool {
+	r.current = blockHeader{}
 	if r.err != nil || r.p == nil {
 		return false
 	}
@@ -166,23 +185,13 @@ func (r *downsampleReader) NextHeader() bool {
 				return false
 			}
 		}
-		var h downsampleBlockHeader
-		if r.p.dsMetadata != nil {
-			if err := h.unmarshal(r.indexData[r.indexPos : r.indexPos+downsampleBlockHeaderSize]); err != nil {
-				r.err = err
-				return false
-			}
-			r.indexPos += downsampleBlockHeaderSize
-		} else {
-			var bh blockHeader
-			if _, err := bh.Unmarshal(r.indexData[r.indexPos : r.indexPos+marshaledBlockHeaderSize]); err != nil {
-				r.err = err
-				return false
-			}
-			r.indexPos += marshaledBlockHeaderSize
-			h = downsampleBlockHeader{TSID: bh.TSID, ResolutionMs: r.resolution, RowsCount: bh.RowsCount, MinTimestamp: bh.MinTimestamp, MaxTimestamp: bh.MaxTimestamp, raw: true, rawHeader: bh}
+		var h blockHeader
+		if _, err := h.Unmarshal(r.indexData[r.indexPos : r.indexPos+marshaledBlockHeaderSize]); err != nil {
+			r.err = err
+			return false
 		}
-		if r.hasPrevious && (h.less(&r.previous) || (!h.raw && !r.previous.less(&h))) {
+		r.indexPos += marshaledBlockHeaderSize
+		if r.hasPrevious && (downsampleHeaderLess(&h, &r.previous) || (r.p.dsMetadata != nil && !downsampleHeadersOrdered(&r.previous, &h))) {
 			r.err = fmt.Errorf("part %q 的 block header 排序错误", r.p.path)
 			return false
 		}
@@ -193,7 +202,7 @@ func (r *downsampleReader) NextHeader() bool {
 			r.indexPos = len(r.indexData)
 			return false
 		}
-		if h.ResolutionMs != r.resolution || (r.hasFilter && h.TSID != r.filterTSID) || h.MaxTimestamp < r.minTimestamp || h.MinTimestamp > r.maxTimestamp {
+		if (r.hasFilter && h.TSID != r.filterTSID) || h.MaxTimestamp < r.minTimestamp || h.MinTimestamp > r.maxTimestamp {
 			continue
 		}
 		r.current = h
@@ -259,7 +268,6 @@ func (r *downsampleReader) nextIndex() (bool, error) {
 				return false, fmt.Errorf("降采样 index 标识错误")
 			}
 			data = data[len(downsampleIndexMagic):]
-			headerSize = downsampleFieldHeaderSize
 		}
 		if uint64(count)*uint64(headerSize) > maxBlockSize {
 			return false, fmt.Errorf("index 解码长度超过上限")
@@ -285,54 +293,57 @@ func (r *downsampleReader) validateIndex(m *downsampleMetaindexRow) error {
 	var rows uint64
 	var minTime, maxTime int64
 	var first, last TSID
-	var previous downsampleBlockHeader
-	for pos := 0; pos < len(r.indexData); pos += downsampleBlockHeaderSize {
-		var h downsampleBlockHeader
-		if err := h.unmarshal(r.indexData[pos : pos+downsampleBlockHeaderSize]); err != nil {
+	var previous blockHeader
+	for pos := 0; pos < len(r.indexData); pos += marshaledBlockHeaderSize {
+		var h blockHeader
+		if _, err := h.Unmarshal(r.indexData[pos : pos+marshaledBlockHeaderSize]); err != nil {
 			return err
 		}
-		if h.ResolutionMs != m.ResolutionMs {
-			return fmt.Errorf("index block 混合分辨率")
+		if err := validateDownsampleHeader(&h); err != nil {
+			return err
+		}
+		if !sameDownsampleTenant(&h.TSID, &m.TSID) || h.TSID.Less(&m.TSID) || m.LastTSID.Less(&h.TSID) {
+			return fmt.Errorf("index block 租户或 TSID 范围错误")
 		}
 		if pos == 0 {
-			if r.hasPreviousIndex && m.IndexBlockOffset == r.previousIndexEnd && (h.Timestamps.Offset != r.previousTimestampEnd || h.Columns[0].Offset != r.previousValuesEnd) {
+			if r.hasPreviousIndex && !downsampleHeadersOrdered(&r.previousIndexHeader, &h) {
+				return fmt.Errorf("跨 index block 排序错误或时间范围重叠")
+			}
+			if r.hasPreviousIndex && m.IndexBlockOffset == r.previousIndexEnd && (h.TimestampsBlockOffset != r.previousTimestampEnd || h.ValuesBlockOffset != r.previousValuesEnd) {
 				return fmt.Errorf("相邻 index block 的降采样负载不连续")
 			}
-			first = h.TSID
-			minTime = h.MinTimestamp
-			maxTime = h.MaxTimestamp
-		} else if !previous.less(&h) {
-			return fmt.Errorf("index block 排序错误")
-		}
-		if pos > 0 && (h.Timestamps.Offset != previous.Timestamps.Offset+uint64(previous.Timestamps.Size) || h.Columns[0].Offset != previous.Columns[countOfDownsampleFeatures-1].Offset+uint64(previous.Columns[countOfDownsampleFeatures-1].Size)) {
-			return fmt.Errorf("相邻降采样 block 负载不连续")
-		}
-		if pos == 0 && m.IndexBlockOffset == 0 && (h.Timestamps.Offset != 0 || h.Columns[0].Offset != 0) {
-			return fmt.Errorf("降采样负载首偏移不是零")
-		}
-		last = h.TSID
-		previous = h
-		rows += uint64(h.RowsCount) * countOfDownsampleFeatures
-		minTime = min(minTime, h.MinTimestamp)
-		maxTime = max(maxTime, h.MaxTimestamp)
-		if err := checkDownsampleExtent(h.Timestamps.Offset, h.Timestamps.Size, r.fileSizes[0]); err != nil {
-			return err
-		}
-		for i := range h.Columns {
-			if err := checkDownsampleExtent(h.Columns[i].Offset, h.Columns[i].Size, r.fileSizes[1]); err != nil {
-				return err
+			first, minTime, maxTime = h.TSID, h.MinTimestamp, h.MaxTimestamp
+		} else {
+			if !downsampleHeadersOrdered(&previous, &h) {
+				return fmt.Errorf("index block 排序错误或时间范围重叠")
+			}
+			if h.TimestampsBlockOffset != previous.TimestampsBlockOffset+uint64(previous.TimestampsBlockSize) || h.ValuesBlockOffset != previous.ValuesBlockOffset+uint64(previous.ValuesBlockSize) {
+				return fmt.Errorf("相邻降采样 block 负载不连续")
 			}
 		}
+		if pos == 0 && m.IndexBlockOffset == 0 && (h.TimestampsBlockOffset != 0 || h.ValuesBlockOffset != 0) {
+			return fmt.Errorf("降采样负载首偏移不是零")
+		}
+		last, previous = h.TSID, h
+		rows += uint64(h.RowsCount)
+		minTime, maxTime = min(minTime, h.MinTimestamp), max(maxTime, h.MaxTimestamp)
+		if err := checkDownsampleExtent(h.TimestampsBlockOffset, h.TimestampsBlockSize, r.fileSizes[0]); err != nil {
+			return err
+		}
+		if err := checkDownsampleExtent(h.ValuesBlockOffset, h.ValuesBlockSize, r.fileSizes[1]); err != nil {
+			return err
+		}
 	}
-	if m.IndexBlockOffset+uint64(m.IndexBlockSize) == r.fileSizes[2] && (previous.Timestamps.Offset+uint64(previous.Timestamps.Size) != r.fileSizes[0] || previous.Columns[countOfDownsampleFeatures-1].Offset+uint64(previous.Columns[countOfDownsampleFeatures-1].Size) != r.fileSizes[1]) {
+	if m.IndexBlockOffset+uint64(m.IndexBlockSize) == r.fileSizes[2] && (previous.TimestampsBlockOffset+uint64(previous.TimestampsBlockSize) != r.fileSizes[0] || previous.ValuesBlockOffset+uint64(previous.ValuesBlockSize) != r.fileSizes[1]) {
 		return fmt.Errorf("降采样负载存在截断或未引用尾部")
 	}
 	if rows != m.RowsCount || first != m.TSID || last != m.LastTSID || minTime != m.MinTimestamp || maxTime != m.MaxTimestamp {
 		return fmt.Errorf("index 与 metaindex 统计矛盾")
 	}
 	r.previousIndexEnd = m.IndexBlockOffset + uint64(m.IndexBlockSize)
-	r.previousTimestampEnd = previous.Timestamps.Offset + uint64(previous.Timestamps.Size)
-	r.previousValuesEnd = previous.Columns[countOfDownsampleFeatures-1].Offset + uint64(previous.Columns[countOfDownsampleFeatures-1].Size)
+	r.previousTimestampEnd = previous.TimestampsBlockOffset + uint64(previous.TimestampsBlockSize)
+	r.previousValuesEnd = previous.ValuesBlockOffset + uint64(previous.ValuesBlockSize)
+	r.previousIndexHeader = previous
 	r.hasPreviousIndex = true
 	return nil
 }
@@ -378,39 +389,71 @@ func (r *downsampleReader) readAt(dst []byte, file int, off uint64, size uint32)
 		_, err := r.files[file].ReadAt(dst, int64(off))
 		return dst, err
 	}
+	if r.p == nil || r.p.dsMetadata != nil {
+		return dst, fmt.Errorf("降采样文件句柄不可用")
+	}
 	f := []fs.MustReadAtCloser{r.p.timestampsFile, r.p.valuesFile, r.p.indexFile}[file]
+	if f == nil {
+		return dst, fmt.Errorf("原始文件句柄不可用")
+	}
 	f.MustReadAt(dst, int64(off))
 	return dst, nil
 }
 
 // FieldHeader 返回单个特征的原生 header，供现有 BlockRef 读取链路使用。
 func (r *downsampleReader) FieldHeader(feature uint8) (blockHeader, error) {
+	if r.err != nil {
+		return blockHeader{}, r.err
+	}
 	if r.p == nil || r.current.RowsCount == 0 || feature >= countOfDownsampleFeatures {
 		return blockHeader{}, fmt.Errorf("降采样 reader 未定位 Block 或特征无效")
 	}
-	if r.current.raw {
-		return r.current.rawHeader, nil
+	if r.p.dsMetadata == nil || feature == r.feature {
+		return r.current, nil
 	}
-	fh := r.current.fieldHeader(int(feature))
-	return fh.BlockHeader, nil
+	peer := r.peers[feature]
+	if peer == nil {
+		peer = getDownsampleReader()
+		r.peers[feature] = peer
+		if err := peer.Init(r.p, r.resolution, feature); err != nil {
+			return blockHeader{}, err
+		}
+		var tsid *TSID
+		if r.hasFilter {
+			tsid = &r.filterTSID
+		}
+		peer.SetFilter(tsid, r.minTimestamp, r.maxTimestamp)
+	}
+	for peer.current.RowsCount == 0 || downsampleHeaderLess(&peer.current, &r.current) {
+		if !peer.NextHeader() {
+			if err := peer.Error(); err != nil {
+				return blockHeader{}, err
+			}
+			return blockHeader{}, fmt.Errorf("降采样特征缺失")
+		}
+	}
+	if !sameDownsampleTimestamps(&r.current, &peer.current) {
+		return blockHeader{}, fmt.Errorf("同一批次的单特征 Block 未共享一致的时间戳描述")
+	}
+	return peer.current, nil
 }
 
 // ReadFieldBlock 读取一个分辨率、一个特征对应的原生 Block，并完成其解码状态转换。
 func (r *downsampleReader) ReadFieldBlock(dst *Block, feature uint8) error {
-	if r.p == nil || r.current.RowsCount == 0 || feature >= countOfDownsampleFeatures {
-		return fmt.Errorf("降采样 reader 未定位 Block 或特征无效")
+	h, err := r.FieldHeader(feature)
+	if err != nil {
+		return err
 	}
-	if r.current.raw {
-		return r.readNativeBlock(dst, &r.current.rawHeader)
-	}
-	fh := r.current.fieldHeader(int(feature))
-	return r.readNativeBlock(dst, &fh.BlockHeader)
+	return r.readNativeBlock(dst, &h)
 }
 
 func (r *downsampleReader) readNativeBlock(b *Block, h *blockHeader) error {
 	b.Reset()
 	if err := h.validate(); err != nil {
 		return err
+	}
+	if h.MinTimestamp > h.MaxTimestamp || h.MinTimestamp < minUnixMilli || h.MaxTimestamp > maxUnixMilli || (h.RowsCount == 1 && h.MinTimestamp != h.MaxTimestamp) {
+		return fmt.Errorf("Block 时间范围无效")
 	}
 	b.bh = *h
 	var err error
@@ -432,20 +475,30 @@ func (r *downsampleReader) readNativeBlock(b *Block, h *blockHeader) error {
 	}
 	b.bh.TimestampsBlockSize = uint32(len(b.timestampsData))
 	b.bh.ValuesBlockSize = uint32(len(b.valuesData))
-	return b.UnmarshalData()
+	if err := b.UnmarshalData(); err != nil {
+		return err
+	}
+	// 原生 const/delta-const 不检查边界；有损编码则先沿用原生顺序修复。
+	if len(b.timestamps) != int(h.RowsCount) || b.timestamps[0] != h.MinTimestamp || b.timestamps[len(b.timestamps)-1] != h.MaxTimestamp {
+		return fmt.Errorf("Block 时间戳首尾或行数与 header 矛盾")
+	}
+	return checkTimestampsBounds(b.timestamps, h.MinTimestamp, h.MaxTimestamp)
 }
 
 func (r *downsampleReader) ReadBlock(b *downsampleBatch) error {
+	if r.err != nil {
+		return r.err
+	}
 	if r.p == nil || r.current.RowsCount == 0 {
 		return fmt.Errorf("降采样 reader 未定位批次")
 	}
 	b.Reset()
 	h := &r.current
 	b.tsid, b.resolution = h.TSID, r.resolution
-	if h.raw {
-		return r.readRawBlock(b, &h.rawHeader)
+	if r.p.dsMetadata == nil {
+		return r.readRawBlock(b, h)
 	}
-	b.precisionBits = h.Timestamps.PrecisionBits
+	b.precisionBits = h.PrecisionBits
 	for i := range b.values {
 		if err := r.ReadFieldBlock(&r.block, uint8(i)); err != nil {
 			return err

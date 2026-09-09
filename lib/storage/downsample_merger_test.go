@@ -88,21 +88,7 @@ func assertDownsampleTestPrecision64(t *testing.T, p *part) {
 		}
 		blocks := 0
 		for r.NextHeader() {
-			h := r.Header()
-			if h.raw {
-				if h.rawHeader.PrecisionBits != 64 {
-					t.Fatalf("raw block lost precision64: %d", h.rawHeader.PrecisionBits)
-				}
-			} else {
-				if h.Timestamps.PrecisionBits != 64 {
-					t.Fatalf("resolution %d lost timestamp precision64: %d", resolution, h.Timestamps.PrecisionBits)
-				}
-				for feature, column := range h.Columns {
-					if column.PrecisionBits != 64 {
-						t.Fatalf("resolution %d feature %d lost shared precision64: %d", resolution, feature, column.PrecisionBits)
-					}
-				}
-			}
+			assertDownsampleTestHeaderPrecision(t, r, 64)
 			if err := r.ReadBlock(b); err != nil {
 				t.Fatal(err)
 			}
@@ -116,6 +102,23 @@ func assertDownsampleTestPrecision64(t *testing.T, p *part) {
 		}
 		if blocks == 0 {
 			t.Fatalf("resolution %d has no blocks to check", resolution)
+		}
+	}
+}
+
+func assertDownsampleTestHeaderPrecision(t *testing.T, r *downsampleReader, want uint8) {
+	t.Helper()
+	h := *r.Header()
+	if h.PrecisionBits != want {
+		t.Fatalf("resolution %d lost native precision: got=%d want=%d", r.resolution, h.PrecisionBits, want)
+	}
+	for feature := uint8(0); feature < countOfDownsampleFeatures; feature++ {
+		column, err := r.FieldHeader(feature)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if column.PrecisionBits != want || column.TSID != h.TSID || column.RowsCount != h.RowsCount || column.MinTimestamp != h.MinTimestamp || column.MaxTimestamp != h.MaxTimestamp || column.TimestampsBlockOffset != h.TimestampsBlockOffset || column.TimestampsBlockSize != h.TimestampsBlockSize || column.TimestampsMarshalType != h.TimestampsMarshalType {
+			t.Fatalf("resolution %d feature %d lost shared timestamps or precision %d: %+v", r.resolution, feature, want, column)
 		}
 	}
 }
@@ -172,14 +175,10 @@ func TestDownsampleMergerSourcePrecision(t *testing.T) {
 						if tc.offset == downsampleResolution1h {
 							want = tc.precisions[(b.timestamps[0]-base)/tc.offset]
 						}
-						if b.precisionBits != want || r.Header().Timestamps.PrecisionBits != want {
+						if b.precisionBits != want {
 							t.Fatalf("round %d lost source precision %d: %+v", round, want, b)
 						}
-						for _, column := range r.Header().Columns {
-							if column.PrecisionBits != want {
-								t.Fatalf("column precision %d; want %d", column.PrecisionBits, want)
-							}
-						}
+						assertDownsampleTestHeaderPrecision(t, r, want)
 						blocks++
 					}
 					if err := r.Error(); err != nil {
@@ -402,13 +401,14 @@ func TestDownsampleMergerSharedPrecisionAndColumnScales(t *testing.T) {
 			if err := r.Init(p, downsampleResolution5m); err != nil || !r.NextHeader() {
 				t.Fatalf("cannot read source header: %v", err)
 			}
-			if r.Header().Timestamps.PrecisionBits != 64 {
-				t.Fatal("source timestamps lost shared precision64")
-			}
+			assertDownsampleTestHeaderPrecision(t, r, 64)
 			scales := make(map[int16]bool)
 			for feature := range block.values {
 				_, scale := decimal.AppendFloatToDecimal(nil, block.values[feature])
-				column := r.Header().Columns[feature]
+				column, err := r.FieldHeader(uint8(feature))
+				if err != nil {
+					t.Fatal(err)
+				}
 				if column.Scale != scale || column.PrecisionBits != block.precisionBits {
 					t.Fatalf("source column %d lost scale or shared precision64", feature)
 				}
@@ -470,14 +470,7 @@ func TestDownsampleMergerSharedPrecisionAndColumnScales(t *testing.T) {
 			}
 			blocks := 0
 			for {
-				if r.Header().Timestamps.PrecisionBits != 64 {
-					t.Fatalf("merge round %d lost shared timestamp precision64", round)
-				}
-				for feature, column := range r.Header().Columns {
-					if column.PrecisionBits != 64 {
-						t.Fatalf("merge round %d column %d lost shared precision64", round, feature)
-					}
-				}
+				assertDownsampleTestHeaderPrecision(t, r, 64)
 				var batch downsampleBatch
 				if err := r.ReadBlock(&batch); err != nil {
 					t.Fatal(err)

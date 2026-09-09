@@ -54,8 +54,8 @@ func TestDownsampleFileRoundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer p.MustClose()
-	if p.ph.RowsCount != 30 || p.ph.BlocksCount != 15 || len(p.dsMetaindex) != 2 {
-		t.Fatalf("错误 part 统计: %+v", p.ph)
+	if p.ph.RowsCount != 30 || p.ph.BlocksCount != 15 || len(p.dsMetaindex) != 2*countOfDownsampleFeatures {
+		t.Fatalf("错误 part 统计: %+v; metaindex rows=%d", p.ph, len(p.dsMetaindex))
 	}
 	r := getDownsampleReader()
 	defer putDownsampleReader(r)
@@ -117,9 +117,12 @@ func TestDownsampleFileConstantAndFilter(t *testing.T) {
 	if !r.NextHeader() {
 		t.Fatalf("丢失相交 block: %v", r.Error())
 	}
-	h := r.Header()
-	if h.Columns[downsampleFeatureCount].Size != 0 || h.Columns[downsampleFeatureCount].MarshalType != encoding.MarshalTypeConst {
-		t.Fatalf("常量列未使用零负载: %+v", h.Columns[downsampleFeatureCount])
+	h, err := r.FieldHeader(downsampleFeatureCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.ValuesBlockSize != 0 || h.ValuesMarshalType != encoding.MarshalTypeConst {
+		t.Fatalf("常量列未使用零负载: %+v", h)
 	}
 	var got downsampleBatch
 	if err := r.ReadBlock(&got); err != nil {
@@ -157,40 +160,33 @@ func TestDownsampleHeaderValidation(t *testing.T) {
 		t.Fatal(r.Error())
 	}
 	base := *r.Header()
-	cases := map[string]func(*downsampleBlockHeader){
-		"resolution":          func(h *downsampleBlockHeader) { h.ResolutionMs = 1 },
-		"rows":                func(h *downsampleBlockHeader) { h.RowsCount = 0 },
-		"feature":             func(h *downsampleBlockHeader) { h.Columns[1].Feature = 1 },
-		"precision":           func(h *downsampleBlockHeader) { h.Columns[0].PrecisionBits = 0 },
-		"type":                func(h *downsampleBlockHeader) { h.Columns[0].MarshalType = 255 },
-		"size":                func(h *downsampleBlockHeader) { h.Columns[0].Size = math.MaxUint32 },
-		"timestamp_precision": func(h *downsampleBlockHeader) { h.Timestamps.PrecisionBits = 0 },
-		"time_domain": func(h *downsampleBlockHeader) {
-			h.MinTimestamp = minUnixMilli - 1
-			h.Timestamps.FirstValue = h.MinTimestamp
-		},
-		"column_offset": func(h *downsampleBlockHeader) { h.Columns[1].Offset++ },
-		"single_row_delta2": func(h *downsampleBlockHeader) {
-			h.RowsCount = 1
-			h.Columns[0].MarshalType = encoding.MarshalTypeNearestDelta2
-		},
-		"single_row_timestamp_delta2": func(h *downsampleBlockHeader) {
-			h.RowsCount = 1
-			h.Timestamps.MarshalType = encoding.MarshalTypeZSTDNearestDelta2
-		},
+	cases := map[string]func(*blockHeader){
+		"rows":                        func(h *blockHeader) { h.RowsCount = 0 },
+		"too_many_rows":               func(h *blockHeader) { h.RowsCount = maxRowsPerBlock + 1 },
+		"precision":                   func(h *blockHeader) { h.PrecisionBits = 0 },
+		"type":                        func(h *blockHeader) { h.ValuesMarshalType = 255 },
+		"size":                        func(h *blockHeader) { h.ValuesBlockSize = math.MaxUint32 },
+		"time_domain":                 func(h *blockHeader) { h.MinTimestamp = minUnixMilli - 1 },
+		"column_offset":               func(h *blockHeader) { h.ValuesBlockOffset = math.MaxUint64 },
+		"single_row_delta2":           func(h *blockHeader) { h.RowsCount = 1; h.ValuesMarshalType = encoding.MarshalTypeNearestDelta2 },
+		"single_row_timestamp_delta2": func(h *blockHeader) { h.RowsCount = 1; h.TimestampsMarshalType = encoding.MarshalTypeZSTDNearestDelta2 },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
 			h := base
 			mutate(&h)
-			var got downsampleBlockHeader
-			if err := got.unmarshal(h.marshal(nil)); err == nil {
+			var got blockHeader
+			_, err := got.Unmarshal(h.Marshal(nil))
+			if err == nil {
+				err = validateDownsampleHeader(&got)
+			}
+			if err == nil {
 				t.Fatal("未拒绝非法 header")
 			}
 		})
 	}
-	var got downsampleBlockHeader
-	if err := got.unmarshal(base.marshal(nil)[:downsampleBlockHeaderSize-1]); err == nil {
+	var got blockHeader
+	if _, err := got.Unmarshal(base.Marshal(nil)[:marshaledBlockHeaderSize-1]); err == nil {
 		t.Fatal("未拒绝截断 header")
 	}
 	if err := checkDownsampleExtent(math.MaxUint64, 1, 10); err == nil {
@@ -404,7 +400,7 @@ func TestDownsampleTimeBounds(t *testing.T) {
 		if err := m.validate(); err == nil {
 			t.Fatal("非法 part 时间范围未拒绝")
 		}
-		mr := downsampleMetaindexRow{ResolutionMs: 300000, TSID: TSID{MetricID: 1}, LastTSID: TSID{MetricID: 1}, MinTimestamp: timestamp, MaxTimestamp: timestamp, BlockHeadersCount: 5, RowsCount: 5, IndexBlockSize: 16}
+		mr := downsampleMetaindexRow{metaindexRow: metaindexRow{TSID: TSID{MetricID: 1}, MinTimestamp: timestamp, MaxTimestamp: timestamp, BlockHeadersCount: 1, IndexBlockSize: 16}, ResolutionMs: 300000, feature: 1, LastTSID: TSID{MetricID: 1}, RowsCount: 1}
 		var got downsampleMetaindexRow
 		if err := got.unmarshal(mr.marshal(nil)); err == nil {
 			t.Fatal("非法 metaindex 时间范围未拒绝")
@@ -526,6 +522,7 @@ func TestDownsampleReaderSeekResolutionAndSharedTSID(t *testing.T) {
 	if err := w.Init(path, 1); err != nil {
 		t.Fatal(err)
 	}
+	w.indexLimit = 2 * marshaledBlockHeaderSize
 	ids := []uint64{1, 10, 10, 10, 20, 30}
 	buckets := []int64{30, 1, 2, 3, 1, 1}
 	for _, res := range []int64{300000, 3600000} {
@@ -559,12 +556,12 @@ func TestDownsampleReaderSeekResolutionAndSharedTSID(t *testing.T) {
 		if err := r.Init(p, res); err != nil {
 			t.Fatal(err)
 		}
-		if r.metaPos != resIdx*3 || r.metaEnd != (resIdx+1)*3 {
+		if r.metaPos != resIdx*15 || r.metaEnd != resIdx*15+3 {
 			t.Fatalf("未直接定位分辨率范围: %d..%d", r.metaPos, r.metaEnd)
 		}
 		tsid := TSID{MetricID: 10}
 		r.SetFilter(&tsid, minUnixMilli, maxUnixMilli)
-		if r.metaPos != resIdx*3 {
+		if r.metaPos != resIdx*15 {
 			t.Fatal("遗漏含目标 TSID 的首个 index")
 		}
 		count := 0
@@ -591,7 +588,7 @@ func TestDownsampleReaderSeekResolutionAndSharedTSID(t *testing.T) {
 		for _, missing := range []uint64{0, 15, 40} {
 			tsid.MetricID = missing
 			r.SetFilter(&tsid, minUnixMilli, maxUnixMilli)
-			if missing == 15 && r.metaPos != resIdx*3+2 {
+			if missing == 15 && r.metaPos != resIdx*15+2 {
 				t.Fatal("未二分跳过较小 LastTSID")
 			}
 			if r.NextHeader() || r.Error() != nil {
@@ -666,7 +663,7 @@ func TestDownsampleReaderSeekHighCardinality(t *testing.T) {
 	for resIdx, res := range []int64{300000, 3600000} {
 		for i := 0; i < rows; i++ {
 			tsid := TSID{MetricID: uint64(i*10 + 10)}
-			p.dsMetaindex[resIdx*rows+i] = downsampleMetaindexRow{ResolutionMs: res, TSID: tsid, LastTSID: tsid}
+			p.dsMetaindex[resIdx*rows+i] = downsampleMetaindexRow{metaindexRow: metaindexRow{TSID: tsid}, ResolutionMs: res, feature: 1, LastTSID: tsid}
 		}
 	}
 	r := getDownsampleReader()
@@ -729,7 +726,7 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 			if err := r.Init(p, 300000); err != nil || !r.NextHeader() {
 				t.Fatalf("无法定位批次: %v / %v", err, r.Error())
 			}
-			if r.Header().Timestamps.PrecisionBits != precision {
+			if r.Header().PrecisionBits != precision {
 				t.Fatal("时间戳未保留共享精度")
 			}
 			for feature := range stored {
@@ -833,18 +830,9 @@ func TestDownsampleRejectsUnknownVersionAndMarker(t *testing.T) {
 					}
 					return
 				}
-				p, err := openDownsamplePart(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer p.MustClose()
-				r := getDownsampleReader()
-				defer putDownsampleReader(r)
-				if err := r.Init(p, 300000); err != nil {
-					t.Fatal(err)
-				}
-				if r.NextHeader() || r.Error() == nil {
-					t.Fatal("reader 未拒绝未知 index 格式标识")
+				if p, err := openDownsamplePart(path); err == nil {
+					p.MustClose()
+					t.Fatal("打开 part 时未拒绝未知 index 格式标识")
 				}
 			})
 		}
@@ -863,52 +851,37 @@ func TestDownsampleFieldHeaderSharedTimestamps(t *testing.T) {
 	if err := r.Init(p, 300000); err != nil || !r.NextHeader() {
 		t.Fatalf("无法定位批次: %v / %v", err, r.Error())
 	}
-	base := r.Header().marshal(nil)
-	if len(base) != 5*(10+marshaledBlockHeaderSize) || downsampleFieldHeaderSize != 10+marshaledBlockHeaderSize {
-		t.Fatal("文件条目长度未与原生 blockHeader 保持一致")
+	base := *r.Header()
+	if len(base.Marshal(nil)) != 89 {
+		t.Fatal("原生 header 长度改变")
 	}
-	for feature := 0; feature < 5; feature++ {
-		var h downsampleFieldHeader
-		if err := h.unmarshal(base[feature*downsampleFieldHeaderSize : (feature+1)*downsampleFieldHeaderSize]); err != nil {
+	for feature := uint8(0); feature < 5; feature++ {
+		h, err := r.FieldHeader(feature)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if h.TimestampPrecisionBits != 64 || h.BlockHeader.PrecisionBits != h.TimestampPrecisionBits {
-			t.Fatalf("特征 %d 的磁盘 header 未保留共享精度64: %+v", feature, h)
+		if !sameDownsampleTimestamps(&base, &h) || h.PrecisionBits != 64 {
+			t.Fatalf("特征 %d 未共享时间戳: %+v", feature, h)
 		}
 	}
-	mutations := map[string]func(*downsampleFieldHeader){
-		"resolution":          func(h *downsampleFieldHeader) { h.ResolutionMs = 3600000 },
-		"feature":             func(h *downsampleFieldHeader) { h.Feature = 1 },
-		"timestamp_precision": func(h *downsampleFieldHeader) { h.TimestampPrecisionBits = 8 },
-		"value_precision":     func(h *downsampleFieldHeader) { h.BlockHeader.PrecisionBits = 8 },
-		"shared_precision": func(h *downsampleFieldHeader) {
-			h.TimestampPrecisionBits = 8
-			h.BlockHeader.PrecisionBits = 8
-		},
-		"tsid":             func(h *downsampleFieldHeader) { h.BlockHeader.TSID.MetricID++ },
-		"account_id":       func(h *downsampleFieldHeader) { h.BlockHeader.TSID.AccountID++ },
-		"project_id":       func(h *downsampleFieldHeader) { h.BlockHeader.TSID.ProjectID++ },
-		"rows":             func(h *downsampleFieldHeader) { h.BlockHeader.RowsCount++ },
-		"minimum":          func(h *downsampleFieldHeader) { h.BlockHeader.MinTimestamp++ },
-		"maximum":          func(h *downsampleFieldHeader) { h.BlockHeader.MaxTimestamp++ },
-		"timestamp_offset": func(h *downsampleFieldHeader) { h.BlockHeader.TimestampsBlockOffset++ },
-		"timestamp_size":   func(h *downsampleFieldHeader) { h.BlockHeader.TimestampsBlockSize++ },
-		"timestamp_codec": func(h *downsampleFieldHeader) {
-			h.BlockHeader.TimestampsMarshalType = encoding.MarshalTypeNearestDelta2
-		},
+	mutations := map[string]func(*blockHeader){
+		"precision":        func(h *blockHeader) { h.PrecisionBits = 8 },
+		"tsid":             func(h *blockHeader) { h.TSID.MetricID++ },
+		"account_id":       func(h *blockHeader) { h.TSID.AccountID++ },
+		"project_id":       func(h *blockHeader) { h.TSID.ProjectID++ },
+		"rows":             func(h *blockHeader) { h.RowsCount++ },
+		"minimum":          func(h *blockHeader) { h.MinTimestamp++ },
+		"maximum":          func(h *blockHeader) { h.MaxTimestamp++ },
+		"timestamp_offset": func(h *blockHeader) { h.TimestampsBlockOffset++ },
+		"timestamp_size":   func(h *blockHeader) { h.TimestampsBlockSize++ },
+		"timestamp_codec":  func(h *blockHeader) { h.TimestampsMarshalType = encoding.MarshalTypeNearestDelta2 },
 	}
 	for name, mutate := range mutations {
 		t.Run(name, func(t *testing.T) {
-			data := append([]byte(nil), base...)
-			var h downsampleFieldHeader
-			if err := h.unmarshal(data[downsampleFieldHeaderSize : 2*downsampleFieldHeaderSize]); err != nil {
-				t.Fatal(err)
-			}
+			h := base
 			mutate(&h)
-			copy(data[downsampleFieldHeaderSize:], h.marshal(nil))
-			var batch downsampleBlockHeader
-			if err := batch.unmarshal(data); err == nil {
-				t.Fatal("未拒绝五个单特征 Block 之间不一致的共享时间戳描述")
+			if sameDownsampleTimestamps(&base, &h) {
+				t.Fatal("未拒绝不一致的共享时间戳描述")
 			}
 		})
 	}
@@ -990,8 +963,8 @@ func TestDownsampleClusterTenantIndexBoundaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer p.MustClose()
-	if len(p.dsMetaindex) != 6 {
-		t.Fatalf("未覆盖两个分辨率各三个 index: %d", len(p.dsMetaindex))
+	if len(p.dsMetaindex) != 50 {
+		t.Fatalf("未覆盖两个分辨率、五列各五个租户 index: %d", len(p.dsMetaindex))
 	}
 	r := getDownsampleReader()
 	defer putDownsampleReader(r)

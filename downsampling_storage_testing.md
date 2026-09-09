@@ -1,8 +1,38 @@
 # 降采样存储测试说明
 
-## 范围与判定
+## 当前布局与本次验证（2026-09-09）
 
-基线为 `v1.151.0-cluster`（`e7a3dc606a1d804cb3101fa73eb30cb0946ab2a9`），候选为 `experimental/downsampling` 的当前工作区；具体 commit、改动和脚本 SHA256 记录在运行 manifest 中。降采样存储与字段查询版本均为 2。
+当前生产实现以 [文件布局](downsampling_storage_file_layout.md) 为准：集群版 89 字节原生 header、113 字节嵌入式 metaindex；
+五路磁盘 spill 在分辨率结束时按 feature 完整输出，values/index/metaindex 全局按 resolution/feature/TSID/时间排列。
+timestamps 按生成顺序只写一次（五列分别编码并校验一致性）；打开时有界五路遍历全部 index，查询只读目标列，归并五路对齐。
+`TSID.Less` 先比较 AccountID、ProjectID；租户变化仍须切 row。分段 index flush 不得导致 feature 从 5 回退到 1。
+
+**旧实验 v2 的 99/112 字节布局不兼容，且无迁移。** 版本号和 magic 仍为 2，不能据此复用旧摘要目录。
+`lib/storage/testdata/downsampling_inspect.py` 当前仍硬编码 99/112 字节，尚未适配；下文集群与一键结果均为历史证据，
+不代表当前布局已通过 E2E。需另行适配检查器并从新目录重跑，本次不修改该脚本。
+
+本次仅修改三份指定文档与 `lib/storage/downsample_space_test.go`，未修改生产代码。空间测试覆盖：
+
+| 测试 | 覆盖 |
+|---|---|
+| `TestEstimateDownsamplePartSize` | raw 两分辨率放大、摘要物理行除五向上取整、混合输入、零行、无效输入及溢出；不依赖源压缩大小 |
+| `TestEstimateDownsampleOutputSize` | 独立 89/113 字节公式：一份 timestamps、五份最终 values、五列独立 index/metaindex、五份 spill header/values、64 KiB metadata |
+| `TestDownsampleSpaceEstimateOverflow` | `math/big` 独立参考；行数/批次数饱和前后、组合加法、payload/五列乘法溢出及饱和算术边界 |
+| `TestDownsampleSpaceBoundCoversEncodedParts` | 满 Block、单行多 TSID、强制每列每 Block 独占 index；实测五路 spill 字节、timestamps 不重复、最终五文件无 spill、逐列 index/metaindex 统计及打开校验 |
+| `TestReserveDownsampleSpaceConcurrentAndCachedFreeSpace` | 并发预留、幂等释放、空闲空间缓存债务与过期 |
+| `TestDownsampleAvailableSpaceBoundaries` | 安全余量、预留、请求边界及无效行数 |
+
+实盘测试比较“最终文件总字节 + flush 前全部 spill 字节”与预算，这是覆盖逐列删除过程的**保守峰值包络**，
+不是对瞬时峰值的采样。独立公式为 `110 × 逻辑行数 + 5105 × 五列批次数 + 65536`，超出 uint64 时饱和。
+
+已运行 `go test ./lib/storage -run 'Test(EstimateDownsample|DownsampleSpace|ReserveDownsampleSpace|DownsampleAvailableSpace)' -count=1 -v`：
+**通过，6 个顶层测试、16 个子测试，包耗时 0.645s。**
+同范围 `go test -race ./lib/storage -run 'Test(EstimateDownsample|DownsampleSpace|ReserveDownsampleSpace|DownsampleAvailableSpace)' -count=1`
+亦通过，包耗时 **2.449s**。本次未运行完整 storage、布局/查询/归并专项或集群 E2E。
+
+## 历史集群验证：范围与判定
+
+以下保留旧布局的场景、复现入口与证据。基线为 `v1.151.0-cluster`（`e7a3dc606a1d804cb3101fa73eb30cb0946ab2a9`），历史候选来自 `experimental/downsampling`；具体 commit、改动和脚本 SHA256 以对应运行 manifest 为准。降采样存储与字段查询版本均为 2。
 
 每侧运行真实的一个 vminsert、一个 vmstorage 和一个 vmselect，replicationFactor=1，绑定 loopback，使用独立目录。vmstorage 与 vmselect 均设置 dedup interval 为零。脚本默认使用 cluster 模式；保留的 single 模式不属于本轮验证范围。
 
@@ -38,7 +68,7 @@
 | `downsampling_multiseries_compare.py` | 160 条时间线、93 天、2381868 个样本；4 条持续采样，其余包含按日、间断、提前结束和延后开始场景，活跃片段内仍按 14～16 秒采样；跨月、标签筛选、空结果、裁剪窗口、多线裸查询及重启 |
 | `downsampling_restart.py` | 两条时间线、三小时、1440 个样本；归并后查询十字段，重启全部三组件，再查询并严格比较二十组非空快照 |
 | `downsampling_cluster_compatibility.py` | 两个混部方向的原生 matrix/range 查询，以及新 vmselect 对旧 vmstorage 的字段请求明确失败；失败响应必须包含字段 RPC 标识，且本次请求新增的 vmstorage 日志须明确记录 unsupported rpcName；普通连接错误不能通过 |
-| `downsampling_inspect.py` | 独立解析集群 32 字节 TSID、99 字节字段 header、112 字节 metaindex，核验版本、五列顺序、共享时间戳描述、offset/size、完整字节覆盖及物理统计 |
+| `downsampling_inspect.py` | **仅适用旧实验布局，待适配**：当前仍解析 32 字节 TSID、99 字节字段 header、112 字节 metaindex；不能检查当前 89/113 字节布局 |
 
 长周期按周写入和归并，每日预留 45 秒内的样本在最后补写。补写与主批次的时间戳集合互斥，用于验证同格子内 raw 与已有摘要的持续归并，特别是 sum/count 的贡献累计。93 天表示输入历史跨度，不表示测试持续运行 93 天。
 
@@ -87,9 +117,9 @@ go test -p 4 ./lib/storage ./lib/vmselectapi ./app/vmstorage ./app/vmselect/nets
 
 检查器的 `--data-dir` 指向直接包含 small/big 的目录。短周期、租户场景的预期 TSID 数量分别为 2、6；租户检查需重复传入三个 `--expected-tenant`，匹配精确集合。系统须提供 libzstd，检查器仅用它解压。
 
-## 本轮结果与证据
+## 历史旧布局结果与证据（本次未重跑）
 
-完整一键运行证据：`/private/tmp/vm-downsampling-oneclick-restart-20260909`，14 个阶段全部通过。两套组件由入口重新构建，使用全新数据目录；候选为 `7d7887c44` 加本轮测试修订，未修改生产 Go。测试入口维护在 `experimental/downsampling` 分支的 `lib/storage/testdata/`。
+历史完整一键运行证据：`/private/tmp/vm-downsampling-oneclick-restart-20260909`，14 个阶段全部通过。两套组件由入口重新构建，使用全新数据目录；候选为 `7d7887c44` 加当时测试修订，未修改生产 Go。测试入口维护在 `experimental/downsampling` 分支的 `lib/storage/testdata/`。以下数字仅对应该历史 manifest，不适用于当前布局。
 
 | 项目 | 结果 |
 |---|---|
@@ -112,8 +142,10 @@ go test -p 4 ./lib/storage ./lib/vmselectapi ./app/vmstorage ./app/vmselect/nets
 
 ## 覆盖边界
 
-- 文件检查验证索引和负载引用结构，不解码 timestamps/values 数值；数学正确性由实际十字段查询与独立参考的比较证明。
-- E2E 实际命中同 TSID 跨 Block、不同 TSID 跨 index、多个月份；同 TSID 跨相邻 index 未自然命中，由本轮运行的 `TestDownsampleIterationMultiTSID` 等定向 UT 覆盖。
-- 本轮在完整归并后验证字段查询，不证明跨未归并 part 的查询侧再聚合、raw/摘要混合查询或多 vmstorage 副本与故障切换。
-- Python 数值参考限于有限值；NaN/Inf 使用现有 Go 特殊值 UT 验证，不能由本轮有限值 E2E 推断。
-- 本轮修改测试脚本与文档，未修改生产 Go。完整 storage race 和全仓库回归不属于本轮已运行结果。
+- 当前打开校验遍历全部 index，但不解码 timestamps/values 数值；五路各保留当前 index，metaindex 仍整体驻留且受 64 MiB 上限约束。
+- 本次空间实盘测试会调用打开校验，但不替代损坏注入、查询单列 I/O、归并数值或全局排序专项测试。
+- 历史文件检查只验证旧布局索引和负载引用结构；历史数学正确性由十字段查询与独立参考比较验证，不能外推到当前布局。
+- 历史 E2E 命中同 TSID 跨 Block、不同 TSID 跨 index、多个月份；同 TSID 跨相邻 index 由当时的 `TestDownsampleIterationMultiTSID` 等 UT 覆盖，本次未重跑。
+- 历史字段查询在完整归并后验证，不证明跨未归并 part 查询侧再聚合、raw/摘要混合查询、多 vmstorage 副本故障切换或崩溃恢复。
+- Python 数值参考限于有限值；NaN/Inf 需 Go 特殊值 UT，不能由有限值 E2E 推断。
+- 完整 storage race 和全仓库回归不属于本次已运行结果。

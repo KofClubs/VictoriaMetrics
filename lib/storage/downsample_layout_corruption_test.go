@@ -28,21 +28,18 @@ func TestDownsampleReaderCrossIndexOffsets(t *testing.T) {
 				// 改动中间 index 的完整 block 偏移，保持列间连续及文件边界合法。
 				// 若只校验单个 index 内部，四种损坏均不会在读取 header 时报错。
 				rewriteDownsampleCrossIndexFile(t, path, 1, func(data []byte) {
-					positions := []int{66, 165, 264, 363, 462}
+					pos := 56 // 原生 blockHeader.TimestampsBlockOffset
 					if tc.field == "values" {
-						positions = []int{74, 173, 272, 371, 470}
+						pos = 64 // 原生 blockHeader.ValuesBlockOffset
 					}
-					for _, pos := range positions {
-						offset := binary.BigEndian.Uint64(data[pos : pos+8])
-						binary.BigEndian.PutUint64(data[pos:pos+8], uint64(int64(offset)+tc.shift))
-					}
+					offset := binary.BigEndian.Uint64(data[pos : pos+8])
+					binary.BigEndian.PutUint64(data[pos:pos+8], uint64(int64(offset)+tc.shift))
 				})
 			}
-			p, err := openDownsamplePart(path)
-			if err != nil {
-				t.Fatal(err)
+			if tc.field != "" {
+				assertDownsampleLayoutOpenRejected(t, path, "相邻 index block 的降采样负载不连续")
 			}
-			defer p.MustClose()
+			p := openDownsampleLayoutReaderFixture(t, path)
 			r := getDownsampleReader()
 			defer putDownsampleReader(r)
 			if err := r.Init(p, 300000); err != nil {
@@ -94,7 +91,7 @@ func TestDownsampleReaderCrossIndexFilterAndReset(t *testing.T) {
 		checkDownsampleCrossIndexStateCleared(t, r)
 		wantMetaPos := 2
 		if resolution == 3600000 {
-			wantMetaPos += 4
+			wantMetaPos += 4 * countOfDownsampleFeatures
 		}
 		if r.metaPos != wantMetaPos {
 			t.Fatalf("二分定位未跳过先前 index: got=%d, want=%d", r.metaPos, wantMetaPos)
@@ -107,15 +104,13 @@ func TestDownsampleReaderCrossIndexFilterAndReset(t *testing.T) {
 
 func TestDownsampleReaderCrossIndexSkippedCorruption(t *testing.T) {
 	path := writeDownsampleCrossIndexPart(t)
-	// 在不相交的 index 中制造非法 feature，证明窗口读取不会补读跳过的 index。
+	// feature 已上移到 metaindex；在不相交的原生 header 中制造非法精度。
+	// 窗口读取不应补读跳过的 index，全量扫描则必须拒绝它。
 	rewriteDownsampleCrossIndexFile(t, path, 1, func(data []byte) {
-		data[8] = 99
+		data[88] = 0
 	})
-	p, err := openDownsamplePart(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer p.MustClose()
+	assertDownsampleLayoutOpenRejected(t, path, "precisionBits")
+	p := openDownsampleLayoutReaderFixture(t, path)
 	r := getDownsampleReader()
 	defer putDownsampleReader(r)
 	if err := r.Init(p, 300000); err != nil {
@@ -131,6 +126,124 @@ func TestDownsampleReaderCrossIndexSkippedCorruption(t *testing.T) {
 	if count != 1 || r.Error() == nil {
 		t.Fatalf("全量扫描未读取并拒绝损坏的 index: count=%d, err=%v", count, r.Error())
 	}
+}
+
+func TestDownsampleLayoutMetaindexIdentityCorruption(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func([]byte)
+	}{
+		{"feature_zero", func(m []byte) { m[64] = 0 }},
+		{"feature_out_of_range", func(m []byte) { m[64] = 6 }},
+		{"resolution", func(m []byte) { copy(m[65:73], encoding.MarshalInt64(nil, 1)) }},
+		{"last_account", func(m []byte) { binary.BigEndian.PutUint32(m[73:77], 1) }},
+		{"last_project", func(m []byte) { binary.BigEndian.PutUint32(m[77:81], 1) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeDownsampleCrossIndexPart(t)
+			filename := filepath.Join(path, metaindexFilename)
+			data, err := os.ReadFile(filename)
+			if err != nil {
+				t.Fatal(err)
+			}
+			meta := decodeDownsampleLayoutFrame(t, data, "VMDSMI")
+			tc.mutate(meta[:clusterDownsampleMetaindexBytes])
+			data = encoding.CompressZSTDLevel(append([]byte(nil), data[:8]...), meta, 1)
+			if err := os.WriteFile(filename, data, 0644); err != nil {
+				t.Fatal(err)
+			}
+			p, err := openDownsamplePart(path)
+			if err == nil {
+				p.MustClose()
+				t.Fatal("接受了损坏的 metaindex feature/resolution/租户")
+			}
+		})
+	}
+}
+
+func TestDownsampleLayoutIndexTenantCorruption(t *testing.T) {
+	for _, offset := range []int{0, 4} {
+		name := "account"
+		if offset == 4 {
+			name = "project"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := writeDownsampleCrossIndexPart(t)
+			rewriteDownsampleCrossIndexFile(t, path, 1, func(data []byte) {
+				binary.BigEndian.PutUint32(data[offset:offset+4], 1)
+			})
+			assertDownsampleLayoutOpenRejected(t, path, "租户")
+			p := openDownsampleLayoutReaderFixture(t, path)
+			r := getDownsampleReader()
+			defer putDownsampleReader(r)
+			if err := r.Init(p, 300000); err != nil {
+				t.Fatal(err)
+			}
+			if !r.NextHeader() || r.NextHeader() || r.Error() == nil || !strings.Contains(r.Error().Error(), "租户") {
+				t.Fatalf("未拒绝 index 内的跨租户 header: %v", r.Error())
+			}
+		})
+	}
+}
+
+func assertDownsampleLayoutOpenRejected(t *testing.T, path, message string) {
+	t.Helper()
+	p, err := openDownsamplePart(path)
+	if err == nil {
+		p.MustClose()
+		t.Fatal("打开时未拒绝损坏的 index")
+	}
+	if !strings.Contains(err.Error(), message) {
+		t.Fatalf("打开时未报告预期损坏 %q: %v", message, err)
+	}
+}
+
+// 仅为 reader 单元测试装配文件和 metaindex，不执行 open 的全量 index 校验。
+// 损坏文件的生产打开路径由 assertDownsampleLayoutOpenRejected 单独覆盖。
+func openDownsampleLayoutReaderFixture(t *testing.T, path string) *part {
+	t.Helper()
+	metadata, err := readDownsampleMetadata(path)
+	if err != nil || metadata == nil {
+		t.Fatalf("读取 fixture metadata: %v", err)
+	}
+	p := &part{path: path, ph: metadata.partHeader, dsMetadata: metadata}
+	t.Cleanup(func() {
+		for _, f := range p.dsFiles {
+			if f != nil {
+				if err := f.Close(); err != nil {
+					t.Error(err)
+				}
+			}
+		}
+	})
+	for i, name := range []string{timestampsFilename, valuesFilename, indexFilename} {
+		f, err := os.Open(filepath.Join(path, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.dsFiles[i] = f
+		st, err := f.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.dsFileSizes[i] = uint64(st.Size())
+	}
+	data, err := os.ReadFile(filepath.Join(path, metaindexFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := decodeDownsampleLayoutFrame(t, data, "VMDSMI")
+	if len(meta) == 0 || len(meta)%clusterDownsampleMetaindexBytes != 0 {
+		t.Fatalf("fixture metaindex 长度错误: %d", len(meta))
+	}
+	for pos := 0; pos < len(meta); pos += clusterDownsampleMetaindexBytes {
+		var mr downsampleMetaindexRow
+		if err := mr.unmarshal(meta[pos : pos+clusterDownsampleMetaindexBytes]); err != nil {
+			t.Fatal(err)
+		}
+		p.dsMetaindex = append(p.dsMetaindex, mr)
+	}
+	return p
 }
 
 func checkDownsampleCrossIndexStateCleared(t *testing.T, r *downsampleReader) {
@@ -170,6 +283,8 @@ func writeDownsampleCrossIndexPart(t *testing.T) string {
 	if err := w.Init(path, 1); err != nil {
 		t.Fatal(err)
 	}
+	// WriteBlock 暂存各 feature，实际切 index 发生在 flushResolution。
+	w.indexLimit = clusterDownsampleFieldHeaderBytes
 	for _, resolution := range []int64{300000, 3600000} {
 		for id := uint64(1); id <= 4; id++ {
 			b := &downsampleBatch{tsid: TSID{MetricID: id}, resolution: resolution, precisionBits: 64}
@@ -184,9 +299,6 @@ func writeDownsampleCrossIndexPart(t *testing.T) string {
 				}
 			}
 			if err := w.WriteBlock(b); err != nil {
-				t.Fatal(err)
-			}
-			if err := w.flushIndex(); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -213,25 +325,25 @@ func rewriteDownsampleCrossIndexFile(t *testing.T, path string, target int, muta
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(meta) != 8*downsampleMetaindexRowSize {
-		t.Fatalf("测试需要八个单 block index，实际 metaindex 字节数=%d", len(meta))
+	if len(meta) != 40*clusterDownsampleMetaindexBytes || target < 0 || target >= 40 {
+		t.Fatalf("测试需要四十个单特征单 block index，实际 metaindex 字节数=%d，target=%d", len(meta), target)
 	}
 	var rewritten []byte
-	for pos := 0; pos < len(meta); pos += downsampleMetaindexRowSize {
-		mr := meta[pos : pos+downsampleMetaindexRowSize]
-		offset := binary.BigEndian.Uint64(mr[92:100])
-		size := binary.BigEndian.Uint32(mr[100:104])
+	for pos := 0; pos < len(meta); pos += clusterDownsampleMetaindexBytes {
+		mr := meta[pos : pos+clusterDownsampleMetaindexBytes]
+		offset := binary.BigEndian.Uint64(mr[52:60])
+		size := binary.BigEndian.Uint32(mr[60:64])
 		frame := indexFile[offset : offset+uint64(size)]
 		data, err := encoding.DecompressZSTDLimited(nil, frame[8:], maxBlockSize)
-		if err != nil || len(data) != downsampleBlockHeaderSize {
-			t.Fatalf("测试 index 不是五个 %d 字节单特征 header: size=%d, err=%v", downsampleFieldHeaderSize, len(data), err)
+		if err != nil || len(data) != clusterDownsampleFieldHeaderBytes || binary.BigEndian.Uint32(mr[32:36]) != 1 {
+			t.Fatalf("测试 index 不是一个 89 字节原生 header: size=%d, err=%v", len(data), err)
 		}
-		if pos/downsampleMetaindexRowSize == target {
+		if pos/clusterDownsampleMetaindexBytes == target {
 			mutate(data)
 		}
 		newFrame := encoding.CompressZSTDLevel(append([]byte(nil), frame[:8]...), data, 1)
-		binary.BigEndian.PutUint64(mr[92:100], uint64(len(rewritten)))
-		binary.BigEndian.PutUint32(mr[100:104], uint32(len(newFrame)))
+		binary.BigEndian.PutUint64(mr[52:60], uint64(len(rewritten)))
+		binary.BigEndian.PutUint32(mr[60:64], uint32(len(newFrame)))
 		rewritten = append(rewritten, newFrame...)
 	}
 	if err := os.WriteFile(filepath.Join(path, indexFilename), rewritten, 0644); err != nil {
@@ -243,8 +355,8 @@ func rewriteDownsampleCrossIndexFile(t *testing.T, path string, target int, muta
 	}
 }
 
-// TestDownsampleReaderDuplicateBatchKey 拒绝相同分辨率、TSID 和起始时间戳的重复批次。
-// 原生字段顺序要求每个批次的键严格递增，不能在相同键下由 feature 5 再回到 feature 1。
+// TestDownsampleReaderDuplicateBatchKey 拒绝同一 resolution/feature 内重复的 TSID/起始时间戳。
+// 不同 feature 共享批次键合法，但同一 feature 内及跨 index 的键必须严格递增。
 func TestDownsampleReaderDuplicateBatchKey(t *testing.T) {
 	for _, separateIndexes := range []bool{false, true} {
 		name := "within_index"
@@ -258,6 +370,9 @@ func TestDownsampleReaderDuplicateBatchKey(t *testing.T) {
 			if err := w.Init(path, 1); err != nil {
 				t.Fatal(err)
 			}
+			if separateIndexes {
+				w.indexLimit = clusterDownsampleFieldHeaderBytes
+			}
 			for i := 0; i < 2; i++ {
 				b := fileTestDownsampleBlock(1, 300000)
 				for j := range b.timestamps {
@@ -265,11 +380,6 @@ func TestDownsampleReaderDuplicateBatchKey(t *testing.T) {
 				}
 				if err := w.WriteBlock(b); err != nil {
 					t.Fatal(err)
-				}
-				if separateIndexes {
-					if err := w.flushIndex(); err != nil {
-						t.Fatal(err)
-					}
 				}
 			}
 			if _, err := w.Finish(); err != nil {
@@ -287,31 +397,40 @@ func TestDownsampleReaderDuplicateBatchKey(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			wantMetaRows := 5
+			if separateIndexes {
+				wantMetaRows = 10
+			}
+			if len(meta) != wantMetaRows*clusterDownsampleMetaindexBytes {
+				t.Fatalf("重复键 fixture 的 metaindex 行数错误: %d", len(meta))
+			}
 			var rewritten []byte
-			for pos := 0; pos < len(meta); pos += downsampleMetaindexRowSize {
-				mr := meta[pos : pos+downsampleMetaindexRowSize]
-				offset := binary.BigEndian.Uint64(mr[92:100])
-				size := binary.BigEndian.Uint32(mr[100:104])
+			for pos := 0; pos < len(meta); pos += clusterDownsampleMetaindexBytes {
+				mr := meta[pos : pos+clusterDownsampleMetaindexBytes]
+				offset := binary.BigEndian.Uint64(mr[52:60])
+				size := binary.BigEndian.Uint32(mr[60:64])
 				frame := indexFile[offset : offset+uint64(size)]
 				data, err := encoding.DecompressZSTDLimited(nil, frame[8:], maxBlockSize)
-				if err != nil {
-					t.Fatal(err)
+				wantHeaders := 2
+				if separateIndexes {
+					wantHeaders = 1
 				}
-				if !separateIndexes || pos > 0 {
-					// 只替换第二个批次的最小时间戳，保留负载 offset/size 和其他统计。
-					batchOffset := downsampleBlockHeaderSize
+				if err != nil || len(data) != wantHeaders*clusterDownsampleFieldHeaderBytes {
+					t.Fatalf("重复键 fixture 的 index 长度错误: %d, err=%v", len(data), err)
+				}
+				if !separateIndexes || pos/clusterDownsampleMetaindexBytes%2 == 1 {
+					// 每个 feature 只替换第二个批次的 MinTimestamp，保留负载和其他统计。
+					batchOffset := clusterDownsampleFieldHeaderBytes
 					if separateIndexes {
 						batchOffset = 0
 					}
 					first := encoding.MarshalInt64(nil, minUnixMilli+1)
-					for feature := 0; feature < 5; feature++ {
-						copy(data[batchOffset+feature*downsampleFieldHeaderSize+42:], first)
-					}
-					copy(mr[72:80], first)
+					copy(data[batchOffset+32:batchOffset+40], first)
+					copy(mr[36:44], first)
 				}
 				newFrame := encoding.CompressZSTDLevel(append([]byte(nil), frame[:8]...), data, 1)
-				binary.BigEndian.PutUint64(mr[92:100], uint64(len(rewritten)))
-				binary.BigEndian.PutUint32(mr[100:104], uint32(len(newFrame)))
+				binary.BigEndian.PutUint64(mr[52:60], uint64(len(rewritten)))
+				binary.BigEndian.PutUint32(mr[60:64], uint32(len(newFrame)))
 				rewritten = append(rewritten, newFrame...)
 			}
 			if err := os.WriteFile(filepath.Join(path, indexFilename), rewritten, 0644); err != nil {
@@ -321,11 +440,8 @@ func TestDownsampleReaderDuplicateBatchKey(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(path, metaindexFilename), metaFile, 0644); err != nil {
 				t.Fatal(err)
 			}
-			p, err := openDownsamplePart(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer p.MustClose()
+			assertDownsampleLayoutOpenRejected(t, path, "排序错误")
+			p := openDownsampleLayoutReaderFixture(t, path)
 			r := getDownsampleReader()
 			defer putDownsampleReader(r)
 			if err := r.Init(p, 300000); err != nil {

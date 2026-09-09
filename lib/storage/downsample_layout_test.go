@@ -14,28 +14,39 @@ import (
 )
 
 const (
-	clusterDownsampleFieldHeaderBytes = 99
-	clusterDownsampleMetaindexBytes   = 112
+	clusterDownsampleFieldHeaderBytes = 89
+	clusterDownsampleMetaindexBytes   = 113
 )
 
 // TestDownsampleFilePhysicalLayout 按设计中的固定字节位置检查真实文件。
 // 不调用降采样 reader 或 header decoder，避免写入端与读取端的相同错误互相抵消。
 func TestDownsampleFilePhysicalLayout(t *testing.T) {
-	if marshaledTSIDSize != 32 || marshaledBlockHeaderSize != 89 || downsampleFieldHeaderSize != clusterDownsampleFieldHeaderBytes || downsampleMetaindexRowSize != clusterDownsampleMetaindexBytes {
+	if marshaledTSIDSize != 32 || marshaledBlockHeaderSize != clusterDownsampleFieldHeaderBytes || downsampleMetaindexRowSize != clusterDownsampleMetaindexBytes {
 		t.Fatal("集群磁盘格式尺寸与独立约定不一致")
 	}
 	for _, tc := range []struct {
 		name         string
 		blocksPerRes int
 		singleRow    bool
+		tenantCuts   bool
 		wantMetaRows int
 	}{
-		{name: "multiple_blocks_and_resolutions", blocksPerRes: 3, wantMetaRows: 2},
-		{name: "multiple_index_blocks", blocksPerRes: 330, wantMetaRows: 6},
-		{name: "zero_payload_columns", blocksPerRes: 3, singleRow: true, wantMetaRows: 2},
+		{name: "multiple_blocks_and_resolutions", blocksPerRes: 3, wantMetaRows: 10},
+		{name: "multiple_index_blocks", blocksPerRes: 738, wantMetaRows: 20},
+		{name: "tenant_row_boundaries", blocksPerRes: 330, tenantCuts: true, wantMetaRows: 50},
+		{name: "zero_payload_columns", blocksPerRes: 3, singleRow: true, wantMetaRows: 10},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			blocks := makeDownsampleLayoutBlocks(tc.blocksPerRes, tc.singleRow)
+			for i, b := range blocks {
+				b.tsid.AccountID, b.tsid.ProjectID = 0x11223344, 0x55667788
+				if tc.tenantCuts {
+					// 当前集群 TSID.Less 先比较租户；分别覆盖 Project 和 Account 切换。
+					group := (i % tc.blocksPerRes) / 66
+					b.tsid.AccountID += uint32(group / 2)
+					b.tsid.ProjectID += uint32(group % 2)
+				}
+			}
 			path := writeFileTestDownsamplePart(t, blocks...)
 			files := make(map[string][]byte)
 			for _, name := range []string{"timestamps.bin", "values.bin", "index.bin", "metaindex.bin", "metadata.json"} {
@@ -51,85 +62,96 @@ func TestDownsampleFilePhysicalLayout(t *testing.T) {
 			}
 
 			meta := decodeDownsampleLayoutFrame(t, files["metaindex.bin"], "VMDSMI")
-			// 独立使用集群格式的 112/99 字节约定，避免复制生产尺寸计算中的错误。
+			// 独立使用集群格式的 113/89 字节约定，避免复制生产尺寸计算中的错误。
 			if len(meta) != tc.wantMetaRows*clusterDownsampleMetaindexBytes {
 				t.Fatalf("metaindex 长度=%d，期望 %d 行，每行 %d 字节", len(meta), tc.wantMetaRows, clusterDownsampleMetaindexBytes)
 			}
 			var nextIndexOffset, totalRows uint64
 			var expectedValues, expectedTimestamps []byte
+			timestampOffsets := make([]uint64, len(blocks))
+			for i, b := range blocks {
+				timestampOffsets[i] = uint64(len(expectedTimestamps))
+				payload, _, _ := encoding.MarshalTimestamps(nil, b.timestamps, b.precisionBits)
+				expectedTimestamps = append(expectedTimestamps, payload...)
+			}
 			var zeroColumns, nonzeroColumns int
-			nextBlock := 0
+			nextField := 0
 			minTimestamp, maxTimestamp := blocks[0].timestamps[0], blocks[0].timestamps[0]
 			for pos := 0; pos < len(meta); pos += clusterDownsampleMetaindexBytes {
 				mr := meta[pos : pos+clusterDownsampleMetaindexBytes]
-				resolution := readDownsampleLayoutInt64(mr[0:8])
-				count := binary.BigEndian.Uint32(mr[88:92])
-				offset := binary.BigEndian.Uint64(mr[92:100])
-				size := binary.BigEndian.Uint32(mr[100:104])
-				if count == 0 || count%5 != 0 || uint64(nextBlock)+uint64(count/5) > uint64(len(blocks)) || offset != nextIndexOffset || offset+uint64(size) > uint64(len(files["index.bin"])) {
-					t.Fatalf("metaindex 第 %d 行的数量或 index offset/size 错误", pos/clusterDownsampleMetaindexBytes)
+				resolution := readDownsampleLayoutInt64(mr[65:73])
+				feature := int(mr[64])
+				count := binary.BigEndian.Uint32(mr[32:36])
+				offset := binary.BigEndian.Uint64(mr[52:60])
+				size := binary.BigEndian.Uint32(mr[60:64])
+				resIndex := nextField / (tc.blocksPerRes * 5)
+				col := nextField / tc.blocksPerRes % 5
+				start := nextField % tc.blocksPerRes
+				if resIndex >= 2 || feature != col+1 || resolution != []int64{300000, 3600000}[resIndex] || count == 0 || count > 736 || start+int(count) > tc.blocksPerRes || offset != nextIndexOffset || offset+uint64(size) > uint64(len(files["index.bin"])) {
+					t.Fatalf("metaindex 第 %d 行的 feature 分组、数量或 index offset/size 错误", pos/clusterDownsampleMetaindexBytes)
 				}
 				nextIndexOffset += uint64(size)
 				index := decodeDownsampleLayoutFrame(t, files["index.bin"][offset:nextIndexOffset], "VMDSIX")
 				if len(index) != int(count)*clusterDownsampleFieldHeaderBytes {
-					t.Fatalf("index 长度=%d，与 %d 个 %d 字节单特征 header 不一致", len(index), count, clusterDownsampleFieldHeaderBytes)
+					t.Fatalf("index 长度=%d，与 %d 个 89 字节原生 header 不一致", len(index), count)
 				}
-				group := blocks[nextBlock : nextBlock+int(count/5)]
-				if readDownsampleLayoutTSID(mr[8:40]) != group[0].tsid || readDownsampleLayoutTSID(mr[40:72]) != group[len(group)-1].tsid {
+				blockStart := resIndex*tc.blocksPerRes + start
+				group := blocks[blockStart : blockStart+int(count)]
+				firstTSID := readDownsampleLayoutTSID(mr[0:32])
+				if firstTSID != group[0].tsid || readDownsampleLayoutTSID(mr[73:105]) != group[len(group)-1].tsid {
 					t.Fatal("metaindex 首末 TSID 错误")
 				}
 				groupMin, groupMax := group[0].timestamps[0], group[0].timestamps[0]
 				var groupRows uint64
 				for i, b := range group {
 					n := len(b.timestamps)
-					groupRows += uint64(n) * 5
+					groupRows += uint64(n)
 					groupMin = min(groupMin, b.timestamps[0])
 					groupMax = max(groupMax, b.timestamps[n-1])
-					timestampsOffset := uint64(len(expectedTimestamps))
+					if b.tsid.AccountID != firstTSID.AccountID || b.tsid.ProjectID != firstTSID.ProjectID {
+						t.Fatal("同一 metaindex row 跨越租户")
+					}
 					timestampsPayload, timestampsType, firstTimestamp := encoding.MarshalTimestamps(nil, b.timestamps, b.precisionBits)
-					expectedTimestamps = append(expectedTimestamps, timestampsPayload...)
 					decodedTimestamps, err := encoding.UnmarshalTimestamps(nil, timestampsPayload, timestampsType, firstTimestamp, n)
 					if err != nil || !reflect.DeepEqual(decodedTimestamps, b.timestamps) {
 						t.Fatalf("时间戳列解码错误: %v", err)
 					}
-					for col := 0; col < 5; col++ {
-						h := index[(i*5+col)*clusterDownsampleFieldHeaderBytes : (i*5+col+1)*clusterDownsampleFieldHeaderBytes]
-						integers, scale := decimal.AppendFloatToDecimal(nil, b.values[col])
-						payload, mt, first := encoding.MarshalValues(nil, integers, b.precisionBits)
-						if resolution != b.resolution || readDownsampleLayoutInt64(h[0:8]) != b.resolution || h[8] != byte(col+1) || h[9] != b.precisionBits || readDownsampleLayoutTSID(h[10:42]) != b.tsid || binary.BigEndian.Uint32(h[90:94]) != uint32(n) {
-							t.Fatalf("批次 %d 特征 %d 的标识、精度或 RowsCount 错误", nextBlock+i, col+1)
-						}
-						if readDownsampleLayoutInt64(h[42:50]) != b.timestamps[0] || readDownsampleLayoutInt64(h[50:58]) != b.timestamps[n-1] {
-							t.Fatalf("批次 %d 特征 %d 的时间范围错误", nextBlock+i, col+1)
-						}
-						checkDownsampleLayoutPayload(t, h[66:74], h[82:86], timestampsOffset, timestampsPayload, files["timestamps.bin"])
-						checkDownsampleLayoutPayload(t, h[74:82], h[86:90], uint64(len(expectedValues)), payload, files["values.bin"])
-						u := binary.BigEndian.Uint16(h[94:96])
-						if readDownsampleLayoutInt64(h[58:66]) != first || int16(u>>1)^-int16(u&1) != scale || h[96] != byte(timestampsType) || h[97] != byte(mt) || h[98] != b.precisionBits {
-							t.Fatalf("批次 %d 特征 %d 的原生 Block 编码字段错误", nextBlock+i, col+1)
-						}
-						expectedValues = append(expectedValues, payload...)
-						decoded, err := encoding.UnmarshalValues(nil, payload, mt, first, n)
-						if err != nil || !reflect.DeepEqual(decimal.AppendDecimalToFloat(nil, decoded, scale), b.values[col]) {
-							t.Fatalf("批次 %d 特征 %d 解码错误: %v", nextBlock+i, col+1, err)
-						}
-						if len(payload) == 0 {
-							zeroColumns++
-						} else {
-							nonzeroColumns++
-						}
+					h := index[i*89 : (i+1)*89]
+					integers, scale := decimal.AppendFloatToDecimal(nil, b.values[col])
+					payload, mt, first := encoding.MarshalValues(nil, integers, b.precisionBits)
+					if resolution != b.resolution || readDownsampleLayoutTSID(h[0:32]) != b.tsid || binary.BigEndian.Uint32(h[80:84]) != uint32(n) {
+						t.Fatalf("批次 %d 特征 %d 的标识或 RowsCount 错误", blockStart+i, feature)
+					}
+					if readDownsampleLayoutInt64(h[32:40]) != b.timestamps[0] || readDownsampleLayoutInt64(h[40:48]) != b.timestamps[n-1] {
+						t.Fatalf("批次 %d 特征 %d 的时间范围错误", blockStart+i, feature)
+					}
+					// 五个 feature 必须引用生成顺序中同一份 timestamps payload。
+					checkDownsampleLayoutPayload(t, h[56:64], h[72:76], timestampOffsets[blockStart+i], timestampsPayload, files["timestamps.bin"])
+					checkDownsampleLayoutPayload(t, h[64:72], h[76:80], uint64(len(expectedValues)), payload, files["values.bin"])
+					u := binary.BigEndian.Uint16(h[84:86])
+					if readDownsampleLayoutInt64(h[48:56]) != first || int16(u>>1)^-int16(u&1) != scale || h[86] != byte(timestampsType) || h[87] != byte(mt) || h[88] != b.precisionBits {
+						t.Fatalf("批次 %d 特征 %d 的原生 Block 编码字段错误", blockStart+i, feature)
+					}
+					expectedValues = append(expectedValues, payload...)
+					decoded, err := encoding.UnmarshalValues(nil, payload, mt, first, n)
+					if err != nil || !reflect.DeepEqual(decimal.AppendDecimalToFloat(nil, decoded, scale), b.values[col]) {
+						t.Fatalf("批次 %d 特征 %d 解码错误: %v", blockStart+i, feature, err)
+					}
+					if len(payload) == 0 {
+						zeroColumns++
+					} else {
+						nonzeroColumns++
 					}
 				}
-
-				if readDownsampleLayoutInt64(mr[72:80]) != groupMin || readDownsampleLayoutInt64(mr[80:88]) != groupMax || binary.BigEndian.Uint64(mr[104:112]) != groupRows {
+				if readDownsampleLayoutInt64(mr[36:44]) != groupMin || readDownsampleLayoutInt64(mr[44:52]) != groupMax || binary.BigEndian.Uint64(mr[105:113]) != groupRows {
 					t.Fatal("metaindex 时间范围或物理行数错误")
 				}
 				minTimestamp = min(minTimestamp, groupMin)
 				maxTimestamp = max(maxTimestamp, groupMax)
 				totalRows += groupRows
-				nextBlock += int(count / 5)
+				nextField += int(count)
 			}
-			if nextBlock != len(blocks) || nextIndexOffset != uint64(len(files["index.bin"])) {
+			if nextField != len(blocks)*5 || nextIndexOffset != uint64(len(files["index.bin"])) {
 				t.Fatal("block 数量错误或 index 存在未引用字节")
 			}
 			if !bytes.Equal(files["values.bin"], expectedValues) || !bytes.Equal(files["timestamps.bin"], expectedTimestamps) {

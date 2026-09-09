@@ -47,10 +47,13 @@ func estimateDownsamplePartSize(pws []*partWrapper) uint64 {
 func estimateDownsampleOutputSize(rows, blocks uint64) uint64 {
 	// 每个 int64 的 varint 最多十字节；MarshalValues/MarshalTimestamps 在压缩无效时退回原始 varint。
 	payload := multiplyDownsampleSpace(rows, 10*uint64(countOfDownsampleFeatures+1))
-	index := addDownsampleSpace(multiplyDownsampleSpace(uint64(downsampleBlockHeaderSize), 2), 256+uint64(len(downsampleIndexMagic)))
+	index := addDownsampleSpace(multiplyDownsampleSpace(uint64(marshaledBlockHeaderSize), 2), 256+uint64(len(downsampleIndexMagic)))
 	metaindex := addDownsampleSpace(multiplyDownsampleSpace(uint64(downsampleMetaindexRowSize), 2), 256+uint64(len(downsampleMetaindexMagic)))
-	indexBytes := multiplyDownsampleSpace(blocks, addDownsampleSpace(index, metaindex))
-	return addDownsampleSpace(addDownsampleSpace(payload, indexBytes), downsampleMaxMetadataSize)
+	physicalBlocks := multiplyDownsampleSpace(blocks, countOfDownsampleFeatures)
+	indexBytes := multiplyDownsampleSpace(physicalBlocks, addDownsampleSpace(index, metaindex))
+	// spill 与最终输出可能同时存在；每列暂存原生 header 和 values，时间戳不重复。
+	spill := addDownsampleSpace(multiplyDownsampleSpace(rows, 10*countOfDownsampleFeatures), multiplyDownsampleSpace(physicalBlocks, uint64(marshaledBlockHeaderSize)))
+	return addDownsampleSpace(addDownsampleSpace(addDownsampleSpace(payload, indexBytes), spill), downsampleMaxMetadataSize)
 }
 
 func addDownsampleSpace(a, b uint64) uint64 {

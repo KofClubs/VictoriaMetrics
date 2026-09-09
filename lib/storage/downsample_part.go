@@ -188,6 +188,9 @@ func openDownsamplePart(path string) (_ *part, err error) {
 		if e != nil {
 			return nil, e
 		}
+		if !st.Mode().IsRegular() || st.Size() < 0 {
+			return nil, fmt.Errorf("降采样 %s 不是普通文件", name)
+		}
 		p.dsFileSizes[i] = uint64(st.Size())
 		p.size += uint64(st.Size())
 	}
@@ -208,7 +211,7 @@ func openDownsamplePart(path string) (_ *part, err error) {
 		nextOffset += uint64(mr.IndexBlockSize)
 		if len(p.dsMetaindex) > 0 {
 			prev := &p.dsMetaindex[len(p.dsMetaindex)-1]
-			if mr.ResolutionMs < prev.ResolutionMs || (mr.ResolutionMs == prev.ResolutionMs && mr.TSID.Less(&prev.LastTSID)) {
+			if mr.ResolutionMs < prev.ResolutionMs || (mr.ResolutionMs == prev.ResolutionMs && (mr.feature < prev.feature || (mr.feature == prev.feature && mr.TSID.Less(&prev.LastTSID)))) {
 				return nil, fmt.Errorf("降采样 metaindex 排序错误")
 			}
 		} else {
@@ -228,11 +231,87 @@ func openDownsamplePart(path string) (_ *part, err error) {
 	if rows != p.ph.RowsCount || blocks != p.ph.BlocksCount || minTime != p.ph.MinTimestamp || maxTime != p.ph.MaxTimestamp || nextOffset != p.dsFileSizes[2] {
 		return nil, fmt.Errorf("降采样 metaindex 与 part 统计矛盾")
 	}
+	if err := validateDownsamplePartIndexes(p); err != nil {
+		return nil, fmt.Errorf("校验降采样 part %q: %w", path, err)
+	}
 	p.metaindexSizeBytes = uint64(cap(p.dsMetaindex)) * uint64(unsafe.Sizeof(downsampleMetaindexRow{}))
 	p.timestampsFile = &downsamplePartFile{f: p.dsFiles[0]}
 	p.valuesFile = &downsamplePartFile{f: p.dsFiles[1]}
 	p.indexFile = &downsamplePartFile{f: p.dsFiles[2]}
 	return p, nil
+}
+
+// 五路只保留各自当前 index block，不建立随 part 大小增长的 header/offset 集合。
+// 打开时验证全部索引，避免过滤查询跳过缺失列、跨组空洞或未引用尾部。
+func validateDownsamplePartIndexes(p *part) error {
+	var readers [countOfDownsampleFeatures]*downsampleReader
+	defer func() {
+		for _, r := range readers {
+			if r != nil {
+				putDownsampleReader(r)
+			}
+		}
+	}()
+	var timestampEnd, valuesEnd uint64
+	for _, resolution := range p.dsMetadata.Resolutions {
+		var firstValues, lastValues [countOfDownsampleFeatures]uint64
+		var seen bool
+		for feature := range readers {
+			if readers[feature] == nil {
+				readers[feature] = getDownsampleReader()
+			}
+			if err := readers[feature].Init(p, resolution, uint8(feature)); err != nil {
+				return err
+			}
+		}
+		for {
+			var present [countOfDownsampleFeatures]bool
+			for feature, r := range readers {
+				present[feature] = r.NextHeader()
+				if err := r.Error(); err != nil {
+					return err
+				}
+			}
+			for feature := 1; feature < countOfDownsampleFeatures; feature++ {
+				if present[feature] != present[0] {
+					return fmt.Errorf("分辨率 %d 的特征列缺失或存在多余 Block", resolution)
+				}
+			}
+			if !present[0] {
+				break
+			}
+			h := readers[0].Header()
+			if h.TimestampsBlockOffset != timestampEnd {
+				return fmt.Errorf("共享时间戳负载不连续")
+			}
+			timestampEnd += uint64(h.TimestampsBlockSize)
+			for feature, r := range readers {
+				column := r.Header()
+				if !sameDownsampleTimestamps(h, column) {
+					return fmt.Errorf("分辨率 %d 的五列时间戳描述不一致", resolution)
+				}
+				if !seen {
+					firstValues[feature] = column.ValuesBlockOffset
+				} else if column.ValuesBlockOffset != lastValues[feature] {
+					return fmt.Errorf("特征列 values 负载不连续")
+				}
+				lastValues[feature] = column.ValuesBlockOffset + uint64(column.ValuesBlockSize)
+			}
+			seen = true
+		}
+		if seen {
+			for feature := range readers {
+				if firstValues[feature] != valuesEnd {
+					return fmt.Errorf("跨 resolution/feature 的 values 负载不连续")
+				}
+				valuesEnd = lastValues[feature]
+			}
+		}
+	}
+	if timestampEnd != p.dsFileSizes[0] || valuesEnd != p.dsFileSizes[1] {
+		return fmt.Errorf("降采样负载存在截断或未引用尾部")
+	}
+	return nil
 }
 
 // 此适配器只为原有 part 生命周期提供 Must 接口，新 reader 使用可返回错误的 ReadAt。
