@@ -7,7 +7,7 @@
 - 实现分支：`experimental/downsampling`；基线：`v1.151.0-cluster`。以下状态依据当前工作区生产代码，不以历史候选 commit 代替。
 - FormatVersion、SemanticsVersion 均为 2，字段 RPC 为 `search_downsampling_v2`，NumericCodec 为 `decimal-values`。
 - 固定 5m/1h、last/sum/count/min/max 五个浮点特征、共享最大时间戳；复用原生 `Block`。inmemory 保持 raw，IndexDB 与 TSID 发号不变。
-- **旧实验 v2 的 99/112 字节布局与当前 89/113 字节布局不兼容，且无迁移或旧布局读取路径。** 版本号和 magic 未变不代表兼容；旧摘要不能直接复用，应保留备份并从原始数据在新目录重建。
+- **当前采用 89/113 字节布局，feature 统一为 0..4。旧 99/112 字节格式，以及 `ae899eded` 的 89/113 字节、feature 1..5 格式均不兼容，且无迁移或旧布局读取路径。** 版本号和 magic 未变不代表兼容；旧摘要不能直接复用，应保留备份并从原始数据在新目录重建。
 
 ## 当前已实现
 
@@ -26,13 +26,12 @@
 租户在同一 resolution/feature 内有序，但仍须显式切 row，避免一个 index 跨租户。
 
 分段 flush 只能在同一 feature 内切 index，或继续追加各列 spill；不能将片段 A 的五列全部输出后再输出片段 B 的五列，
-否则 feature 从 5 回退到 1，破坏全局排序。当前 writer 在分辨率切换或 Finish 时完整转置。
+否则 feature 从 4 回退到 0，破坏全局排序。当前 writer 在分辨率切换或 Finish 时完整转置。
 
-## 验证状态与待办
+## 验证状态与范围
 
-- 本次仅修改三份指定文档与 `lib/storage/downsample_space_test.go`，不修改生产代码；空间定向测试结果见测试说明。
-- Go 布局/损坏测试源码已适配 89/113 字节；本次空间测试不替代完整布局、归并、查询或集群回归。
-- Python `downsampling_inspect.py` 仍使用旧 99/112 字节布局，**尚未适配**。需另行更新检查器并用新目录重跑一键 E2E、文件检查和重启验证。
-- 历史一键证据 `/private/tmp/vm-downsampling-oneclick-restart-20260909` 记录 14 阶段、31 项 Python UT、1670 项 E2E 及二十组重启快照通过；这些是旧布局结果，不证明当前布局通过。
-- 历史入口失败/中断清理证据为 `/private/tmp/vm-downsampling-oneclick-harness-checks-20260909/summary.json`，同样未在本次重跑。
-- 跨未归并 part 查询侧再聚合、raw/摘要混合查询、多节点副本故障及崩溃恢复仍不在已验证范围内。
+- 当前 Go 布局/损坏测试采用 89/113 字节及 feature 0..4。完整 storage、降采样跨包定向及 storage 定向 race 已通过，详见测试说明。
+- Python `downsampling_inspect.py` 已适配当前格式；检查器 UT 和 Go writer 实盘交叉验证用于核对新解析器。
+- 一键入口单独运行布局与遍历 Go UT，保证同一 `(resolution, feature)` 内跨 index 的覆盖；160 条时间线的集群长周期场景如实报告实际覆盖，不将 feature 切换计为同列跨 index。
+- 当前格式的完整一键集群测试已通过：15 个阶段、1670 项 E2E，最大绝对误差为 0；重启前后二十组快照、780 个查询点严格一致。证据：`/private/var/folders/tk/llwph05x6_xgbmqxbxkq_6m40000gn/T/vm-downsampling-e2e-8n7u6mcp/manifest.json`。历史旧布局结果单独保留在测试说明中。
+- 跨未归并 part 查询侧再聚合、raw/摘要混合查询、多节点副本故障及崩溃恢复仍不在本次验证范围内。

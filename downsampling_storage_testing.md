@@ -5,13 +5,13 @@
 当前生产实现以 [文件布局](downsampling_storage_file_layout.md) 为准：集群版 89 字节原生 header、113 字节嵌入式 metaindex；
 五路磁盘 spill 在分辨率结束时按 feature 完整输出，values/index/metaindex 全局按 resolution/feature/TSID/时间排列。
 timestamps 按生成顺序只写一次（五列分别编码并校验一致性）；打开时有界五路遍历全部 index，查询只读目标列，归并五路对齐。
-`TSID.Less` 先比较 AccountID、ProjectID；租户变化仍须切 row。分段 index flush 不得导致 feature 从 5 回退到 1。
+`TSID.Less` 先比较 AccountID、ProjectID；租户变化仍须切 row。分段 index flush 不得导致 feature 从 4 回退到 0。
 
-**旧实验 v2 的 99/112 字节布局不兼容，且无迁移。** 版本号和 magic 仍为 2，不能据此复用旧摘要目录。
-`lib/storage/testdata/downsampling_inspect.py` 当前仍硬编码 99/112 字节，尚未适配；下文集群与一键结果均为历史证据，
-不代表当前布局已通过 E2E。需另行适配检查器并从新目录重跑，本次不修改该脚本。
+**当前 feature 编号为 0..4。旧 99/112 字节格式，以及 `ae899eded` 的 89/113 字节、feature 1..5 格式都不兼容，且无迁移。** 版本号和 magic 仍为 2，不能据此复用旧摘要目录。
+检查器已适配当前格式；下文历史集群与一键结果仍属于旧布局，不代表当前布局已通过 E2E。
+本次更新文档、检查器和一键验证入口，不修改生产 Go 代码；用户已完成当前布局的一键集群测试，结果及产物已复核通过。
 
-本次仅修改三份指定文档与 `lib/storage/downsample_space_test.go`，未修改生产代码。空间测试覆盖：
+当前空间测试覆盖：
 
 | 测试 | 覆盖 |
 |---|---|
@@ -25,14 +25,49 @@ timestamps 按生成顺序只写一次（五列分别编码并校验一致性）
 实盘测试比较“最终文件总字节 + flush 前全部 spill 字节”与预算，这是覆盖逐列删除过程的**保守峰值包络**，
 不是对瞬时峰值的采样。独立公式为 `110 × 逻辑行数 + 5105 × 五列批次数 + 65536`，超出 uint64 时饱和。
 
-已运行 `go test ./lib/storage -run 'Test(EstimateDownsample|DownsampleSpace|ReserveDownsampleSpace|DownsampleAvailableSpace)' -count=1 -v`：
-**通过，6 个顶层测试、16 个子测试，包耗时 0.645s。**
-同范围 `go test -race ./lib/storage -run 'Test(EstimateDownsample|DownsampleSpace|ReserveDownsampleSpace|DownsampleAvailableSpace)' -count=1`
-亦通过，包耗时 **2.449s**。本次未运行完整 storage、布局/查询/归并专项或集群 E2E。
+本轮生产代码审查中已运行：
 
-## 历史集群验证：范围与判定
+- `go test ./lib/storage -count=1`：通过，23.558s。
+- `go test -race ./lib/storage -run 'Test(Downsample|Downsampling|CheckDownsampling|MustOpenStorageDownsampling)' -count=1`：通过，7.454s。
+- storage、vmselectapi、vmstorage、netstorage、prometheus 的降采样定向测试：通过；vmstorage 无匹配测试但完成编译。
+- `TestDownsampleFilePhysicalLayout`：四个子场景全部通过，覆盖两个分辨率、738 批次跨默认 index 阈值、Account/Project 租户边界及零 payload。
 
-以下保留旧布局的场景、复现入口与证据。基线为 `v1.151.0-cluster`（`e7a3dc606a1d804cb3101fa73eb30cb0946ab2a9`），历史候选来自 `experimental/downsampling`；具体 commit、改动和脚本 SHA256 以对应运行 manifest 为准。降采样存储与字段查询版本均为 2。
+检查器与入口更新后的验证：
+
+- `python3 -B -E -W error::ResourceWarning -m unittest discover -s lib/storage/testdata -p 'test_downsampling_*.py' -v`：46 项通过，含新增的 15 项检查器测试，0.185s。
+- 一键入口中的 `go-layout-ut` 和 `go-ut` 两条实际命令均通过；storage 分别耗时 2.649s、3.726s。普通定向测试跳过独立布局组，并纳入空间估算、预留测试。
+- `bash -n`、入口 `--help`、内嵌 Python 语法及参数检查、`git diff --check` 均通过。
+
+检查器独立解析固定偏移的 89 字节原生 header、113 字节 metaindex 和 32 字节 TSID；resolution/feature 从 metaindex 继承。
+按五列同步比对 Block 身份和共享时间戳，验证 timestamps 按分辨率只存一份、values 按 resolution/feature 连续、每 row 同租户，以及排序、统计、完整文件覆盖和损坏拒绝。
+当前 Go writer 的四组实盘 fixture 已由新 Python CLI 全部检查通过：不同 TSID 跨 index、五租户边界、零 payload、同 TSID 跨 index；分别为 7380、3300、30、7380 个单特征 Block。
+交叉验证证据：`/var/folders/tk/llwph05x6_xgbmqxbxkq_6m40000gn/T/vm-downsampling-inspector-check-m0jx8mk8/cross_validation.json`；同目录保留 Go overlay、fixture 清单、各组 `inspection.json`、`python-ut.log` 和含脚本 SHA256 的 `validation.json`。
+`feature_switch` 单独报告；跨 TSID、同 TSID 延续和多个 index 的覆盖只在同一 `(resolution, feature)` 内计算。
+
+## 当前布局一键结果
+
+证据目录：`/private/var/folders/tk/llwph05x6_xgbmqxbxkq_6m40000gn/T/vm-downsampling-e2e-8n7u6mcp`，总清单为其中的 `manifest.json`。本次于 2026-09-09 运行，15 个阶段均为 `passed`、退出码均为 0。
+候选为 `dcb40bdc9774d39ff696ea7449aad26247e93def` 加本次文档和测试工具更新。复核时 HEAD、工作区 diff 与清单记录一致，12 个测试脚本的快照/工作区 SHA256 和两套共六个二进制 SHA256 全部匹配。
+
+| 项目 | 本次结果 |
+|---|---|
+| Python UT | 46 项通过，含 15 项检查器测试 |
+| Go 布局/遍历及其余降采样定向 UT | 两个独立阶段均通过，含空间估算和预留测试 |
+| 三小时集群对照 | 240 项通过 |
+| 三租户集群对照 | 759 项通过，租户为 11:17、11:18、12:17 |
+| 160 条时间线、93 天集群对照 | 562 项通过 |
+| 重启一致性 | 103 项通过；二十组快照、780 个查询点严格一致 |
+| 原版组件兼容性 | 6 项通过 |
+| 当前 89/113 字节文件检查 | short、tenants、long、restart 四组全部通过 |
+
+E2E 合计 **1670 项，最大绝对误差为 0**。长周期最终为 4 个 part、160 个 TSID、5660 个单特征 Block、694200 个物理行、40 个 index。
+多租户产物为 30 个 index（两分辨率 × 五特征 × 三租户），每个 row 保持同租户。
+长周期产物未命中同列跨 index；同 TSID 跨相邻 index 由本次 `go-layout-ut` 的固定 fixture 验证，不将 feature 切换当作该覆盖。多租户 E2E 实际命中了同列不同 TSID 跨相邻 index。
+本次验收范围是三项文件布局约束及现有写入、重复归并、字段查询和正常重启流程；仍保留下文的覆盖边界。
+
+## 集群测试场景与判定
+
+一键入口使用当前工作区作为候选，基线为 `v1.151.0-cluster`（`e7a3dc606a1d804cb3101fa73eb30cb0946ab2a9`）。具体 commit、工作区改动、脚本和二进制 SHA256 以对应运行 manifest 为准。降采样存储与字段查询版本均为 2；历史旧布局结果单独列在后文。
 
 每侧运行真实的一个 vminsert、一个 vmstorage 和一个 vmselect，replicationFactor=1，绑定 loopback，使用独立目录。vmstorage 与 vmselect 均设置 dedup interval 为零。脚本默认使用 cluster 模式；保留的 single 模式不属于本轮验证范围。
 
@@ -68,7 +103,8 @@ timestamps 按生成顺序只写一次（五列分别编码并校验一致性）
 | `downsampling_multiseries_compare.py` | 160 条时间线、93 天、2381868 个样本；4 条持续采样，其余包含按日、间断、提前结束和延后开始场景，活跃片段内仍按 14～16 秒采样；跨月、标签筛选、空结果、裁剪窗口、多线裸查询及重启 |
 | `downsampling_restart.py` | 两条时间线、三小时、1440 个样本；归并后查询十字段，重启全部三组件，再查询并严格比较二十组非空快照 |
 | `downsampling_cluster_compatibility.py` | 两个混部方向的原生 matrix/range 查询，以及新 vmselect 对旧 vmstorage 的字段请求明确失败；失败响应必须包含字段 RPC 标识，且本次请求新增的 vmstorage 日志须明确记录 unsupported rpcName；普通连接错误不能通过 |
-| `downsampling_inspect.py` | **仅适用旧实验布局，待适配**：当前仍解析 32 字节 TSID、99 字节字段 header、112 字节 metaindex；不能检查当前 89/113 字节布局 |
+| `downsampling_inspect.py` | 当前 89/113 字节、feature 0..4 独立文件检查；五列共享时间戳、全局列布局、单 row 租户、连续负载与索引遍历覆盖 |
+| `test_downsampling_inspect.py` | 独立二进制 fixture 验证解析、覆盖报告，以及错列、旧编号、跨租户和损坏文件拒绝 |
 
 长周期按周写入和归并，每日预留 45 秒内的样本在最后补写。补写与主批次的时间戳集合互斥，用于验证同格子内 raw 与已有摘要的持续归并，特别是 sum/count 的贡献累计。93 天表示输入历史跨度，不表示测试持续运行 93 天。
 
@@ -96,7 +132,7 @@ Python UT 使用手算结果验证五特征、格子边界、共享时间戳、�
 
 ```sh
 python3 -B -W error::ResourceWarning -m unittest discover -s lib/storage/testdata -p 'test_downsampling_*.py' -v
-go test -p 4 ./lib/storage ./lib/vmselectapi ./app/vmstorage ./app/vmselect/netstorage ./app/vmselect/prometheus -run 'Test(Downsample|Downsampling|CheckDownsampling|MustOpenStorageDownsampling)' -count=1
+go test -p 4 ./lib/storage ./lib/vmselectapi ./app/vmstorage ./app/vmselect/netstorage ./app/vmselect/prometheus -run 'Test(Downsample|Downsampling|CheckDownsampling|MustOpenStorageDownsampling|EstimateDownsample|ReserveDownsample)' -count=1
 ```
 
 在候选源码根目录执行一键入口；从其他目录使用脚本的绝对路径调用，入口按自身路径定位源码：
@@ -105,13 +141,16 @@ go test -p 4 ./lib/storage ./lib/vmselectapi ./app/vmstorage ./app/vmselect/nets
 ./lib/storage/testdata/downsampling_e2e.sh
 ```
 
-默认创建全新的系统临时目录。指定保存位置时，目录必须尚不存在：
+入口自动创建全新的系统临时目录，并在终端打印输出路径。结束时应显示 `结果：passed`，且输出目录的 `manifest.json` 中 `status` 为 `passed`、`exit_code` 为 `0`。
+各阶段日志位于 `logs/`，集群场景的 `summary.json` 与 `inspection.json` 位于相应子目录；失败或中断时保留证据。
+
+指定保存位置时，目录必须尚不存在：
 
 ```sh
 ./lib/storage/testdata/downsampling_e2e.sh --output /tmp/vm-downsampling-result
 ```
 
-依赖 bash、Python 3、满足 go.mod 要求的 Go、Git、系统 libzstd，以及本地 `v1.151.0-cluster` tag。入口自动创建基准 detached worktree，构建两套三组件，运行 Python UT、Go 定向 UT、五组 E2E 和四组文件检查。长周期固定使用 93 天、160 条时间线、4 条持续采样线。所有阶段串行运行，关闭 Python 优化模式，保证测试断言执行。
+依赖 bash、Python 3、满足 go.mod 要求的 Go、Git、系统 libzstd，以及本地 `v1.151.0-cluster` tag。入口自动创建基准 detached worktree，构建两套三组件，运行 Python UT、Go 定向 UT、独立 Go 布局/遍历 UT、五组 E2E 和四组文件检查。长周期固定使用 93 天、160 条时间线、4 条持续采样线。新格式每个 index 最多容纳 736 个单列 header；该场景不保证同列跨 index。一键中的独立 Go 布局/遍历阶段强制验证同列跨 index，集群长周期仍要求同 TSID 超过 8192 个 5m 摘要行且跨 Block、多物理 TSID 和跨月。所有阶段串行运行，关闭 Python 优化模式，保证测试断言执行。
 
 每个阶段的命令、日志、退出码和结果写入输出目录；`manifest.json` 保存源码 commit、工作区状态、脚本和 binary SHA256 及总结果，`test-sources/` 保存测试脚本副本，Python 测试与文件检查实际从该副本执行。失败立即停止，返回非零退出码；中断或失败时清理本次阶段的子进程，结束时移除本次基准 worktree，保留二进制、数据和证据。
 
@@ -143,9 +182,9 @@ go test -p 4 ./lib/storage ./lib/vmselectapi ./app/vmstorage ./app/vmselect/nets
 ## 覆盖边界
 
 - 当前打开校验遍历全部 index，但不解码 timestamps/values 数值；五路各保留当前 index，metaindex 仍整体驻留且受 64 MiB 上限约束。
-- 本次空间实盘测试会调用打开校验，但不替代损坏注入、查询单列 I/O、归并数值或全局排序专项测试。
+- 检查器不解码 timestamps/values 的数值内容；数学正确性由 Go 数值测试和本次集群 E2E 的独立参考比较验证。
 - 历史文件检查只验证旧布局索引和负载引用结构；历史数学正确性由十字段查询与独立参考比较验证，不能外推到当前布局。
-- 历史 E2E 命中同 TSID 跨 Block、不同 TSID 跨 index、多个月份；同 TSID 跨相邻 index 由当时的 `TestDownsampleIterationMultiTSID` 等 UT 覆盖，本次未重跑。
+- 历史 E2E 命中同 TSID 跨 Block、不同 TSID 跨 index、多个月份；当前同一 resolution/feature 内的同 TSID 和不同 TSID 跨 index 由一键 Go 布局/遍历阶段验证；集群产物的 coverage 另行如实报告。
 - 历史字段查询在完整归并后验证，不证明跨未归并 part 查询侧再聚合、raw/摘要混合查询、多 vmstorage 副本故障切换或崩溃恢复。
 - Python 数值参考限于有限值；NaN/Inf 需 Go 特殊值 UT，不能由有限值 E2E 推断。
-- 完整 storage race 和全仓库回归不属于本次已运行结果。
+- 已运行完整 storage、降采样定向 race 和当前格式的完整集群 E2E；完整 storage race 与全仓库回归不属于本次已运行结果。

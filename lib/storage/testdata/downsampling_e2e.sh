@@ -59,9 +59,23 @@ environment = os.environ.copy()
 environment.pop("PYTHONOPTIMIZE", None)
 environment["PYTHONDONTWRITEBYTECODE"] = "1"
 python = [sys.executable, "-B", "-E"]
+layout_tests = (
+    "^TestDownsample(FilePhysicalLayout|IterationMultiTSID|IterationReaderReuse|ClusterTenantIndexBoundaries)$")
+long_required_coverage = ["same_tsid_5m_over_8192_rows_and_multiple_blocks",
+                          "multiple_partitions", "multiple_physical_tsids"]
 manifest = {"status": "running", "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "output": str(output), "candidate_source": str(source), "baseline_ref": baseline_ref,
-            "baseline_commit": baseline_commit, "zstd_library": zstd_library, "steps": [], "results": {}}
+            "baseline_commit": baseline_commit, "zstd_library": zstd_library, "steps": [], "results": {},
+            "coverage_validation": {
+                "go-layout-ut": {
+                    "test_pattern": layout_tests,
+                    "scope": "同 (resolution, feature) 内同 TSID 与不同 TSID 跨 index，租户切 row，文件物理分组",
+                    "fixtures": ["每分辨率 738 批次，超过默认每 index 的 736 个 header 上限",
+                                 "180 条时间线，以 132 header/index 使同一 TSID 跨相邻 index",
+                                 "AccountID 与 ProjectID 分别切换时 row 保持同租户"]},
+                "long": {
+                    "required": long_required_coverage,
+                    "scope": "160 条时间线的真实 E2E 文件；同列跨 index 按实际产物报告，不作为本场景必选项"}}}
 
 
 def save_manifest():
@@ -238,9 +252,13 @@ try:
         save_manifest()
     run_step("python-ut", python + ["-W", "error::ResourceWarning", "-m", "unittest", "discover", "-s", tests,
                                    "-p", "test_downsampling_*.py", "-v"])
+    # 新格式每列独立成组。160 条 E2E 时间线不保证超过同列 736 header/index；
+    # 固定 Go fixture 必须独立通过，不能把 feature 切换算作同列跨 index。
+    run_step("go-layout-ut", ["go", "test", "-p", "4", "./lib/storage", "-run", layout_tests, "-count=1", "-v"])
     run_step("go-ut", ["go", "test", "-p", "4", "./lib/storage", "./lib/vmselectapi", "./app/vmstorage",
                        "./app/vmselect/netstorage", "./app/vmselect/prometheus", "-run",
-                       "Test(Downsample|Downsampling|CheckDownsampling|MustOpenStorageDownsampling)", "-count=1"])
+                       "Test(Downsample|Downsampling|CheckDownsampling|MustOpenStorageDownsampling|EstimateDownsample|ReserveDownsample)",
+                       "-skip", layout_tests, "-count=1"])
     common = ["--original", output / "original", "--candidate", output / "candidate"]
     cluster = ["--mode", "cluster", "--tenant", "11:17"]
     cases = [("short", "downsampling_compare.py", common + cluster),
@@ -264,8 +282,7 @@ try:
         elif name == "tenants":
             inspect(name, 6, ["11:17", "11:18", "12:17"])
         elif name == "long":
-            inspect(name, 160, ["11:17"], ["same_tsid_5m_over_8192_rows_and_multiple_blocks",
-                    "different_tsids_across_adjacent_indexes", "multiple_partitions", "multiple_indexes_within_one_resolution"])
+            inspect(name, 160, ["11:17"], long_required_coverage)
         save_manifest()
     manifest["e2e_checks"] = sum(result["checks"] for result in manifest["results"].values())
     manifest["max_absolute_error"] = max(result["max_absolute_error"] for result in manifest["results"].values())

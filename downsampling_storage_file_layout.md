@@ -3,7 +3,8 @@
 > 状态：已实现，以 `experimental/downsampling` 当前工作区生产代码为准；集群版基线为 `v1.151.0-cluster`。
 > 本文替代 [downsampling_storage_design.md](downsampling_storage_design.md) 第 3 节的旧布局描述。
 > 实现状态与验证范围分别见 [实现说明](downsampling_storage_implement.md) 和 [测试说明](downsampling_storage_testing.md)。
-> **兼容性：旧实验 v2 的 99 字节字段 header / 112 字节 metaindex 与当前 89/113 字节布局不兼容。**
+> **兼容性：当前格式为 89 字节原生 header / 113 字节 metaindex，feature 编号为 0..4。**
+> 旧 99/112 字节布局，以及 `ae899eded` 生成的 89/113 字节但 feature 为 1..5 的布局，均不兼容。
 > FormatVersion、SemanticsVersion 和 magic 仍为 2，不代表旧实验文件可读；没有迁移或旧布局读取路径。
 > 旧实验数据须保留备份，并从原始数据在新目录重建，不能直接复用旧摘要目录。
 
@@ -29,7 +30,7 @@
 
 与旧键 `(ResolutionMs, TSID.Less, MinTimestamp, Feature)` 的区别：
 
-- `ResolutionMs` 仍为主键，feature 从批次内末位提升为第二键。磁盘编号为 1=last、2=sum、3=count、4=min、5=max；查询 API 与 `downsampleFeatureLast..Max` 常量使用 0..4。
+- `ResolutionMs` 仍为主键，feature 从批次内末位提升为第二键。磁盘、查询 API 与 `downsampleFeatureLast..Max` 常量统一使用 0=last、1=sum、2=count、3=min、4=max。
 - 同一 `(ResolutionMs, feature)` 的全部 block 在 index.bin、values.bin 中**物理连续**；一个 index block（= 一个 metaindex row）仅属于一个 `(ResolutionMs, feature)`。
 - feature 由 metaindex row 统一声明，不再重复存入每条 header。`TSID.Less` 依次比较 AccountID、ProjectID、MetricGroupID、JobID、InstanceID、MetricID，租户已包含在 TSID 排序中。
 
@@ -48,18 +49,15 @@
 下列图中 `[tsN]` 表示一批共享时间戳 payload，`[vN]` 表示单列 value payload，
 `[bhN]` 表示一条原生 `blockHeader`（89 字节），`[mrN]` 表示一条 `downsampleMetaindexRow`（113/97 字节）。
 
-**timestamps.bin** — 按生成顺序连续追加；同一 `(resolution, 批次)` 的 5 个 feature 引用同一 `(offset,size)`：
+**timestamps.bin** — 输入按分辨率递增，因此先连续存储 5m 时间列，再存储 1h 时间列；每组内部按 `(TSID.Less, MinTimestamp)` 生成 block。同一 `(resolution, 批次)` 的 5 个 feature 引用同一 `(offset,size)`：
 
 ```text
 +----------------------------------------------------------------------+
 | timestamps.bin                                                        |
 +----------------------------------------------------------------------+
-| [ts0][ts1][ts2][ts3][ts4][ts5] ...  (按生成顺序，无 feature 分组)     |
+| 5m: [ts0][ts1][ts2] ... | 1h: [ts0][ts1][ts2] ...                    |
 +----------------------------------------------------------------------+
-         ^       ^       ^       ^       ^
-         |       |       |       |       |
-      batch0  batch1  batch2  batch3  batch4
-   (feature 1..5 共享各自 batch 的同一 offset/size)
+   (feature 0..4 共享各自 resolution/batch 的同一 offset/size)
 ```
 
 **values.bin** — 按 `(ResolutionMs, feature)` 分组，组内单列 value payload 连续：
@@ -68,10 +66,12 @@
 +------------------------------------------------------------------------------+
 | values.bin                                                                    |
 +------------------------------------------------------------------------------+
-| 组(res=5m,f=1): [v0][v1][v2]... | 组(res=5m,f=2): [v0][v1][v2]... | ...       |
-| 组(res=1h,f=1): ...             | ...                                          |
+| 组(res=5m,f=0): [v0][v1][v2]... | 组(res=5m,f=1): [v0][v1][v2]... | ...       |
+| 组(res=1h,f=0): ...             | ...                                          |
 +------------------------------------------------------------------------------+
 ```
+
+两组 timestamps、十组 values 是连续的逻辑分组；常量或单行编码允许 payload 为零字节，定位信息仍在 index 中，不保证每组都有非空字节区段。
 
 **index.bin** — 一个 index block 对应一个 metaindex row；block 内只含同一 `(ResolutionMs, feature)` 的 89 字节 `blockHeader`：
 
@@ -168,7 +168,7 @@ type downsampleMetaindexRow struct {
     metaindexRow          // 直接嵌入：TSID / MinTimestamp / MaxTimestamp /
                           //   IndexBlockOffset / BlockHeadersCount / IndexBlockSize
 
-    feature       uint8    // 1=last 2=sum 3=count 4=min 5=max
+    feature       uint8    // 0=last 1=sum 2=count 3=min 4=max
     ResolutionMs int64    // 300000 或 3600000
     LastTSID     TSID     // 保留：末 TSID，用于排序/二分定位
     RowsCount    uint64   // 保留：该 index block 的物理行数（用于统计一致性）
@@ -208,7 +208,7 @@ type downsampleMetaindexRow struct {
 
 ```text
 validDownsampleResolution(ResolutionMs)
-feature 在 [1, countOfDownsampleFeatures]
+feature 在 [0, countOfDownsampleFeatures)
 BlockHeadersCount > 0（不再 %5）
 IndexBlockSize ∈ [len(downsampleIndexMagic), downsampleMaxIndexSize]
 IndexBlockOffset 不溢出
@@ -260,7 +260,7 @@ writer 只保留当前批次的五个 Block、单列 spill 读取缓冲、当前
 
 ### 5.2 flushResolution：保证整个 part 的全局顺序
 
-每个 spill 已按 `(TSID.Less, MinTimestamp)` 排序。分辨率切换或 `Finish()` 时，依次完整消费 feature 1..5 的 spill：
+每个 spill 已按 `(TSID.Less, MinTimestamp)` 排序。分辨率切换或 `Finish()` 时，依次完整消费 feature 0..4 的 spill：
 
 - 逐条读取 header 和 values，校验 header、时间戳引用范围、顺序及连续性。
 - 将 values 追加到最终 `values.bin`，重写 `ValuesBlockOffset`，将原生 header 追加到 index。
@@ -270,8 +270,8 @@ writer 只保留当前批次的五个 Block、单列 spill 读取缓冲、当前
 这是一种利用输入有序性的外部转置，不需要全量展开、内存排序或通用外部归并排序。
 最终 values/index/metaindex 按 `(ResolutionMs, feature, TSID.Less, MinTimestamp)` **全局**排列。
 
-**分段 flush 不能破坏全局排序。** 同一分辨率若先输出片段 A 的 feature 1..5，再输出片段 B 的 feature 1..5，
-会从 feature 5 回退到 feature 1，违反格式。允许在同一 feature 内分多个 index block，或分段追加各自 spill；
+**分段 flush 不能破坏全局排序。** 同一分辨率若先输出片段 A 的 feature 0..4，再输出片段 B 的 feature 0..4，
+会从 feature 4 回退到 feature 0，违反格式。允许在同一 feature 内分多个 index block，或分段追加各自 spill；
 不能把每个输入片段的五列直接轮流写入最终文件。当前实现只在分辨率结束时完整转置。
 
 ### 5.3 offset、发布与失败处理
@@ -343,5 +343,5 @@ metaindex 本身仍整体驻留，压缩文件与解压数据各受 64 MiB 上�
 
 当前 Go 布局测试已使用 89/113 字节断言，并包含多 index、租户边界、零负载及损坏场景。
 空间测试覆盖五列独立索引预算、spill 共存上界和饱和溢出，具体运行结果见测试说明。
-旧 Python `downsampling_inspect.py` 仍解析 99/112 字节，尚未适配；历史一键 E2E 不能作为当前布局的通过证据。
-本次仅同步指定文档与空间测试，不修改该检查器或生产代码。
+Python `downsampling_inspect.py` 已适配 89/113 字节与 feature 0..4，独立解析 metaindex/header，按五列校验共享 timestamps、values 连续布局及租户边界。
+检查器 UT 覆盖正确文件、旧编号及损坏文件。当前布局完整一键测试已于 2026-09-09 通过：15 个阶段、46 项 Python UT、1670 项 E2E 和四组文件检查；数值比较最大绝对误差为 0。具体证据及覆盖边界见测试说明。

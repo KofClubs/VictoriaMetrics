@@ -15,8 +15,8 @@ import sys
 
 FIELDS = ("last", "sum", "count", "min", "max")
 RESOLUTIONS = {300_000: "5m", 3_600_000: "1h"}
-FIELD_HEADER_BYTES = 99
-METAINDEX_ROW_BYTES = 112
+FIELD_HEADER_BYTES = 89
+METAINDEX_ROW_BYTES = 113
 MIN_TIMESTAMP = 86_400_000
 MAX_TIMESTAMP = 9_222_422_399_999
 
@@ -90,53 +90,61 @@ class Zstandard:
         return destination.raw[:count]
 
 
-def decode_field(data):
+def decode_field(data, entry):
     require(len(data) == FIELD_HEADER_BYTES, "单特征 header 长度错误")
-    # 前 10 字节为扩展字段；后 89 字节是包含 AccountID/ProjectID 的集群 blockHeader。
+    # 原生集群 blockHeader 不含 resolution/feature，两者只能从所属 metaindex row 继承。
     header = {
-        "resolution_ms": signed(data, 0, 8), "feature": data[8],
-        "timestamp_precision": data[9], "tsid": tsid_at(data, 10),
-        "min_timestamp": signed(data, 42, 8), "max_timestamp": signed(data, 50, 8),
-        "first_value": signed(data, 58, 8),
-        "timestamp_offset": unsigned(data, 66, 8), "value_offset": unsigned(data, 74, 8),
-        "timestamp_size": unsigned(data, 82, 4), "value_size": unsigned(data, 86, 4),
-        "rows": unsigned(data, 90, 4), "scale": signed(data, 94, 2),
-        "timestamp_codec": data[96], "value_codec": data[97], "precision": data[98],
+        "resolution_ms": entry["resolution_ms"], "feature": entry["feature"],
+        "tsid": tsid_at(data, 0),
+        "min_timestamp": signed(data, 32, 8), "max_timestamp": signed(data, 40, 8),
+        "first_value": signed(data, 48, 8),
+        "timestamp_offset": unsigned(data, 56, 8), "value_offset": unsigned(data, 64, 8),
+        "timestamp_size": unsigned(data, 72, 4), "value_size": unsigned(data, 76, 4),
+        "rows": unsigned(data, 80, 4), "scale": signed(data, 84, 2),
+        "timestamp_codec": data[86], "value_codec": data[87], "precision": data[88],
     }
     require(header["resolution_ms"] in RESOLUTIONS, "非法分辨率")
-    require(1 <= header["feature"] <= 5, "非法特征编号")
+    require(0 <= header["feature"] < len(FIELDS), "非法特征编号")
     require(1 <= header["rows"] <= 8192, "单特征 Block 行数超出限制")
     require(MIN_TIMESTAMP <= header["min_timestamp"] <= header["max_timestamp"] <= MAX_TIMESTAMP,
             "Block 时间范围无效")
-    for key in ("timestamp_precision", "precision"):
-        require(1 <= header[key] <= 64, "Block 精度字段无效")
+    require(header["rows"] != 1 or header["min_timestamp"] == header["max_timestamp"],
+            "单行 Block 的首末时间不一致")
+    require(1 <= header["precision"] <= 64, "Block 精度字段无效")
     for kind in ("timestamp", "value"):
         codec = header[kind + "_codec"]
         size = header[kind + "_size"]
         require(1 <= codec <= 6, "Block codec 不属于现有编码种类")
         require(size <= 131072, "单列编码负载过大")
         require(codec not in (1, 5) or header["rows"] >= 2, "单行不能使用二阶差分编码")
-        require(codec != 3 or size == 0, "常量列不应存储 values 或 timestamps 负载")
-        require(header[kind + "_offset"] <= (1 << 63) - 1, "列偏移超出 int64 范围")
+        require((codec == 3) == (size == 0), "常量与非常量列的负载大小矛盾")
+        require(codec != 2 or size <= 10, "等差列的负载超过 varint 上限")
+        require(header[kind + "_offset"] + size <= (1 << 63) - 1, "列偏移超出 int64 范围")
+    require(header["timestamp_codec"] != 3 or header["min_timestamp"] == header["max_timestamp"],
+            "常量时间戳与 header 时间范围矛盾")
     return header
 
 
 def decode_meta(data):
     require(len(data) == METAINDEX_ROW_BYTES, "metaindex 行长度错误")
     result = {
-        "resolution_ms": signed(data, 0, 8),
-        "first_tsid": tsid_at(data, 8), "last_tsid": tsid_at(data, 40),
-        "min_timestamp": signed(data, 72, 8), "max_timestamp": signed(data, 80, 8),
-        "blocks": unsigned(data, 88, 4), "offset": unsigned(data, 92, 8),
-        "size": unsigned(data, 100, 4), "rows": unsigned(data, 104, 8),
+        "first_tsid": tsid_at(data, 0), "blocks": unsigned(data, 32, 4),
+        "min_timestamp": signed(data, 36, 8), "max_timestamp": signed(data, 44, 8),
+        "offset": unsigned(data, 52, 8), "size": unsigned(data, 60, 4),
+        "feature": data[64], "resolution_ms": signed(data, 65, 8),
+        "last_tsid": tsid_at(data, 73), "rows": unsigned(data, 105, 8),
     }
     require(result["resolution_ms"] in RESOLUTIONS, "metaindex 分辨率无效")
+    require(0 <= result["feature"] < len(FIELDS), "metaindex 特征编号无效（当前格式为 0..4）")
     require(result["first_tsid"] <= result["last_tsid"], "metaindex TSID 首末范围无效")
-    require(0 < result["blocks"] <= (65536 // (5 * FIELD_HEADER_BYTES)) * 5
-            and result["blocks"] % 5 == 0, "metaindex 单特征 Block 数量无效")
+    require(result["first_tsid"][:2] == result["last_tsid"][:2], "metaindex 首末 TSID 不属于同一租户")
+    require(MIN_TIMESTAMP <= result["min_timestamp"] <= result["max_timestamp"] <= MAX_TIMESTAMP,
+            "metaindex 时间范围无效")
+    require(0 < result["blocks"] <= 65536 // FIELD_HEADER_BYTES, "metaindex 单特征 Block 数量无效")
     require(result["blocks"] <= result["rows"] <= result["blocks"] * 8192,
             "metaindex 物理行数无效")
     require(8 < result["size"] <= 131072, "index 压缩负载大小无效")
+    require(result["offset"] + result["size"] <= (1 << 63) - 1, "index 偏移超出 int64 范围")
     return result
 
 
@@ -158,6 +166,8 @@ def validate_metadata(metadata):
     require(metadata["RowsCount"] >= metadata["BlocksCount"] > 0
             and metadata["RowsCount"] % 5 == 0 and metadata["BlocksCount"] % 5 == 0,
             "metadata 物理行数或 Block 数量无效")
+    require(MIN_TIMESTAMP <= metadata["MinTimestamp"] <= metadata["MaxTimestamp"] <= MAX_TIMESTAMP,
+            "metadata 时间范围无效")
 
 
 def active_parts(data_dir):
@@ -187,100 +197,135 @@ def active_parts(data_dir):
 def shared_key(header):
     return tuple(header[name] for name in (
         "resolution_ms", "tsid", "min_timestamp", "max_timestamp", "rows",
-        "timestamp_precision", "timestamp_offset", "timestamp_size", "timestamp_codec"))
+        "precision", "timestamp_offset", "timestamp_size", "timestamp_codec"))
 
 
 def ordering_key(header):
-    return (header["resolution_ms"], header["tsid"], header["min_timestamp"], header["feature"])
+    return (header["resolution_ms"], header["feature"], header["tsid"], header["min_timestamp"])
+
+
+def column_headers(entries, index_file, sizes, zstd, reports, endpoints):
+    """遍历一个 (resolution, feature)；只保留当前解压 index 和前一个 header。"""
+    previous = None
+    for entry in entries:
+        index_file.seek(entry["offset"])
+        frame = index_file.read(entry["size"])
+        require(len(frame) == entry["size"], "index 文件被截断或测试期间发生变化")
+        index = zstd.frame(frame, b"VMDSIX", 65536)
+        require(len(index) == entry["blocks"] * FIELD_HEADER_BYTES,
+                "index 长度与物理 Block 数量不一致")
+        headers = [decode_field(index[offset:offset + FIELD_HEADER_BYTES], entry)
+                   for offset in range(0, len(index), FIELD_HEADER_BYTES)]
+        require(headers[0]["tsid"] == entry["first_tsid"] and headers[-1]["tsid"] == entry["last_tsid"],
+                "index 与 metaindex 的物理 TSID 首末标识不一致")
+        require(sum(header["rows"] for header in headers) == entry["rows"]
+                and min(header["min_timestamp"] for header in headers) == entry["min_timestamp"]
+                and max(header["max_timestamp"] for header in headers) == entry["max_timestamp"],
+                "index 与 metaindex 的行数或时间范围不一致")
+        reports.append({
+            "number": entry["number"], "resolution": RESOLUTIONS[entry["resolution_ms"]],
+            "feature": FIELDS[entry["feature"]], "feature_id": entry["feature"],
+            "account_id": entry["first_tsid"][0], "project_id": entry["first_tsid"][1],
+            "offset": entry["offset"], "size": entry["size"],
+            "physical_blocks": entry["blocks"], "physical_rows": entry["rows"],
+            "first_tsid": tsid_text(entry["first_tsid"]), "last_tsid": tsid_text(entry["last_tsid"]),
+            "unique_tsids": len({header["tsid"] for header in headers}),
+        })
+        endpoints[entry["number"]] = (headers[0], headers[-1])
+        for header in headers:
+            require(header["tsid"][:2] == entry["first_tsid"][:2], "单个 metaindex row 混入多个租户")
+            require(entry["first_tsid"] <= header["tsid"] <= entry["last_tsid"],
+                    "header TSID 超出 metaindex 范围")
+            if previous is not None:
+                require(ordering_key(previous) < ordering_key(header),
+                        "物理排序键 (分辨率, feature, TSID, MinTimestamp) 未严格递增")
+                require(previous["tsid"] != header["tsid"]
+                        or previous["max_timestamp"] < header["min_timestamp"],
+                        "同列相邻 Block（含跨 index）的同 TSID 时间范围重叠")
+                for kind in ("timestamp", "value"):
+                    require(header[kind + "_offset"] == previous[kind + "_offset"] + previous[kind + "_size"],
+                            "同列相邻 Block（含跨 index）的 " + kind + " 负载存在间隙或重叠")
+            for kind, filename in (("timestamp", "timestamps.bin"), ("value", "values.bin")):
+                require(header[kind + "_offset"] + header[kind + "_size"] <= sizes[filename],
+                        filename + " 负载超出文件或被截断")
+            header["index_number"] = entry["number"]
+            previous = header
+            yield header
 
 
 def inspect_part(partition, path, zstd):
-    metadata = read_json(path / "metadata.json")
-    validate_metadata(metadata)
     sizes = {name: (path / name).stat().st_size for name in
              ("timestamps.bin", "values.bin", "index.bin", "metaindex.bin", "metadata.json")}
+    require(sizes["metadata.json"] <= 64 << 10, "metadata 文件超过大小上限")
+    require(sizes["metaindex.bin"] <= 64 << 20, "metaindex 文件超过大小上限")
+    metadata = read_json(path / "metadata.json")
+    validate_metadata(metadata)
     meta = zstd.frame((path / "metaindex.bin").read_bytes(), b"VMDSMI", 64 << 20)
     require(meta and len(meta) % METAINDEX_ROW_BYTES == 0, "metaindex 解码长度无效")
-    reports, boundaries = [], []
-    series = {}
-    metric_ids = {}
+    groups = collections.defaultdict(list)
+    next_index_offset = 0
+    previous_entry = None
+    for number, pos in enumerate(range(0, len(meta), METAINDEX_ROW_BYTES)):
+        entry = decode_meta(meta[pos:pos + METAINDEX_ROW_BYTES])
+        entry["number"] = number
+        require(entry["offset"] == next_index_offset, "index.bin 存在间隙、重叠或起始偏移错误")
+        next_index_offset += entry["size"]
+        require(next_index_offset <= sizes["index.bin"], "index 负载超出文件或被截断")
+        if previous_entry is not None:
+            require((previous_entry["resolution_ms"], previous_entry["feature"], previous_entry["last_tsid"])
+                    <= (entry["resolution_ms"], entry["feature"], entry["first_tsid"]),
+                    "metaindex 的 (分辨率, feature, TSID) 排序错误")
+        previous_entry = entry
+        groups[(entry["resolution_ms"], entry["feature"])].append(entry)
+    require(next_index_offset == sizes["index.bin"], "index.bin 存在未引用尾部")
+    del meta
+
+    reports, boundaries, endpoints = [], [], {}
+    series, metric_ids = {}, {}
     field_tsid_sets = collections.defaultdict(lambda: [set() for _ in FIELDS])
-    next_index_offset = next_timestamp_offset = next_value_offset = 0
+    next_timestamp_offset = next_value_offset = 0
     physical_rows = physical_blocks = shared_timestamp_batches = 0
     zero_value_payloads = zero_timestamp_payloads = 0
-    previous_header = None
     minimum = maximum = None
     with (path / "index.bin").open("rb") as index_file:
-        for number, pos in enumerate(range(0, len(meta), METAINDEX_ROW_BYTES)):
-            entry = decode_meta(meta[pos:pos + METAINDEX_ROW_BYTES])
-            require(entry["offset"] == next_index_offset, "index.bin 存在间隙、重叠或起始偏移错误")
-            require(entry["offset"] + entry["size"] <= sizes["index.bin"], "index 负载超出文件")
-            index_file.seek(entry["offset"])
-            frame = index_file.read(entry["size"])
-            require(len(frame) == entry["size"], "index 文件被截断或测试期间发生变化")
-            index = zstd.frame(frame, b"VMDSIX", 65536)
-            require(len(index) == entry["blocks"] * FIELD_HEADER_BYTES, "index 长度与物理 Block 数量不一致")
-            next_index_offset += entry["size"]
-            headers = [decode_field(index[offset:offset + FIELD_HEADER_BYTES])
-                       for offset in range(0, len(index), FIELD_HEADER_BYTES)]
-            require(all(header["resolution_ms"] == entry["resolution_ms"] for header in headers),
-                    "单个 index 混入多个分辨率")
-            require(headers[0]["tsid"] == entry["first_tsid"] and headers[-1]["tsid"] == entry["last_tsid"],
-                    "index 与 metaindex 的物理 TSID 首末标识不一致")
-            require(sum(header["rows"] for header in headers) == entry["rows"]
-                    and min(header["min_timestamp"] for header in headers) == entry["min_timestamp"]
-                    and max(header["max_timestamp"] for header in headers) == entry["max_timestamp"],
-                    "index 与 metaindex 的行数或时间范围不一致")
-            if previous_header is not None:
-                first = headers[0]
-                if previous_header["resolution_ms"] != first["resolution_ms"]:
-                    kind = "resolution_switch"
-                elif previous_header["tsid"] == first["tsid"]:
-                    kind = "same_tsid_continuation"
-                else:
-                    kind = "tsid_switch"
-                boundaries.append({
-                    "previous_index": number - 1, "next_index": number, "kind": kind,
-                    "previous_resolution": RESOLUTIONS[previous_header["resolution_ms"]],
-                    "next_resolution": RESOLUTIONS[first["resolution_ms"]],
-                    "previous_tsid": tsid_text(previous_header["tsid"]), "next_tsid": tsid_text(first["tsid"]),
-                    "previous_batch_min_timestamp": previous_header["min_timestamp"],
-                    "next_batch_min_timestamp": first["min_timestamp"],
-                })
-            for batch_pos in range(0, len(headers), 5):
-                batch = headers[batch_pos:batch_pos + 5]
+        for resolution in sorted(RESOLUTIONS):
+            readers = [column_headers(groups[(resolution, feature)], index_file, sizes, zstd, reports, endpoints)
+                       for feature in range(len(FIELDS))]
+            first_values = [None] * len(FIELDS)
+            last_values = [None] * len(FIELDS)
+            while True:
+                batch = [next(reader, None) for reader in readers]
+                require(all(header is None for header in batch) or all(header is not None for header in batch),
+                        "同分辨率特征缺列或存在多余 Block")
+                if batch[0] is None:
+                    break
                 first = batch[0]
-                require([header["feature"] for header in batch] == [1, 2, 3, 4, 5],
-                        "批次的特征缺失、重复或顺序错误")
                 require(all(shared_key(header) == shared_key(first) for header in batch),
                         "五个单特征 Block 未共享相同的时间戳和行数描述")
                 require(first["timestamp_offset"] == next_timestamp_offset,
                         "timestamps.bin 重复存储、间隙、重叠或起始偏移错误")
                 next_timestamp_offset += first["timestamp_size"]
-                require(next_timestamp_offset <= sizes["timestamps.bin"], "时间戳负载超出文件")
                 shared_timestamp_batches += 1
                 zero_timestamp_payloads += first["timestamp_size"] == 0
-                identity = (first["resolution_ms"], first["tsid"])
+                identity = (resolution, first["tsid"])
                 if identity not in series:
-                    series[identity] = {"resolution": RESOLUTIONS[identity[0]], "tsid": tsid_text(identity[1]),
+                    series[identity] = {"resolution": RESOLUTIONS[resolution], "tsid": tsid_text(identity[1]),
                                         "account_id": identity[1][0], "project_id": identity[1][1],
                                         "blocks_by_field": dict.fromkeys(FIELDS, 0), "rows_by_field": dict.fromkeys(FIELDS, 0),
-                                        "batch_rows": [], "index_numbers": set()}
+                                        "batch_rows": [], "index_numbers": set(),
+                                        "index_numbers_by_field": {field: set() for field in FIELDS}}
                 stat = series[identity]
                 stat["batch_rows"].append(first["rows"])
-                stat["index_numbers"].add(number)
-                for header in batch:
-                    if previous_header is not None:
-                        require(ordering_key(previous_header) < ordering_key(header),
-                                "完整物理排序键 (分辨率, TSID, MinTimestamp, Feature) 未严格递增")
-                    require(header["value_offset"] == next_value_offset,
-                            "values.bin 列顺序不连续，存在间隙或重叠")
-                    next_value_offset += header["value_size"]
-                    require(next_value_offset <= sizes["values.bin"], "values 负载超出文件")
-                    field = FIELDS[header["feature"] - 1]
+                for feature, header in enumerate(batch):
+                    if first_values[feature] is None:
+                        first_values[feature] = header["value_offset"]
+                    last_values[feature] = header["value_offset"] + header["value_size"]
+                    field = FIELDS[feature]
                     stat["blocks_by_field"][field] += 1
                     stat["rows_by_field"][field] += header["rows"]
-                    field_tsid_sets[header["resolution_ms"]][header["feature"] - 1].add(header["tsid"])
+                    stat["index_numbers"].add(header["index_number"])
+                    stat["index_numbers_by_field"][field].add(header["index_number"])
+                    field_tsid_sets[resolution][feature].add(header["tsid"])
                     metric_id = header["tsid"][-1]
                     require(metric_id not in metric_ids or metric_ids[metric_id] == header["tsid"],
                             "同一 MetricID 对应多个物理 TSID")
@@ -290,20 +335,36 @@ def inspect_part(partition, path, zstd):
                     physical_blocks += 1
                     minimum = header["min_timestamp"] if minimum is None else min(minimum, header["min_timestamp"])
                     maximum = header["max_timestamp"] if maximum is None else max(maximum, header["max_timestamp"])
-                    previous_header = header
-            reports.append({
-                "number": number, "resolution": RESOLUTIONS[entry["resolution_ms"]],
-                "offset": entry["offset"], "size": entry["size"],
-                "physical_blocks": entry["blocks"], "physical_rows": entry["rows"],
-                "first_tsid": tsid_text(entry["first_tsid"]), "last_tsid": tsid_text(entry["last_tsid"]),
-                "unique_tsids": len({header["tsid"] for header in headers}),
-            })
-    require(next_index_offset == sizes["index.bin"], "index.bin 存在未引用尾部")
+            if first_values[0] is not None:
+                for first_value, last_value in zip(first_values, last_values):
+                    require(first_value == next_value_offset,
+                            "values.bin 跨分辨率/feature 的列顺序不连续，存在间隙或重叠")
+                    next_value_offset = last_value
     require(next_timestamp_offset == sizes["timestamps.bin"], "timestamps.bin 存在未引用尾部")
     require(next_value_offset == sizes["values.bin"], "values.bin 存在未引用尾部")
     require(physical_rows == metadata["RowsCount"] and physical_blocks == metadata["BlocksCount"]
             and minimum == metadata["MinTimestamp"] and maximum == metadata["MaxTimestamp"],
             "part 与实际物理 Block 的统计或时间范围不一致")
+    for number in range(1, len(endpoints)):
+        previous = endpoints[number - 1][1]
+        first = endpoints[number][0]
+        if previous["resolution_ms"] != first["resolution_ms"]:
+            kind = "resolution_switch"
+        elif previous["feature"] != first["feature"]:
+            kind = "feature_switch"
+        elif previous["tsid"] == first["tsid"]:
+            kind = "same_tsid_continuation"
+        else:
+            kind = "tsid_switch"
+        boundaries.append({
+            "previous_index": number - 1, "next_index": number, "kind": kind,
+            "previous_resolution": RESOLUTIONS[previous["resolution_ms"]],
+            "next_resolution": RESOLUTIONS[first["resolution_ms"]],
+            "previous_feature": FIELDS[previous["feature"]], "next_feature": FIELDS[first["feature"]],
+            "previous_tsid": tsid_text(previous["tsid"]), "next_tsid": tsid_text(first["tsid"]),
+            "previous_batch_min_timestamp": previous["min_timestamp"],
+            "next_batch_min_timestamp": first["min_timestamp"],
+        })
     physical_tsids = {}
     for resolution, sets in sorted(field_tsid_sets.items()):
         require(all(values == sets[0] for values in sets), "同分辨率下五个特征的物理 TSID 集合不一致")
@@ -312,6 +373,8 @@ def inspect_part(partition, path, zstd):
         require(len(set(stat["blocks_by_field"].values())) == 1 and len(set(stat["rows_by_field"].values())) == 1,
                 "同一物理 TSID 五个特征的 Block 数量或行数不一致")
         stat["index_numbers"] = sorted(stat["index_numbers"])
+        stat["index_numbers_by_field"] = {field: sorted(numbers)
+                                           for field, numbers in stat["index_numbers_by_field"].items()}
     return {
         "partition": partition, "path": str(path), "metadata": metadata, "file_sizes": sizes,
         "physical_rows": physical_rows, "physical_blocks": physical_blocks,
@@ -319,7 +382,8 @@ def inspect_part(partition, path, zstd):
         "physical_tsid_sets_equal_between_resolutions": (set(physical_tsids) == {"5m", "1h"}
                                                         and physical_tsids["5m"] == physical_tsids["1h"]),
         "zero_value_payloads": zero_value_payloads, "zero_timestamp_payloads": zero_timestamp_payloads,
-        "physical_tsids_by_resolution": physical_tsids, "indexes": reports, "index_boundaries": boundaries,
+        "physical_tsids_by_resolution": physical_tsids,
+        "indexes": sorted(reports, key=lambda report: report["number"]), "index_boundaries": boundaries,
         "series": [series[key] for key in sorted(series)],
     }
 
@@ -331,11 +395,11 @@ def summarize(parts):
     for part in parts:
         partition = partitions[part["partition"]]
         partition["parts"].append(part["path"])
-        counts = collections.Counter(index["resolution"] for index in part["indexes"])
-        for resolution, count in sorted(counts.items()):
+        counts = collections.Counter((index["resolution"], index["feature"]) for index in part["indexes"])
+        for (resolution, feature), count in sorted(counts.items()):
             if count >= 2:
                 multiple_indexes_evidence.append({"partition": part["partition"], "part": part["path"],
-                                                  "resolution": resolution, "indexes": count})
+                                                  "resolution": resolution, "feature": feature, "indexes": count})
         for stat in part["series"]:
             metric_id = stat["tsid"].rsplit(":", 1)[-1]
             require(metric_id not in identities or identities[metric_id] == stat["tsid"],
@@ -410,7 +474,7 @@ def main():
                         help="必须实际命中的 coverage 字段，可重复指定；未指定的未命中项仍如实报告 false")
     args = parser.parse_args()
     report = {"status": "running", "data_dir": str(args.data_dir.resolve()), "parts": [],
-              "decoder": "Python 固定偏移解析集群 99/112 字节记录和 32 字节 TSID；系统 libzstd 仅解压",
+              "decoder": "Python 固定偏移解析集群 89/113 字节记录和 32 字节 TSID，feature=0..4；系统 libzstd 仅解压",
               "scope": "仅 parts.json 引用的 small/big 活动 part；不读取 indexdb；不解码 values 数学内容"}
     try:
         zstd = Zstandard()
