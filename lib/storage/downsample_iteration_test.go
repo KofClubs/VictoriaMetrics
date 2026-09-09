@@ -103,7 +103,7 @@ func newDownsampleIterationPart(t *testing.T) *part {
 		for feature := 0; feature < 5; feature++ {
 			pos := (i*5 + feature) * 2
 			left, right := &p.dsMetaindex[pos], &p.dsMetaindex[pos+1]
-			if left.ResolutionMs != resolution || right.ResolutionMs != resolution || left.feature != uint8(feature+1) || right.feature != uint8(feature+1) || left.LastTSID != wide || right.TSID != wide || left.BlockHeadersCount != 132 || right.BlockHeadersCount != 49 {
+			if left.ResolutionMs != resolution || right.ResolutionMs != resolution || left.feature != uint8(feature) || right.feature != uint8(feature) || left.LastTSID != wide || right.TSID != wide || left.BlockHeadersCount != 132 || right.BlockHeadersCount != 49 {
 				t.Fatalf("分辨率 %d 特征 %d 的长序列未跨 index: 左=%+v，右=%+v", resolution, feature, left, right)
 			}
 		}

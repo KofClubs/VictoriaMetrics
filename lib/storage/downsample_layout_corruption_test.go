@@ -133,8 +133,8 @@ func TestDownsampleLayoutMetaindexIdentityCorruption(t *testing.T) {
 		name   string
 		mutate func([]byte)
 	}{
-		{"feature_zero", func(m []byte) { m[64] = 0 }},
-		{"feature_out_of_range", func(m []byte) { m[64] = 6 }},
+		{"feature_out_of_range", func(m []byte) { m[64] = 5 }},
+		{"feature_out_of_range_high", func(m []byte) { m[64] = 255 }},
 		{"resolution", func(m []byte) { copy(m[65:73], encoding.MarshalInt64(nil, 1)) }},
 		{"last_account", func(m []byte) { binary.BigEndian.PutUint32(m[73:77], 1) }},
 		{"last_project", func(m []byte) { binary.BigEndian.PutUint32(m[77:81], 1) }},

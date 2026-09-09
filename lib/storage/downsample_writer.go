@@ -242,7 +242,7 @@ func (w *downsampleWriter) flushResolution() error {
 				return err
 			}
 			w.indexData = h.Marshal(w.indexData)
-			w.mr.ResolutionMs, w.mr.feature = w.resolution, uint8(feature+1)
+			w.mr.ResolutionMs, w.mr.feature = w.resolution, uint8(feature)
 			w.mr.RegisterBlockHeader(&h)
 			w.mr.LastTSID = h.TSID
 			w.mr.RowsCount += uint64(h.RowsCount)

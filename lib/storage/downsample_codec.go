@@ -31,7 +31,7 @@ const downsampleIndexMagic = "VMDSIX\x00\x02"
 
 type downsampleMetaindexRow struct {
 	metaindexRow
-	feature      uint8 // 磁盘编号 1..5；查询 API 使用 0..4。
+	feature      uint8 // 特征编号，与 downsampleFeature* 的 iota 值一致（0..4）。
 	ResolutionMs int64
 	LastTSID     TSID
 	RowsCount    uint64
@@ -116,7 +116,7 @@ func (m *downsampleMetaindexRow) unmarshal(src []byte) error {
 		return err
 	}
 	m.RowsCount = encoding.UnmarshalUint64(tail)
-	if !validDownsampleResolution(m.ResolutionMs) || m.feature < 1 || m.feature > countOfDownsampleFeatures || !sameDownsampleTenant(&m.TSID, &m.LastTSID) || m.LastTSID.Less(&m.TSID) || m.MinTimestamp > m.MaxTimestamp || m.MinTimestamp < minUnixMilli || m.MaxTimestamp > maxUnixMilli || m.RowsCount < uint64(m.BlockHeadersCount) || m.RowsCount > uint64(m.BlockHeadersCount)*maxRowsPerBlock || uint64(m.BlockHeadersCount) > uint64(maxBlockSize/marshaledBlockHeaderSize) || m.IndexBlockSize < uint32(len(downsampleIndexMagic)) || m.IndexBlockOffset > uint64(^uint64(0)>>1)-uint64(m.IndexBlockSize) {
+	if !validDownsampleResolution(m.ResolutionMs) || m.feature >= countOfDownsampleFeatures || !sameDownsampleTenant(&m.TSID, &m.LastTSID) || m.LastTSID.Less(&m.TSID) || m.MinTimestamp > m.MaxTimestamp || m.MinTimestamp < minUnixMilli || m.MaxTimestamp > maxUnixMilli || m.RowsCount < uint64(m.BlockHeadersCount) || m.RowsCount > uint64(m.BlockHeadersCount)*maxRowsPerBlock || uint64(m.BlockHeadersCount) > uint64(maxBlockSize/marshaledBlockHeaderSize) || m.IndexBlockSize < uint32(len(downsampleIndexMagic)) || m.IndexBlockOffset > uint64(^uint64(0)>>1)-uint64(m.IndexBlockSize) {
 		return fmt.Errorf("无效降采样 metaindex 行")
 	}
 	return nil

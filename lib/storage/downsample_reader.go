@@ -136,10 +136,10 @@ func (r *downsampleReader) SetFilter(tsid *TSID, minTimestamp, maxTimestamp int6
 	if r.p.dsMetadata != nil {
 		rows := r.p.dsMetaindex
 		start := sort.Search(len(rows), func(i int) bool {
-			return rows[i].ResolutionMs > r.resolution || (rows[i].ResolutionMs == r.resolution && rows[i].feature >= r.feature+1)
+			return rows[i].ResolutionMs > r.resolution || (rows[i].ResolutionMs == r.resolution && rows[i].feature >= r.feature)
 		})
 		end := start + sort.Search(len(rows)-start, func(i int) bool {
-			return rows[start+i].ResolutionMs > r.resolution || rows[start+i].feature > r.feature+1
+			return rows[start+i].ResolutionMs > r.resolution || rows[start+i].feature > r.feature
 		})
 		if r.hasFilter {
 			// 同一分辨率、特征下 LastTSID 单调，保留所有可能包含目标的边界 index。

@@ -87,7 +87,7 @@ func TestDownsampleFilePhysicalLayout(t *testing.T) {
 				resIndex := nextField / (tc.blocksPerRes * 5)
 				col := nextField / tc.blocksPerRes % 5
 				start := nextField % tc.blocksPerRes
-				if resIndex >= 2 || feature != col+1 || resolution != []int64{300000, 3600000}[resIndex] || count == 0 || count > 736 || start+int(count) > tc.blocksPerRes || offset != nextIndexOffset || offset+uint64(size) > uint64(len(files["index.bin"])) {
+				if resIndex >= 2 || feature != col || resolution != []int64{300000, 3600000}[resIndex] || count == 0 || count > 736 || start+int(count) > tc.blocksPerRes || offset != nextIndexOffset || offset+uint64(size) > uint64(len(files["index.bin"])) {
 					t.Fatalf("metaindex 第 %d 行的 feature 分组、数量或 index offset/size 错误", pos/clusterDownsampleMetaindexBytes)
 				}
 				nextIndexOffset += uint64(size)

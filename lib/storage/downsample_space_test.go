@@ -247,7 +247,7 @@ func TestDownsampleSpaceBoundCoversEncodedParts(t *testing.T) {
 			var indexCounts [5]int
 			var blockCounts, rowCounts [5]uint64
 			for _, mr := range p.dsMetaindex {
-				feature := int(mr.feature) - 1
+				feature := int(mr.feature)
 				if feature < 0 || feature >= len(indexCounts) || mr.ResolutionMs != downsampleResolution5m {
 					t.Fatalf("unexpected metaindex identity: %+v", mr)
 				}
