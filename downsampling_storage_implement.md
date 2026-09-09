@@ -15,13 +15,14 @@
 | 数学计算、Block 复用、列存、归并及存储接入 | 已实现，本轮未修改生产代码 |
 | 一键集群测试入口 | 完整一键运行通过；构建失败、SIGINT、SIGTERM 清理验证通过 |
 | 集群 Python 测试 | 已修正求值时间戳参考；默认 cluster，输入采用 14～16 秒唯一样本 |
-| Python UT | 23 项通过 |
+| Python UT | 31 项通过，含 8 项重启比较器 UT |
 | Go 降采样定向 UT | 通过 |
-| 集群对照 | 1567 项通过，最大绝对误差 0 |
+| 集群 E2E | 1670 项通过，最大绝对误差 0 |
 | 文件结构、采样间隔及手算值核验 | 通过 |
+| 重启前后严格一致性 | 独立运行及一键回归均通过；十字段、二十组快照、780 个查询点严格一致 |
 
 ## 续接信息
 
-一键入口已完成并验证，无待处理事项。源码与测试入口统一维护在 `experimental/downsampling` 分支。一键运行证据为 `/private/tmp/vm-downsampling-oneclick-final-20260909`；失败与中断验证见 `/private/tmp/vm-downsampling-oneclick-harness-checks-20260909/summary.json`。
+重启场景、比较器 UT、一键入口集成及完整回归已完成，无待处理事项。最新一键运行的 14 个阶段全部通过，证据为 `/private/tmp/vm-downsampling-oneclick-restart-20260909`；重启测试结果位于其中的 `restart/summary.json`。源码与测试入口统一维护在 `experimental/downsampling` 分支。入口的失败与中断清理验证见 `/private/tmp/vm-downsampling-oneclick-harness-checks-20260909/summary.json`。
 
 后续修改先核对 manifest 与源码，再重跑受影响的验证。当前查询测试仅覆盖已完整归并的摘要；跨未归并 part 再聚合、raw/摘要混合查询和多节点副本故障测试尚未实施。状态与结果直接更新本文及测试说明，不追加过程流水账。

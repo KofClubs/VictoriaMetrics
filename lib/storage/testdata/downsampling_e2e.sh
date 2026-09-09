@@ -21,7 +21,7 @@ import time
 testdata = pathlib.Path(sys.argv[1]).resolve()
 parser = argparse.ArgumentParser(
     prog="downsampling_e2e.sh",
-    description="一键运行降采样集群测试：两套组件构建、UT、三小时、三租户、93 天对照、兼容性及文件检查。")
+    description="一键运行降采样集群测试：两套组件构建、UT、三小时、三租户、93 天对照、重启一致性、兼容性及文件检查。")
 parser.add_argument("--output", type=pathlib.Path, help="尚不存在的输出目录；默认在系统临时目录中自动创建")
 args = parser.parse_args(sys.argv[2:])
 for tool in ("git", "go"):
@@ -243,17 +243,23 @@ try:
                        "Test(Downsample|Downsampling|CheckDownsampling|MustOpenStorageDownsampling)", "-count=1"])
     common = ["--original", output / "original", "--candidate", output / "candidate"]
     cluster = ["--mode", "cluster", "--tenant", "11:17"]
-    cases = [("short", "downsampling_compare.py", cluster),
-             ("tenants", "downsampling_cluster_tenants.py", []),
-             ("long", "downsampling_multiseries_compare.py", cluster + ["--days", "93", "--series", "160", "--dense-series", "4"]),
-             ("compatibility", "downsampling_cluster_compatibility.py", [])]
+    cases = [("short", "downsampling_compare.py", common + cluster),
+             ("tenants", "downsampling_cluster_tenants.py", common),
+             ("long", "downsampling_multiseries_compare.py", common + cluster + ["--days", "93", "--series", "160", "--dense-series", "4"]),
+             ("restart", "downsampling_restart.py", ["--candidate", output / "candidate", "--tenant", "11:17"]),
+             ("compatibility", "downsampling_cluster_compatibility.py", common)]
     for name, script, options in cases:
-        run_step(name, python + [tests / script] + common + options + ["--output", output / name])
+        run_step(name, python + [tests / script] + options + ["--output", output / name])
         report = read_result(output / name / "summary.json")
         manifest["results"][name] = {
             "summary": str(output / name / "summary.json"), "checks": report["checks_count"],
             "max_absolute_error": max((check.get("max_absolute_error", 0) for check in report["checks"]), default=0)}
-        if name == "short":
+        if name == "restart":
+            if report.get("exact_comparisons") != 20 or not report.get("exact_compared_points", 0):
+                raise RuntimeError("重启一致性测试未完成全部二十组非空快照比较")
+            manifest["results"][name].update(exact_comparisons=report["exact_comparisons"],
+                                            exact_compared_points=report["exact_compared_points"])
+        if name in ("short", "restart"):
             inspect(name, 2, ["11:17"])
         elif name == "tenants":
             inspect(name, 6, ["11:17", "11:18", "12:17"])
