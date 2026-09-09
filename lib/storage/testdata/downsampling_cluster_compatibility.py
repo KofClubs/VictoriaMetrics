@@ -10,7 +10,39 @@ import urllib.error
 
 sys.dont_write_bytecode = True
 
-from downsampling_compare import Server, assert_samples, binary_manifest, write_json
+from downsampling_compare import Server, assert_samples, binary_manifest, range_expected, write_json
+
+
+def assert_field_rejected(server, path, params, evidence):
+    server.cluster.assert_running()
+    log_path = server.root / "vmstorage.log"
+    log_offset = log_path.stat().st_size
+    try:
+        result = server.request(path, params)
+    except urllib.error.HTTPError as error:
+        try:
+            response = json.loads(error.read().decode())
+        finally:
+            error.close()
+        server.cluster.assert_running()
+        with log_path.open("rb") as log:
+            log.seek(log_offset)
+            appended = log.read()
+            end_offset = log.tell()
+        excerpt_path = server.root / (evidence + "-vmstorage.log")
+        excerpt_path.write_bytes(appended)
+        write_json(server.root / (evidence + ".json"), {
+            "url": server.url(path), "params": params,
+            "http_status": error.code, "response": response,
+            "vmstorage_log": {"path": str(log_path), "start_offset": log_offset,
+                              "end_offset": end_offset, "excerpt_path": str(excerpt_path)}})
+        assert 400 <= error.code < 600 and response.get("status") == "error", response
+        assert "search_downsampling_v2" in response.get("error", ""), response
+        assert b'unsupported rpcName: "search_downsampling_v2"' in appended, \
+            ("本次请求未产生不支持字段 RPC 的 vmstorage 日志", str(excerpt_path), response)
+        return {"check": server.name + ":" + evidence, "http_status": error.code,
+                "unsupported_rpc_log": str(excerpt_path)}
+    raise AssertionError(("旧 vmstorage 的字段查询未明确失败", path, result))
 
 
 def main():
@@ -26,7 +58,7 @@ def main():
     base = (int(time.time() * 1000) // 3_600_000 - 24) * 3_600_000
     metric = "downsampling_protocol_compatibility"
     rows = [{"metric": metric, "timestamp": base + offset, "value": value}
-            for offset, value in ((1000, 2), (2000, 8), (299999, 4))]
+            for offset, value in ((1000, 2), (15000, 8), (31000, 4))]
     write_json(args.output / "fixture.json", rows)
     try:
         for name, new_select in (("new-select-old-storage", True), ("old-select-new-storage", False)):
@@ -47,22 +79,19 @@ def main():
                 actual = server.query("flushed", metric, base, base + 300000)
                 expected = [(row["timestamp"], row["value"]) for row in rows]
                 summary["checks"].append(assert_samples(actual, expected, name + ":native-raw"))
+                start, end, step = base + 16000, base + 32000, 16000
+                actual = server.query("flushed", metric, start, end, "16s", range_query=True)
+                summary["checks"].append(assert_samples(actual, range_expected(expected, start, end, step),
+                                                         name + ":native-range"))
                 if new_select:
                     params = {"query": metric + "[300001ms]", "time": (base + 300000) / 1000,
                               "nocache": "1", "query.field": "5m:sum"}
-                    try:
-                        result = server.request("/api/v1/query", params)
-                    except urllib.error.HTTPError as error:
-                        result = error.read().decode()
-                        response = json.loads(result)
-                        write_json(server.root / "unsupported-downsampling-v2.json", {
-                            "url": server.url("/api/v1/query"), "params": params,
-                            "http_status": error.code, "response": response})
-                        assert response.get("status") == "error", response
-                        assert "search_downsampling_v2" in response.get("error", ""), response
-                        summary["checks"].append({"check": name + ":downsampling-v2-rejected", "http_status": error.code})
-                    else:
-                        raise AssertionError(("旧 vmstorage 的字段查询未明确失败", result))
+                    summary["checks"].append(assert_field_rejected(
+                        server, "/api/v1/query", params, "unsupported-downsampling-v2-matrix"))
+                    params = {"query": metric, "start": start / 1000, "end": end / 1000, "step": "16s",
+                              "nocache": "1", "query.field": "5m:sum"}
+                    summary["checks"].append(assert_field_rejected(
+                        server, "/api/v1/query_range", params, "unsupported-downsampling-v2-range"))
             finally:
                 server.stop()
         summary["status"] = "passed"

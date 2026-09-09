@@ -10,12 +10,13 @@ import time
 
 sys.dont_write_bytecode = True
 
-from downsampling_compare import (DUPLICATE_METRIC, FIELDS, METRIC, RESOLUTIONS, Server,
-                                  aggregate, assert_samples, binary_manifest, fixture, write_json)
+from downsampling_compare import (CONTROL_METRIC, FIELDS, METRIC, RESOLUTIONS, Server,
+                                  aggregate, assert_samples, binary_manifest, fixture, range_expected, write_json)
 
 
 TENANTS = ("11:17", "11:18", "12:17")
 TRANSFORMS = ((1, 100), (2, 1000), (-3, -1000))
+METRICS = (METRIC, CONTROL_METRIC)
 
 
 def verify(stage, servers, inputs, base, summary, output):
@@ -26,7 +27,7 @@ def verify(stage, servers, inputs, base, summary, output):
         expected = sum(len(rows) for rows in inputs.values())
         if server.downsampling:
             expected = sum(len(aggregate(rows, metric, resolution)) * len(FIELDS)
-                           for rows in inputs.values() for metric in (METRIC, DUPLICATE_METRIC)
+                           for rows in inputs.values() for metric in METRICS
                            for resolution in RESOLUTIONS.values())
         assert actual == expected, (stage, server.name, "全租户物理行数", actual, expected)
         summary["checks"].append({"check": stage + ":" + server.name + ":physical-rows", "rows": actual})
@@ -35,26 +36,27 @@ def verify(stage, servers, inputs, base, summary, output):
             server.cluster.tenant = tenant
         prefix = stage + "-tenant-" + tenant.replace(":", "-")
         original = servers[0]
-        raw = original.query(prefix, METRIC, base, end)
-        expected_raw = sorted((row["timestamp"], row["value"]) for row in inputs[tenant] if row["metric"] == METRIC)
-        summary["checks"].append(assert_samples(raw, expected_raw, prefix + ":original:raw"))
-        original.query(prefix, DUPLICATE_METRIC, base, end)
-        reference = [{"metric": METRIC, "timestamp": timestamp, "value": value} for timestamp, value in raw]
-        for resolution, milliseconds in RESOLUTIONS.items():
-            expected = aggregate(reference, METRIC, milliseconds)
-            actual = original.query(prefix, METRIC, base + milliseconds - 1, end, resolution, range_query=True)
-            summary["checks"].append(assert_samples(actual, [(row["timestamp"], row["last"]) for row in expected],
-                                                     prefix + ":original:" + resolution + ":bare-range"))
-            for metric in (METRIC, DUPLICATE_METRIC):
-                expected = aggregate(reference if metric == METRIC else inputs[tenant], metric, milliseconds)
+        for metric in METRICS:
+            raw = original.query(prefix, metric, base, end)
+            expected_raw = sorted((row["timestamp"], row["value"]) for row in inputs[tenant] if row["metric"] == metric)
+            summary["checks"].append(assert_samples(raw, expected_raw, prefix + ":original:" + metric + ":raw", exact=True))
+            reference = [{"metric": metric, "timestamp": timestamp, "value": value} for timestamp, value in raw]
+            for resolution, milliseconds in RESOLUTIONS.items():
+                start = base + milliseconds - 1
+                actual = original.query(prefix, metric, start, end, resolution, range_query=True)
+                wanted_range = range_expected(raw, start, end, milliseconds)
+                summary["checks"].append(assert_samples(actual, wanted_range,
+                                                         prefix + ":original:" + metric + ":" + resolution + ":bare-range"))
+                expected = aggregate(reference, metric, milliseconds)
                 write_json(servers[1].root / (prefix + "-" + metric + "-" + resolution + "-expected.json"), expected)
                 for field in FIELDS:
                     actual = servers[1].query(prefix, metric, base, end, resolution, field)
                     wanted = [(row["timestamp"], row[field]) for row in expected]
                     summary["checks"].append(assert_samples(actual, wanted, prefix + ":" + metric + ":" + resolution + ":" + field))
-                    if metric == METRIC:
-                        actual = servers[1].query(prefix, metric, base + milliseconds - 1, end, resolution, field, True)
-                        summary["checks"].append(assert_samples(actual, wanted, prefix + ":" + resolution + ":" + field + ":bare-range"))
+                    actual = servers[1].query(prefix, metric, start, end, resolution, field, True)
+                    wanted_range = range_expected(wanted, start, end, milliseconds)
+                    summary["checks"].append(assert_samples(actual, wanted_range,
+                                                             prefix + ":" + metric + ":" + resolution + ":" + field + ":bare-range"))
         write_json(output / "summary.json", summary)
     # 未写入的租户必须为空，不能透出其它租户的相同指标。
     for server in servers:
@@ -85,7 +87,8 @@ def main():
     phases = {}
     for tenant, (multiplier, offset) in zip(TENANTS, TRANSFORMS):
         phases[tenant] = [[{**row, "value": row["value"] * multiplier + offset} for row in batch] for batch in fixture(base)]
-    write_json(args.output / "fixture.json", {"base_ms": base, "tenants": phases})
+    write_json(args.output / "fixture.json", {"base_ms": base, "timestamp_step_ms": [14000, 15000, 16000],
+                                              "tenants": phases})
     summary = {"status": "running", "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                "topology": "真实集群 1 vminsert + 1 vmstorage + 1 vmselect，replicationFactor=1",
                "tenants": list(TENANTS), "absent_tenant": "999:999", "checks": [], "stages": [], "binaries": {}}
@@ -110,11 +113,20 @@ def main():
             verify(stage, servers, inputs, base, summary, args.output)
         for server in servers:
             server.force_merge("rewrite")
+            previous = json.loads((server.root / "phase3-parts.json").read_text())
+            current = json.loads((server.root / "rewrite-parts.json").read_text())
+            assert {part["path"] for part in previous}.isdisjoint(part["path"] for part in current), \
+                (server.name, "强制重写未产生新的 part 代次")
+            summary["checks"].append({"check": server.name + ":rewrite-part-generation"})
         verify("rewrite", servers, inputs, base, summary, args.output)
         for server in servers:
             server.stop()
             server.start()
-            server.part_metadata("restart")
+            current = server.part_metadata("restart")
+            previous = json.loads((server.root / "rewrite-parts.json").read_text())
+            assert {part["path"] for part in current} == {part["path"] for part in previous}, \
+                (server.name, "重启改变已完成发布的 part 代次")
+            summary["checks"].append({"check": server.name + ":restart-part-generation"})
         verify("restart", servers, inputs, base, summary, args.output)
         summary["status"] = "passed"
     except Exception as error:

@@ -2,72 +2,99 @@
 
 ## 范围与判定
 
-基线为原版 `v1.151.0-cluster`，候选为当前分支。降采样存储和字段查询版本均为 2。每侧运行真实的一个 vminsert、一个 vmstorage 和一个 vmselect，replicationFactor=1，全部绑定 loopback，使用独立目录。
+基线为 `v1.151.0-cluster`（`e7a3dc606a1d804cb3101fa73eb30cb0946ab2a9`），候选生产源码为 `experimental/downsampling` 的 `069bf4ce8`；Python 脚本使用本轮修订后的工作区。降采样存储与字段查询版本均为 2。
 
-验证 raw 写入 → 降采样落盘 → 持续归并 → 字段读取与重启。独立参考按原版查询结果或明确的写入贡献分桶计算五特征；标签、序列集合、点数和时间戳严格相同，数值容差为相对 `1e-10`、绝对 `1e-9`。
+每侧运行真实的一个 vminsert、一个 vmstorage 和一个 vmselect，replicationFactor=1，绑定 loopback，使用独立目录。vmstorage 与 vmselect 均设置 dedup interval 为零。脚本默认使用 cluster 模式；保留的 single 模式不属于本轮验证范围。
 
-## Go 测试
+主数值场景的原始输入仅使用有限浮点数，每条时间线在活跃区段内按 14、15、16 秒循环采样，时间戳唯一。本轮不验证同时间戳覆盖。先严格比较基线 raw 查询与实际输入，再独立计算 `5m/1h × last/sum/count/min/max` 的期望值；标签、序列集合、点数和时间戳必须相同，特征值容差为相对 `1e-10`、绝对 `1e-9`。
 
-| 层次 | 验证内容 |
+## 参考计算与查询语义
+
+- 以 `timestamp // resolution` 分组，区间左闭右开。共享时间戳取区间内最大时间戳，last 取该样本的值；sum 使用 `math.fsum`，count 为原始样本数的浮点表示，min/max 为区间极值。空区间不产生摘要。
+- `query.field` 使用 `5m:last`、`1h:count` 等十种组合，经 vmselect 的 tenant 查询路径传入。期望值不调用生产 accumulator 或 reader。
+- `/api/v1/query` 使用 `metric[窗口]` 读取实际点，按共享时间戳比较。查询窗口左端不包含，为验证 `[start,end]`，窗口长度取 `end-start+1ms`。时间裁剪只判断共享时间戳，不重新计算部分格子的特征。
+- `/api/v1/query_range` 使用裸 selector，`step=max_lookback=resolution`。每个求值时刻 `t` 选择 `(t-step,t]` 内的末点，响应时间戳为 `t`；空窗口不返回点。不能用摘要共享时间戳代替求值时间戳。
+- 旧短周期脚本混淆了上述两类时间戳，且输入恰好位于求值网格而掩盖错误。本轮已修正，并用不对齐网格的输入及手算 UT 验证。
+
+实际查询的固定手算样例，时间戳为相对输入起点的偏移：
+
+| 区间 | 共享时间戳（ms） | last | sum | count | min | max |
+|---|---:|---:|---:|---:|---:|---:|
+| 首个 5m | 299000 | -3.5 | -99.75 | 21 | -6 | -3.5 |
+| 第二个 5m | 599000 | -1 | -43.75 | 20 | -3.375 | -1 |
+| 第三个 5m | 884000 | 1.375 | 4.75 | 19 | -0.875 | 1.375 |
+| 首个 1h | 3584000 | -0.375 | -146.625 | 240 | -6 | 6 |
+
+这四组共 20 个字段值已直接与重启后的 HTTP 响应比较，通过；未使用聚合函数生成这些固定期望值。
+
+## 脚本与场景
+
+| 文件（位于 lib/storage/testdata） | 验证内容 |
 |---|---|
-| 数学计算 | raw/摘要、多轮归并、同时间戳贡献、NaN/Inf、边界与独立随机参考 |
-| Block 与文件 | 原生 Block 编解码、独立 99/112 字节解析、五列顺序、共享时间戳、offset/size、metadata 及损坏拒绝 |
-| 存储生命周期 | inmemory 保持 raw，dump/flush/merge/关闭/snapshot 输出摘要；失败、空间不足及发布清理 |
-| 遍历与 tenant | 同 TSID 跨 Block/index、跨 TSID 与 AccountID/ProjectID、过滤、缺失序列及对象复用 |
-| RPC | 十字段、tenant 保留、原生请求兼容、无效负载、服务端分派、原生 MetricBlock 响应及节点错误传播 |
+| `downsampling_e2e.sh` | 串行执行完整构建与验证流程；统一证据、错误退出及子进程清理 |
+| `downsampling_cluster.py` | 三组件启动、tenant 路由、写入计数、进程存活及退出清理；HTTP import 成功后仍等待 vmstorage 接收全部样本 |
+| `downsampling_compare.py` | 两条时间线、三小时、1440 个样本；按第一小时、第三小时、第二小时分批倒序写入，逐轮归并，再重写、重启；全部十字段均比较 matrix 与 query_range |
+| `downsampling_cluster_tenants.py` | 同一 vmstorage 上的 `11:17`、`11:18`、`12:17` 三个 tenant，共六条时间线、4320 个样本；同名指标使用不同值，验证字段隔离及空租户；检查重写与重启的 part 代次 |
+| `downsampling_multiseries_compare.py` | 160 条时间线、93 天、2381868 个样本；4 条持续采样，其余包含按日、间断、提前结束和延后开始场景，活跃片段内仍按 14～16 秒采样；跨月、标签筛选、空结果、裁剪窗口、多线裸查询及重启 |
+| `downsampling_cluster_compatibility.py` | 两个混部方向的原生 matrix/range 查询，以及新 vmselect 对旧 vmstorage 的字段请求明确失败；失败响应必须包含字段 RPC 标识，且本次请求新增的 vmstorage 日志须明确记录 unsupported rpcName；普通连接错误不能通过 |
+| `downsampling_inspect.py` | 独立解析集群 32 字节 TSID、99 字节字段 header、112 字节 metaindex，核验版本、五列顺序、共享时间戳描述、offset/size、完整字节覆盖及物理统计 |
 
-在仓库根目录执行；同一 checkout 的完整 storage 测试串行运行：
+长周期按周写入和归并，每日预留 45 秒内的样本在最后补写。补写与主批次的时间戳集合互斥，用于验证同格子内 raw 与已有摘要的持续归并，特别是 sum/count 的贡献累计。93 天表示输入历史跨度，不表示测试持续运行 93 天。
 
-```sh
-go test ./lib/storage ./lib/encoding ./lib/decimal ./lib/vmselectapi ./app/vmstorage ./app/vmselect/netstorage ./app/vmselect/prometheus ./app/vmselect/promql ./app/vminsert ./app/vmselect -count=1
-go test -race ./lib/storage -count=1
-go test -race ./app/vmselect/netstorage ./lib/vmselectapi -run '^TestDownsample' -count=1
-go vet ./lib/storage ./lib/vmselectapi ./app/vmstorage ./app/vminsert ./app/vmselect ./app/vmselect/netstorage ./app/vmselect/prometheus ./app/vmselect/promql
-```
+每次验证前调用 force_flush/force_merge，等待本次异步 merge 完成及 metrics 缓存过期，并确认无 inmemory 行、无活动 merge、每个非空月份只有一个 file part。测试保存实际请求、响应、期望值、输入和活动 part metadata。
 
-## Python 集群对照
+## UT 与复现方法
 
-分别在隔离基线源码目录和当前源码目录构建三个组件，保存 commit、源码和 binary SHA256；候选生产代码变化后必须重建。每组 binary 目录包含 vminsert、vmstorage、vmselect：
+Python UT 使用手算结果验证五特征、格子边界、共享时间戳、求值网格、空窗口、count 累加及输入性质；另验证集群路由、写入计数、错误处理和资源清理。在候选源码目录执行：
 
 ```sh
-go build -o /tmp/vm-downsampling-version2-20260908/candidate/ ./app/vminsert ./app/vmstorage ./app/vmselect
+python3 -B -W error::ResourceWarning -m unittest discover -s lib/storage/testdata -p 'test_downsampling_*.py' -v
+go test -p 4 ./lib/storage ./lib/vmselectapi ./app/vmstorage ./app/vmselect/netstorage ./app/vmselect/prometheus -run 'Test(Downsample|Downsampling|CheckDownsampling|MustOpenStorageDownsampling)' -count=1
 ```
 
-测试步骤：
-
-1. 经 vminsert 的 `/insert/<account:project>/prometheus/api/v1/import` 写入相同输入；等待 vmstorage 实际接收全部行。
-2. 调用 vmstorage 的 force_flush/force_merge，等待本次异步请求完成及 metrics 缓存过期；确认无 inmemory 行、无活动 merge，每个非空月各一个 file part。
-3. 通过 vmselect 的 `/select/<account:project>/prometheus/api/v1/query` 与 query_range 比较全部十种 query.field；使用裸 selector，避免以 PromQL 聚合替代存储计算。
-4. 覆盖分批写入、迟到输入、摘要重写及重启；严格验证重写改变 part 代次、重启保持已完成发布的代次。两个进程均设置 dedup interval 为零。
-5. 独立解析实际文件，核对版本 2、完整 tenant、五列字节覆盖、共享时间戳及统计；如实记录实际命中的 index 边界。
-
-以下命令的 output 必须为不存在的新目录；复现时替换该目录名：
+在候选源码根目录执行一键入口；从其他目录使用脚本的绝对路径调用，入口按自身路径定位源码：
 
 ```sh
-python3 lib/storage/testdata/downsampling_compare.py --mode cluster --tenant 11:17 --original /tmp/vm-downsampling-version2-20260908/original --candidate /tmp/vm-downsampling-version2-20260908/candidate --output /tmp/vm-downsampling-version2-20260908/reproduce-3h
-python3 lib/storage/testdata/downsampling_cluster_tenants.py --original /tmp/vm-downsampling-version2-20260908/original --candidate /tmp/vm-downsampling-version2-20260908/candidate --output /tmp/vm-downsampling-version2-20260908/reproduce-tenants
-python3 lib/storage/testdata/downsampling_multiseries_compare.py --mode cluster --tenant 11:17 --days 93 --series 160 --dense-series 4 --original /tmp/vm-downsampling-version2-20260908/original --candidate /tmp/vm-downsampling-version2-20260908/candidate --output /tmp/vm-downsampling-version2-20260908/reproduce-multiseries
-python3 lib/storage/testdata/downsampling_cluster_compatibility.py --original /tmp/vm-downsampling-version2-20260908/original --candidate /tmp/vm-downsampling-version2-20260908/candidate --output /tmp/vm-downsampling-version2-20260908/reproduce-compatibility
+./lib/storage/testdata/downsampling_e2e.sh
 ```
 
-文件检查使用 `downsampling_inspect.py`，指定 `--data-dir`、`--output`、`--expected-series`，并用重复的 `--expected-tenant` 校验精确租户集合。检查器按固定偏移解析，仅依赖系统 libzstd 解压，不使用生产 decoder。
+默认创建全新的系统临时目录。指定保存位置时，目录必须尚不存在：
 
-## 当前结果
+```sh
+./lib/storage/testdata/downsampling_e2e.sh --output /tmp/vm-downsampling-result
+```
 
-证据目录：`/tmp/vm-downsampling-version2-20260908`。以下结果来自当前代码重新构建的候选与全新测试数据。
+依赖 bash、Python 3、满足 go.mod 要求的 Go、Git、系统 libzstd，以及本地 `v1.151.0-cluster` tag。入口自动创建基准 detached worktree，构建两套三组件，运行 Python UT、Go 定向 UT、四组 E2E 和三组文件检查。长周期固定使用 93 天、160 条时间线、4 条持续采样线。所有阶段串行运行，关闭 Python 优化模式，保证测试断言执行。
+
+每个阶段的命令、日志、退出码和结果写入输出目录；`manifest.json` 保存源码 commit、工作区状态、脚本和 binary SHA256 及总结果，`test-sources/` 保存测试脚本副本，Python 测试与文件检查实际从该副本执行。失败立即停止，返回非零退出码；中断或失败时清理本次阶段的子进程，结束时移除本次基准 worktree，保留二进制、数据和证据。
+
+检查器的 `--data-dir` 指向直接包含 small/big 的目录。短周期、租户场景的预期 TSID 数量分别为 2、6；租户检查需重复传入三个 `--expected-tenant`，匹配精确集合。系统须提供 libzstd，检查器仅用它解压。
+
+## 本轮结果与证据
+
+完整一键运行证据：`/private/tmp/vm-downsampling-oneclick-final-20260909`，12 个阶段全部通过。两套组件由入口重新构建，使用全新数据目录；验证时使用 `/private/tmp/vm-downsampling-e2e-review-20260909/source`；测试入口现维护在 `experimental/downsampling` 分支的 `lib/storage/testdata/`。
 
 | 项目 | 结果 |
 |---|---|
-| Go 普通回归、RPC 定向 race、vet | 通过 |
-| 3 小时对照 | 175 项通过 |
-| 同一 vmstorage 三 tenant 隔离 | 560 项通过 |
-| 160 条时间线、93 天对照 | 562 项通过 |
-| 原版组件兼容性 | 3 项通过 |
-| 独立文件检查 | 通过 |
-| 完整 storage race | 通过（182.881s） |
+| Python UT | 23 项通过，启用 ResourceWarning 错误检查 |
+| Go 降采样定向 UT | 通过；app/vmstorage 完成编译，无匹配测试用例 |
+| 三小时集群对照 | 240 项通过 |
+| 三租户集群对照 | 759 项通过 |
+| 160 条时间线、93 天集群对照 | 562 项通过 |
+| 原版组件兼容性 | 6 项通过 |
+| 三组独立文件检查、实际输入间隔检查 | 通过 |
+| 固定手算值对照实际响应 | 20 个字段值通过 |
 
-集群对照共 1300 项，数值比较的最大绝对误差为 0。构建、Python 测试命令和结果、源码及 binary 哈希见 `manifest.json`；Go 验证与代码、文档检查见 `review.json`。
+集群对照共 **1567 项**，所有数值比较的最大绝对误差为 **0**。长周期最终包含 160 个 TSID、4 个月份的 part、5660 个 Block、694200 个物理行和 12 个 index。
 
-长跨度产物包含 160 个 TSID、4 个 part、6050 个 Block、694200 个物理行、14 个 index。实际文件命中同 TSID 跨 Block、不同 TSID 跨 index；同 TSID 跨相邻 index 由定向 UT 覆盖，本次 E2E 未自然命中。
+一键输出中的 `manifest.json` 保存源码 commit、binary 与脚本 SHA256、命令和结果索引；各场景的 `summary.json` 保存逐项检查，`inspection.json` 保存物理文件及遍历覆盖证据；`compatibility` 保存本次请求对应的 vmstorage 错误日志摘录。独立输入复核及手算响应证据另保存在 `/private/tmp/vm-downsampling-e2e-review-20260909/input-validation.json` 和该目录下的 `short/golden-values.json`。
 
-覆盖范围为存储与字段测试接口。93 天表示输入的历史跨度，不表示持续运行 93 天；本轮不验证多 vmstorage 副本、故障切换或跨未合并 part 的查询侧再聚合。
+一键入口还使用假 Go 命令验证故障处理：构建失败并遗留持有 stdout 的后代、SIGINT、SIGTERM。三个场景分别返回 1、130、143，状态分别为 failed、interrupted、interrupted；均清除阶段子进程与本次基准 worktree。验证命令为 `python3 -B -E /private/tmp/vm-downsampling-oneclick-harness-checks-20260909/check_runner.py --run`，结果见同目录的 `summary.json`。该验证独立于数值 E2E。
+
+## 覆盖边界
+
+- 文件检查验证索引和负载引用结构，不解码 timestamps/values 数值；数学正确性由实际十字段查询与独立参考的比较证明。
+- E2E 实际命中同 TSID 跨 Block、不同 TSID 跨 index、多个月份；同 TSID 跨相邻 index 未自然命中，由本轮运行的 `TestDownsampleIterationMultiTSID` 等定向 UT 覆盖。
+- 本轮在完整归并后验证字段查询，不证明跨未归并 part 的查询侧再聚合、raw/摘要混合查询或多 vmstorage 副本与故障切换。
+- Python 数值参考限于有限值；NaN/Inf 使用现有 Go 特殊值 UT 验证，不能由本轮有限值 E2E 推断。
+- 本轮修改测试脚本与文档，未修改生产 Go。完整 storage race 和全仓库回归不属于本轮已运行结果。

@@ -2,7 +2,6 @@
 """验证多时间线、多个 month partition 与长历史时间跨度的降采样查询。"""
 
 import argparse
-import bisect
 import calendar
 import datetime
 import functools
@@ -17,7 +16,8 @@ import urllib.request
 
 sys.dont_write_bytecode = True
 
-from downsampling_compare import FIELDS, RESOLUTIONS, Server, binary_manifest, metric_value, request, write_json
+from downsampling_compare import (FIELDS, INPUT_STEPS_MS, RESOLUTIONS, Server, binary_manifest,
+                                  metric_value, range_expected, request, sample_timestamps, write_json)
 
 
 DAY = 86_400_000
@@ -152,6 +152,7 @@ def active_day(pattern, day, days):
 
 
 def rows_for_series(index, labels, base, start_day, end_day, days, late=False):
+    """活跃区段按 14、15、16 秒循环采样；每日预留一段样本供历史追加。"""
     rows = []
     dense = labels["pattern"] == "dense"
     for day in range(start_day, end_day):
@@ -159,21 +160,19 @@ def rows_for_series(index, labels, base, start_day, end_day, days, late=False):
             continue
         day_start = base + day * DAY
         if dense:
-            buckets = [(day * 13) % 288] if late else range(288)
-            for bucket in buckets:
-                bucket_start = day_start + bucket * 300_000
-                value = index * 2 + (day % 11) * 0.5 + (bucket % 13) * 0.125
-                if late:
-                    rows.append((bucket_start + 299_997, -value - 0.25))
-                else:
-                    rows.extend(((bucket_start + 299_998, value), (bucket_start + 299_999, value + 0.375)))
+            start, end = day_start, day_start + DAY
+            deferred_start = day_start + ((day * 13) % 288) * 300_000 + 90_000
         else:
-            bucket_start = day_start + ((index * 7) % 24) * 3_600_000 + (index % 12) * 300_000
-            value = index * 0.25 - (day % 19) * 0.125
-            if late:
-                rows.append((bucket_start + 180_000, -value - 0.5))
-            else:
-                rows.extend(((bucket_start + 60_000, value), (bucket_start + 240_000, value - 0.625)))
+            start = day_start + ((index * 7) % 24) * 3_600_000 + (index % 12) * 300_000
+            end = start + 300_000
+            deferred_start = start + 90_000
+        for ordinal, timestamp in enumerate(sample_timestamps(start, end)):
+            deferred = deferred_start <= timestamp < deferred_start + 45_000
+            if deferred != late:
+                continue
+            # 数值包含时间线标识，并有正负波动；两个环境始终写入同一份输入。
+            value = index * 2 + (day % 11) * 0.5 + (ordinal % 31 - 15) * 0.125
+            rows.append((timestamp, value))
     return rows
 
 
@@ -231,7 +230,7 @@ def filter_points(data, start, end, selected=None, field=None):
     return result
 
 
-def assert_maps(actual, expected, description, expected_path):
+def assert_maps(actual, expected, description, expected_path, exact=False):
     save_compact(expected_path, [{"metric": dict(labels), "values": points} for labels, points in sorted(expected.items())])
     assert set(actual) == set(expected), (description, "series 集合不一致", "missing", list(set(expected) - set(actual))[:5],
                                           "unexpected", list(set(actual) - set(expected))[:5])
@@ -242,7 +241,8 @@ def assert_maps(actual, expected, description, expected_path):
         assert len(got) == len(want), (description, labels, "样本数量", len(got), len(want))
         for index, (a, e) in enumerate(zip(got, want)):
             assert a[0] == e[0], (description, labels, index, "时间戳", a, e)
-            assert math.isclose(a[1], e[1], rel_tol=1e-10, abs_tol=1e-9), (description, labels, index, "数值", a, e)
+            matches = a[1] == e[1] if exact else math.isclose(a[1], e[1], rel_tol=1e-10, abs_tol=1e-9)
+            assert matches, (description, labels, index, "数值", a, e)
             max_error = max(max_error, abs(a[1] - e[1]))
         rows += len(got)
     return {"check": description, "series": len(actual), "rows": rows, "max_absolute_error": max_error}
@@ -252,16 +252,6 @@ def next_month(timestamp):
     date = datetime.datetime.fromtimestamp(timestamp / 1000, datetime.timezone.utc)
     year, month = date.year + (date.month == 12), date.month % 12 + 1
     return calendar.timegm((year, month, 1, 0, 0, 0)) * 1000
-
-
-def range_expected(points, start, end, step):
-    result = []
-    timestamps = [timestamp for timestamp, _ in points]
-    for timestamp in range(start, end + 1, step):
-        index = bisect.bisect_right(timestamps, timestamp) - 1
-        if index >= 0 and points[index][0] > timestamp - step:
-            result.append((timestamp, points[index][1]))
-    return result
 
 
 @functools.lru_cache(maxsize=256)
@@ -294,10 +284,12 @@ def verify_stage(stage, servers, inputs, base, active_days, root, summary):
     end = base + active_days * DAY - 1
     for points in inputs.values():
         points.sort()
+        assert all(points[index][0] > points[index - 1][0] for index in range(1, len(points))), "输入时间戳必须唯一"
     expected_raw = filter_points(inputs, base, end)
     baseline, name = servers[0].query_many(stage, "full", METRIC, base, end)
-    summary["checks"].append(assert_maps(baseline, expected_raw, "original:" + name, servers[0].root / (name + "-expected.json")))
-    aggregate = {resolution: aggregate_map(baseline, duration) for resolution, duration in RESOLUTIONS.items()}
+    summary["checks"].append(assert_maps(baseline, expected_raw, "original:" + name, servers[0].root / (name + "-expected.json"), exact=True))
+    # 原版响应已与输入逐点核对；特征期望仍直接从输入计算，避免共同遗漏。
+    aggregate = {resolution: aggregate_map(expected_raw, duration) for resolution, duration in RESOLUTIONS.items()}
     # metadata 按物理单值 Block 行计数；分辨率之间不能重复读取相同贡献。
     physical_counts = {}
     for server in servers:
@@ -398,14 +390,14 @@ def verify_stage(stage, servers, inputs, base, active_days, root, summary):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--original", type=pathlib.Path, required=True)
+    parser.add_argument("--original", type=pathlib.Path, required=True, help="开源 v1.151.0-cluster 组件目录；single 模式为 binary")
     parser.add_argument("--candidate", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--days", type=int, default=93)
     parser.add_argument("--series", type=int, default=160)
     parser.add_argument("--dense-series", type=int, default=4)
     parser.add_argument("--base-ms", type=int)
-    parser.add_argument("--mode", choices=("single", "cluster"), default="single")
+    parser.add_argument("--mode", choices=("single", "cluster"), default="cluster")
     parser.add_argument("--tenant", default="0:0")
     args = parser.parse_args()
     assert args.days >= 3 and args.series >= 8 and 1 <= args.dense_series <= args.series
@@ -416,9 +408,14 @@ def main():
     inputs = {labels_key(metric_labels): [] for metric_labels in labels}
     write_json(args.output / "fixture-config.json", {"base_ms": base, "days": args.days, "series": args.series,
                                                      "dense_series": args.dense_series, "labels": labels,
+                                                     "input_steps_ms": INPUT_STEPS_MS,
+                                                     "unique_timestamps_per_series": True,
+                                                     "sparse_active_window_ms": 300_000,
+                                                     "late_input": "每日预留45秒区段最后追加，主批次与追加批次不重叠",
                                                      "meaning": "模拟历史数据跨度，不是连续运行指定天数"})
     summary = {"status": "running", "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                "base_ms": base, "days": args.days, "series": args.series, "dense_series": args.dense_series, "mode": args.mode, "tenant": args.tenant,
+               "input_steps_ms": INPUT_STEPS_MS, "unique_timestamps_per_series": True,
                "checks": [], "stages": [], "batches": [], "binaries": {},
                "tolerance": {"relative": 1e-10, "absolute": 1e-9},
                "scope": "模拟历史跨度；每周写入及归并，三阶段递增区间、整个历史迟到追加、summary rewrite、正常重启"}

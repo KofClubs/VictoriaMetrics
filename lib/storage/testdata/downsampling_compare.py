@@ -2,6 +2,7 @@
 """使用独立数据目录，对照原始存储与降采样存储的 HTTP 查询结果。"""
 
 import argparse
+import bisect
 import datetime
 import hashlib
 import json
@@ -22,7 +23,8 @@ sys.dont_write_bytecode = True
 RESOLUTIONS = {"5m": 300_000, "1h": 3_600_000}
 FIELDS = ("last", "sum", "count", "min", "max")
 METRIC = "downsampling_compare_value"
-DUPLICATE_METRIC = "downsampling_compare_duplicate"
+CONTROL_METRIC = "downsampling_compare_control"
+INPUT_STEPS_MS = (14_000, 15_000, 16_000)
 
 
 def write_json(path, value):
@@ -164,7 +166,7 @@ class Server:
 
     def ingest(self, samples):
         lines = []
-        for metric in (METRIC, DUPLICATE_METRIC):
+        for metric in sorted({row["metric"] for row in samples}):
             selected = [row for row in samples if row["metric"] == metric]
             lines.append(json.dumps({
                 "metric": {"__name__": metric},
@@ -245,21 +247,41 @@ class Server:
 
 
 def fixture(base):
-    phases = []
-    for phase, offsets in enumerate(((0, 60_000, 299_999), (1, 120_000), (180_000, 240_000))):
-        samples = []
-        for bucket in range(36):
-            for position, offset in enumerate(offsets):
-                samples.append({"metric": METRIC, "timestamp": base + bucket * 300_000 + offset,
-                                "value": (bucket - 17) * 1.25 + phase * 0.5 + position * 0.125})
-        for bucket in (0, 11, 12, 23, 24, 35):
-            values = ((-8.0, 7.0), (12.0, -100.0), (3.0, 12.0))[phase]
-            for value in values:
-                samples.append({"metric": DUPLICATE_METRIC,
-                                "timestamp": base + bucket * 300_000 + 299_999, "value": value})
-        # 倒序写入，覆盖非时间顺序输入与历史数据追加。
-        phases.append(list(reversed(samples)))
+    """两条完整时间线按 14、15、16 秒循环采样，中间一小时最后追加。"""
+    phases = [[], [], []]
+    for metric_index, metric in enumerate((METRIC, CONTROL_METRIC)):
+        for ordinal, timestamp in enumerate(sample_timestamps(base, base + 3 * 3_600_000)):
+            hour = (timestamp - base) // 3_600_000
+            phase = (0, 2, 1)[hour]
+            value = (ordinal % 97 - 48) * 0.125 + metric_index * 100.25
+            phases[phase].append({"metric": metric, "timestamp": timestamp, "value": value})
+    for samples in phases:
+        # 倒序导入不会增加样本；三批的时间戳集合严格互斥。
+        samples.reverse()
     return phases
+
+
+def sample_timestamps(start, end):
+    """生成左闭右开区间内的采样时间戳，不依赖查询网格或降采样结果。"""
+    timestamp = start
+    ordinal = 0
+    while timestamp < end:
+        yield timestamp
+        timestamp += INPUT_STEPS_MS[ordinal % len(INPUT_STEPS_MS)]
+        ordinal += 1
+
+
+def range_expected(points, start, end, step):
+    """在求值网格上返回 (t-step, t] 内的末点；空窗口不返回样本。"""
+    assert step > 0, "query_range step 必须大于零"
+    assert all(points[index][0] > points[index - 1][0] for index in range(1, len(points))), "参考输入必须按时间严格递增"
+    timestamps = [timestamp for timestamp, _ in points]
+    result = []
+    for timestamp in range(start, end + 1, step):
+        index = bisect.bisect_right(timestamps, timestamp) - 1
+        if index >= 0 and timestamps[index] > timestamp - step:
+            result.append((timestamp, points[index][1]))
+    return result
 
 
 def aggregate(samples, metric, resolution):
@@ -278,12 +300,13 @@ def aggregate(samples, metric, resolution):
     return result
 
 
-def assert_samples(actual, expected, description):
+def assert_samples(actual, expected, description, exact=False):
     assert len(actual) == len(expected), (description, "样本数", len(actual), len(expected))
     max_error = 0.0
     for got, want in zip(actual, expected):
         assert got[0] == want[0], (description, "时间戳", got, want)
-        assert math.isclose(got[1], want[1], rel_tol=1e-10, abs_tol=1e-9), (description, "数值", got, want)
+        matches = got[1] == want[1] if exact else math.isclose(got[1], want[1], rel_tol=1e-10, abs_tol=1e-9)
+        assert matches, (description, "数值", got, want)
         max_error = max(max_error, abs(got[1] - want[1]))
     return {"check": description, "rows": len(actual), "max_absolute_error": max_error}
 
@@ -298,54 +321,47 @@ def verify_stage(stage, servers, samples, base, summary):
         expected_rows = len(samples)
         if server.downsampling:
             expected_rows = sum(len(aggregate(samples, metric, resolution)) * len(FIELDS)
-                                for metric in (METRIC, DUPLICATE_METRIC)
+                                for metric in (METRIC, CONTROL_METRIC)
                                 for resolution in RESOLUTIONS.values())
         assert physical_rows == expected_rows, (stage, server.name, "metadata.RowsCount", physical_rows, expected_rows)
         summary["checks"].append({"check": stage + ":" + server.name + ":metadata-physical-rows",
                                   "rows": physical_rows})
-    expected_raw = sorted((row["timestamp"], row["value"]) for row in samples if row["metric"] == METRIC)
-    raw = original.query(stage, METRIC, base, end)
-    summary["checks"].append(assert_samples(raw, expected_raw, stage + ":original:raw-matrix"))
-    # 原版对重复时间戳的查询可能做 dedup；该响应保留为证据，不作为 count 和 sum 的输入。
-    original.query(stage, DUPLICATE_METRIC, base, end)
-    for resolution, milliseconds in RESOLUTIONS.items():
-        expected = aggregate(samples, METRIC, milliseconds)
-        start = base + milliseconds - 1
-        baseline = original.query(stage, METRIC, start, end, resolution, range_query=True)
-        summary["checks"].append(assert_samples(
-            baseline, [(row["timestamp"], row["last"]) for row in expected],
-            stage + ":original:" + resolution + ":bare-range"))
-    if len(servers) == 1:
-        print(stage + ": 原始查询与写入样本一致", flush=True)
-        return
-    candidate = servers[1]
-    # 核心序列的参考值也从原版裸查询返回值独立聚合，避免仅验证本脚本的写入预期。
-    baseline_samples = [{"metric": METRIC, "timestamp": timestamp, "value": value} for timestamp, value in raw]
-    for metric in (METRIC, DUPLICATE_METRIC):
-        reference = baseline_samples if metric == METRIC else samples
+    for metric in (METRIC, CONTROL_METRIC):
+        expected_raw = sorted((row["timestamp"], row["value"]) for row in samples if row["metric"] == metric)
+        assert len({timestamp for timestamp, _ in expected_raw}) == len(expected_raw), "输入时间戳必须唯一"
+        raw = original.query(stage, metric, base, end)
+        summary["checks"].append(assert_samples(raw, expected_raw, stage + ":original:" + metric + ":raw-matrix", exact=True))
+        # 先逐点验证原版 HTTP 原始结果，再直接以实际输入计算五特征参考值。
         for resolution, milliseconds in RESOLUTIONS.items():
-            expected = aggregate(reference, metric, milliseconds)
+            start = base + milliseconds - 1
+            baseline = original.query(stage, metric, start, end, resolution, range_query=True)
+            summary["checks"].append(assert_samples(
+                baseline, range_expected(expected_raw, start, end, milliseconds),
+                stage + ":original:" + metric + ":" + resolution + ":bare-range"))
+            if len(servers) == 1:
+                continue
+            candidate = servers[1]
+            expected = aggregate(samples, metric, milliseconds)
             write_json(candidate.root / (stage + "-" + metric + "-" + resolution + "-expected.json"), expected)
             for field in FIELDS:
                 actual = candidate.query(stage, metric, base, end, resolution, field)
                 want = [(row["timestamp"], row[field]) for row in expected]
                 summary["checks"].append(assert_samples(
                     actual, want, stage + ":candidate:" + metric + ":" + resolution + ":" + field + ":matrix"))
-                if metric == METRIC:
-                    actual_range = candidate.query(stage, metric, base + milliseconds - 1, end,
-                                                   resolution, field, range_query=True)
-                    summary["checks"].append(assert_samples(
-                        actual_range, want, stage + ":candidate:" + resolution + ":" + field + ":bare-range"))
+                actual_range = candidate.query(stage, metric, start, end, resolution, field, range_query=True)
+                summary["checks"].append(assert_samples(
+                    actual_range, range_expected(want, start, end, milliseconds),
+                    stage + ":candidate:" + metric + ":" + resolution + ":" + field + ":bare-range"))
     print(stage + ": 查询与独立参考聚合结果一致", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--original", type=pathlib.Path, required=True, help="开源 v1.151.0 binary")
+    parser.add_argument("--original", type=pathlib.Path, required=True, help="开源 v1.151.0-cluster 组件目录；single 模式为 binary")
     parser.add_argument("--candidate", type=pathlib.Path, help="当前分支 binary；省略时仅验证原版与 fixture")
     parser.add_argument("--output", type=pathlib.Path, required=True, help="不存在的新产物目录")
     parser.add_argument("--base-ms", type=int, help="按 1h 对齐且位于 retention 内的起始时间戳")
-    parser.add_argument("--mode", choices=("single", "cluster"), default="single",
+    parser.add_argument("--mode", choices=("single", "cluster"), default="cluster",
                         help="cluster 模式的 binary 参数必须为含三个集群组件的目录")
     parser.add_argument("--tenant", default="0:0", help="集群租户 account:project")
     args = parser.parse_args()
@@ -353,9 +369,11 @@ def main():
     base = args.base_ms if args.base_ms is not None else (int(time.time() * 1000) // 3_600_000 - 24) * 3_600_000
     assert base % 3_600_000 == 0, "base-ms 必须按 1h 对齐"
     phases = fixture(base)
-    write_json(args.output / "fixture.json", {"base_ms": base, "phases": phases})
+    write_json(args.output / "fixture.json", {"base_ms": base, "input_steps_ms": INPUT_STEPS_MS,
+                                             "unique_timestamps_per_series": True, "phases": phases})
     summary = {"status": "running", "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                "base_ms": base, "query_field_format": "5m:last", "mode": args.mode, "tenant": args.tenant, "checks": [], "stages": [],
+               "input_steps_ms": INPUT_STEPS_MS, "input_rows": sum(map(len, phases)),
                "tolerance": {"relative": 1e-10, "absolute": 1e-9}, "binaries": {},
                "scope": ("真实集群 1+1+1" if args.mode == "cluster" else "单节点") +
                         " HTTP 裸查询；36 个 5m 格子、3 个 1h 格子、三轮写入与归并、重复归并、正常重启"}
@@ -399,6 +417,7 @@ def main():
             server.stop()
         summary["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         summary["checks_count"] = len(summary["checks"])
+        summary["max_absolute_error"] = max((check.get("max_absolute_error", 0) for check in summary["checks"]), default=0)
         write_json(args.output / "summary.json", summary)
     print(json.dumps({"status": summary["status"], "checks": summary["checks_count"],
                       "output": str(args.output)}, ensure_ascii=False))
