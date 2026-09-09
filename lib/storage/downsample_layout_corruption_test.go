@@ -172,7 +172,7 @@ func writeDownsampleCrossIndexPart(t *testing.T) string {
 	}
 	for _, resolution := range []int64{300000, 3600000} {
 		for id := uint64(1); id <= 4; id++ {
-			b := &downsampleBatch{tsid: TSID{MetricID: id}, resolution: resolution, timestampPrecisionBits: 64, precisionBits: [5]uint8{64, 64, 64, 64, 64}}
+			b := &downsampleBatch{tsid: TSID{MetricID: id}, resolution: resolution, precisionBits: 64}
 			base := int64(minUnixMilli)
 			if id == 2 {
 				base += 50 * resolution

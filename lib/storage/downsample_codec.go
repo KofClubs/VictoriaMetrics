@@ -102,6 +102,10 @@ func (h *downsampleFieldHeader) unmarshal(src []byte) error {
 		return err
 	}
 	bh := &h.BlockHeader
+	// 保留现有磁盘字段，但时间戳和 values 必须共用原生 Block 的精度。
+	if h.TimestampPrecisionBits != bh.PrecisionBits {
+		return fmt.Errorf("单特征 block 时间戳与 values 精度不一致")
+	}
 	if bh.RowsCount > maxRowsPerBlock || bh.MinTimestamp > bh.MaxTimestamp || bh.MinTimestamp < minUnixMilli || bh.MaxTimestamp > maxUnixMilli {
 		return fmt.Errorf("单特征 block 行数或时间范围无效")
 	}

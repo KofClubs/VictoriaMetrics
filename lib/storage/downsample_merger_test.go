@@ -59,6 +59,144 @@ func TestDownsampleMergerRepeatedMerge(t *testing.T) {
 	other := []rawRow{{TSID: TSID{MetricID: 100}, Timestamp: base + 1, Value: -7, PrecisionBits: 64}}
 	fourth, _ := runDownsampleTestMerge(t, m, []*partWrapper{newDownsampleTestRawPart(t, other)}, nil, 0)
 	assertDownsampleTestRows(t, readDownsampleTestPart(t, fourth.p), referenceDownsampleTestRows(other, nil, 0))
+	// raw 提升、混合归并、纯摘要重写及 merger 复用均须保留默认共享精度64。
+	for _, stage := range []struct {
+		name string
+		p    *part
+	}{
+		{name: "raw", p: raw.p},
+		{name: "raw_to_summary", p: first.p},
+		{name: "mixed_to_summary", p: second.p},
+		{name: "summary_to_summary", p: third.p},
+		{name: "reused_merger", p: fourth.p},
+	} {
+		t.Run(stage.name, func(t *testing.T) {
+			assertDownsampleTestPrecision64(t, stage.p)
+		})
+	}
+}
+
+func assertDownsampleTestPrecision64(t *testing.T, p *part) {
+	t.Helper()
+	r := getDownsampleReader()
+	defer putDownsampleReader(r)
+	b := getDownsampleBatch()
+	defer putDownsampleBatch(b)
+	for _, resolution := range downsampleResolutions {
+		if err := r.Init(p, resolution); err != nil {
+			t.Fatal(err)
+		}
+		blocks := 0
+		for r.NextHeader() {
+			h := r.Header()
+			if h.raw {
+				if h.rawHeader.PrecisionBits != 64 {
+					t.Fatalf("raw block lost precision64: %d", h.rawHeader.PrecisionBits)
+				}
+			} else {
+				if h.Timestamps.PrecisionBits != 64 {
+					t.Fatalf("resolution %d lost timestamp precision64: %d", resolution, h.Timestamps.PrecisionBits)
+				}
+				for feature, column := range h.Columns {
+					if column.PrecisionBits != 64 {
+						t.Fatalf("resolution %d feature %d lost shared precision64: %d", resolution, feature, column.PrecisionBits)
+					}
+				}
+			}
+			if err := r.ReadBlock(b); err != nil {
+				t.Fatal(err)
+			}
+			if b.precisionBits != 64 {
+				t.Fatalf("resolution %d decoded batch lost precision64: %d", resolution, b.precisionBits)
+			}
+			blocks++
+		}
+		if err := r.Error(); err != nil {
+			t.Fatal(err)
+		}
+		if blocks == 0 {
+			t.Fatalf("resolution %d has no blocks to check", resolution)
+		}
+	}
+}
+
+func TestDownsampleMergerSourcePrecision(t *testing.T) {
+	const base int64 = 1704067200000
+	for _, tc := range []struct {
+		name       string
+		precisions []uint8
+		offset     int64
+		wantError  bool
+	}{
+		{name: "shared_low_precision", precisions: []uint8{8, 8}, offset: 1},
+		{name: "split_precision_blocks", precisions: []uint8{8, 64, 8}, offset: downsampleResolution1h},
+		{name: "reject_mixed_bucket", precisions: []uint8{8, 64}, offset: 1, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sources []*partWrapper
+			for i, precision := range tc.precisions {
+				sources = append(sources, newDownsampleTestRawPart(t, []rawRow{{
+					TSID: TSID{MetricID: 42}, Timestamp: base + int64(i)*tc.offset,
+					Value: float64(i + 1), PrecisionBits: precision,
+				}}))
+			}
+			m := getDownsampleMerger()
+			defer putDownsampleMerger(m)
+			if tc.wantError {
+				w := getDownsampleWriter()
+				defer putDownsampleWriter(w)
+				if err := w.Init(filepath.Join(t.TempDir(), "mixed"), -5); err != nil {
+					t.Fatal(err)
+				}
+				defer w.Abort()
+				if _, err := m.Merge(sources, w, nil, nil, 0, 2); err == nil {
+					t.Fatal("accepted different source precisions in the same bucket")
+				}
+				return
+			}
+			for round := 0; round < 2; round++ {
+				output, _ := runDownsampleTestMerge(t, m, sources, nil, 0)
+				r := getDownsampleReader()
+				defer putDownsampleReader(r)
+				for _, resolution := range downsampleResolutions {
+					if err := r.Init(output.p, resolution); err != nil {
+						t.Fatal(err)
+					}
+					blocks := 0
+					for r.NextHeader() {
+						var b downsampleBatch
+						if err := r.ReadBlock(&b); err != nil {
+							t.Fatal(err)
+						}
+						want := tc.precisions[0]
+						if tc.offset == downsampleResolution1h {
+							want = tc.precisions[(b.timestamps[0]-base)/tc.offset]
+						}
+						if b.precisionBits != want || r.Header().Timestamps.PrecisionBits != want {
+							t.Fatalf("round %d lost source precision %d: %+v", round, want, b)
+						}
+						for _, column := range r.Header().Columns {
+							if column.PrecisionBits != want {
+								t.Fatalf("column precision %d; want %d", column.PrecisionBits, want)
+							}
+						}
+						blocks++
+					}
+					if err := r.Error(); err != nil {
+						t.Fatal(err)
+					}
+					wantBlocks := 1
+					if tc.offset == downsampleResolution1h {
+						wantBlocks = len(tc.precisions)
+					}
+					if blocks != wantBlocks {
+						t.Fatalf("got %d blocks; want %d", blocks, wantBlocks)
+					}
+				}
+				sources = []*partWrapper{output}
+			}
+		})
+	}
 }
 
 func TestDownsampleMergerOverlappingBlocksAndWindows(t *testing.T) {
@@ -213,16 +351,14 @@ func TestDownsampleMergerCancellation(t *testing.T) {
 	assertDownsampleTestRows(t, readDownsampleTestPart(t, output.p), referenceDownsampleTestRows(rows, nil, 0))
 }
 
-func TestDownsampleMergerPrecisionAndColumnScales(t *testing.T) {
+func TestDownsampleMergerSharedPrecisionAndColumnScales(t *testing.T) {
 	const base int64 = 1704067200000
-	precisions := [2][5]uint8{{32, 16, 8, 40, 64}, {16, 32, 16, 8, 32}}
-	timestampPrecisions := [2]uint8{8, 32}
 	var sources []*partWrapper
 	var decoded []*downsampleBatch
-	for source := range precisions {
+	for source := 0; source < 2; source++ {
 		block := &downsampleBatch{
 			tsid: TSID{MetricID: 42}, resolution: downsampleResolution5m,
-			precisionBits: precisions[source], timestampPrecisionBits: timestampPrecisions[source],
+			precisionBits: 64,
 		}
 		for i := 0; i < 12; i++ {
 			block.timestamps = append(block.timestamps, base+int64(i)*downsampleResolution5m+10000+int64(i*i*137+source*10000))
@@ -266,12 +402,15 @@ func TestDownsampleMergerPrecisionAndColumnScales(t *testing.T) {
 			if err := r.Init(p, downsampleResolution5m); err != nil || !r.NextHeader() {
 				t.Fatalf("cannot read source header: %v", err)
 			}
+			if r.Header().Timestamps.PrecisionBits != 64 {
+				t.Fatal("source timestamps lost shared precision64")
+			}
 			scales := make(map[int16]bool)
 			for feature := range block.values {
 				_, scale := decimal.AppendFloatToDecimal(nil, block.values[feature])
 				column := r.Header().Columns[feature]
-				if column.Scale != scale || column.PrecisionBits != block.precisionBits[feature] {
-					t.Fatalf("source column %d lost scale or precision", feature)
+				if column.Scale != scale || column.PrecisionBits != block.precisionBits {
+					t.Fatalf("source column %d lost scale or shared precision64", feature)
 				}
 				scales[scale] = true
 			}
@@ -310,7 +449,7 @@ func TestDownsampleMergerPrecisionAndColumnScales(t *testing.T) {
 	sort.Slice(buckets, func(i, j int) bool { return buckets[i] < buckets[j] })
 	expected := &downsampleBatch{
 		tsid: TSID{MetricID: 42}, resolution: downsampleResolution5m,
-		precisionBits: [5]uint8{16, 16, 8, 8, 32}, timestampPrecisionBits: 8,
+		precisionBits: 64,
 	}
 	for _, bucket := range buckets {
 		point := points[bucket]
@@ -329,13 +468,33 @@ func TestDownsampleMergerPrecisionAndColumnScales(t *testing.T) {
 			if err := r.Init(output.p, downsampleResolution5m); err != nil || !r.NextHeader() {
 				t.Fatalf("cannot read output header: %v", err)
 			}
-			if r.Header().Timestamps.PrecisionBits != expected.timestampPrecisionBits {
-				t.Fatal("merged timestamp precision wasn't inherited from its sources")
-			}
-			for feature, precision := range expected.precisionBits {
-				if r.Header().Columns[feature].PrecisionBits != precision {
-					t.Fatalf("merged column %d didn't retain minimum source precision", feature)
+			blocks := 0
+			for {
+				if r.Header().Timestamps.PrecisionBits != 64 {
+					t.Fatalf("merge round %d lost shared timestamp precision64", round)
 				}
+				for feature, column := range r.Header().Columns {
+					if column.PrecisionBits != 64 {
+						t.Fatalf("merge round %d column %d lost shared precision64", round, feature)
+					}
+				}
+				var batch downsampleBatch
+				if err := r.ReadBlock(&batch); err != nil {
+					t.Fatal(err)
+				}
+				if batch.precisionBits != 64 {
+					t.Fatalf("merge round %d decoded batch lost precision64", round)
+				}
+				blocks++
+				if !r.NextHeader() {
+					break
+				}
+			}
+			if err := r.Error(); err != nil {
+				t.Fatal(err)
+			}
+			if blocks == 0 {
+				t.Fatal("no merged blocks checked")
 			}
 		}()
 		expected = roundTripDownsampleTestReferenceBlock(t, expected)
@@ -348,20 +507,20 @@ func roundTripDownsampleTestReferenceBlock(t *testing.T, source *downsampleBatch
 	t.Helper()
 	result := &downsampleBatch{
 		tsid: source.tsid, resolution: source.resolution,
-		precisionBits: source.precisionBits, timestampPrecisionBits: source.timestampPrecisionBits,
+		precisionBits: source.precisionBits,
 	}
-	data, marshalType, first := encoding.MarshalTimestamps(nil, source.timestamps, source.timestampPrecisionBits)
+	data, marshalType, first := encoding.MarshalTimestamps(nil, source.timestamps, source.precisionBits)
 	var err error
 	result.timestamps, err = encoding.UnmarshalTimestamps(nil, data, marshalType, first, len(source.timestamps))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if source.timestampPrecisionBits < 64 {
+	if source.precisionBits < 64 {
 		encoding.EnsureNonDecreasingSequence(result.timestamps, source.timestamps[0], source.timestamps[len(source.timestamps)-1])
 	}
 	for feature, values := range source.values {
 		integers, scale := decimal.AppendFloatToDecimal(nil, values)
-		data, marshalType, first := encoding.MarshalValues(nil, integers, source.precisionBits[feature])
+		data, marshalType, first := encoding.MarshalValues(nil, integers, source.precisionBits)
 		decoded, err := encoding.UnmarshalValues(nil, data, marshalType, first, len(values))
 		if err != nil {
 			t.Fatal(err)

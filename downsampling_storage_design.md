@@ -19,7 +19,7 @@
 
 所有 NaN 统一为 `decimal.StaleNaN`，不区分来源。较新的 last 标记覆盖较早数值；sum/min/max 按列传播标记，count 对 raw 标记仍计入 1。运算产生的 NaN 使用相同规则，不影响其他列。原始摄取对普通 NaN 的处理保持不变。
 
-编解码复用现有 decimal、timestamps 和 values 算法，各列独立保留 scale、precision 和编码类型；共享时间戳使用独立 precision。浮点误差及有损编码沿用原有规则，不附加精度保证。
+编解码直接复用原生 `Block.MarshalData`、`Block.UnmarshalData` 及现有 decimal 算法。时间戳和五个 value 列共用源 raw 的 `precisionBits`，默认 64；各列仅独立保留 scale 和编码类型，不再单独设置精度或在归并时取最小精度。不同区间的源精度不同时拆分输出 Block；同一区间的源精度不一致时报错。浮点误差及有损编码沿用原有规则，不附加精度保证。
 
 ## 2. 存储与归并
 
@@ -47,7 +47,7 @@ reader、writer、merger、batch 通过 `sync.Pool` 复用。Reset 清除文件�
 | metadata.json | 固定配置、版本及 part 物理统计 |
 | parts.json | 复用 partition 的活动 part 清单及原子发布机制 |
 
-排序键为 `(ResolutionMs, TSID.Less, MinTimestamp, Feature)`。每个 index 仅包含一种分辨率和完整五字段批次；先写 5m，再写 1h。同批五个 header 的 TSID、行数、时间范围及时间戳描述一致；values 的 offset/size、FirstValue、Scale、PrecisionBits 和 marshal type 各自独立。常量列允许 size=0，不表示缺少特征。
+排序键为 `(ResolutionMs, TSID.Less, MinTimestamp, Feature)`。每个 index 仅包含一种分辨率和完整五字段批次；先写 5m，再写 1h。同批五个 header 的 TSID、行数、时间范围、时间戳描述及 PrecisionBits 一致；values 的 offset/size、FirstValue、Scale 和 marshal type 各自独立。保留现有 TimestampPrecisionBits 磁盘字段，但必须等于每个原生 blockHeader 的 PrecisionBits；不接受精度不一致的旧试验文件。常量列允许 size=0，不表示缺少特征。
 
 ### 3.1 扩展 header
 
@@ -123,7 +123,7 @@ vmselect 与 vmstorage 的 dedup 配置分别生效，测试必须在两个进�
 | `downsample_writer.go`、`downsample_reader.go`、`downsample_merger.go` | Block 复用、列读写、有界归并及 Reset |
 | `downsample_partition.go`、`downsample_space.go` | 文件目标归并、发布、retention 和空间预算 |
 | `partition.go`、`part.go`、`storage.go`、`downsample_open.go` | 文件输出分派、part 打开、启用配置和启动预检查 |
-| `block.go` | 共用单列编解码，允许独立时间戳 precision |
+| `block.go` | 保持原生单列编解码实现不变，时间戳与 values 共用 PrecisionBits |
 | `downsample_query.go`、`downsample_search_protocol.go`、各层 search | 字段选择、请求编解码及 TSID 遍历 |
 | `app/vmselect/prometheus`、`promql`、`netstorage`；`lib/vmselectapi`；`app/vmstorage` | HTTP 参数、集群 RPC、缓存隔离及存储调用 |
 

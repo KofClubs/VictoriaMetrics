@@ -121,16 +121,15 @@ func TestDownsampleQueryFieldRawIsolationAndReset(t *testing.T) {
 	}
 }
 
-func TestDownsampleQueryFieldIndependentPrecision(t *testing.T) {
+func TestDownsampleQueryFieldSharedPrecision(t *testing.T) {
 	b := fileTestDownsampleBlock(10, 300000)
-	b.timestampPrecisionBits = 2
+	b.precisionBits = 64
 	b.timestamps = b.timestamps[:0]
 	for i := 0; i < 40; i++ {
 		b.timestamps = append(b.timestamps, minUnixMilli+int64(i)*300000+int64(i*i+1))
 	}
 	for field := range b.values {
 		b.values[field] = b.values[field][:0]
-		b.precisionBits[field] = 64
 		for row := range b.timestamps {
 			b.values[field] = append(b.values[field], float64(field*100+row)+0.125)
 		}
@@ -142,40 +141,43 @@ func TestDownsampleQueryFieldIndependentPrecision(t *testing.T) {
 	defer p.MustClose()
 	var ps partSearch
 	defer ps.reset()
-	q := DownsampleQueryField{ResolutionMs: 300000, Feature: downsampleFeatureSum}
 	tr := TimeRange{MinTimestamp: minUnixMilli, MaxTimestamp: maxUnixMilli}
-	ps.initWithDownsampleField(p, []TSID{b.tsid}, tr, &q)
-	if !ps.NextBlock() {
-		t.Fatalf("未找到低精度 block: %v", ps.Error())
-	}
-	if ps.BlockRef.bh.PrecisionBits != 2 {
-		t.Fatalf("丢失时间戳修复所需的精度提示: %d", ps.BlockRef.bh.PrecisionBits)
-	}
-	// 复刻单机版 BlockRef.Init(PartRef, data) 语义：仅保留 part 指针 + header 序列化往返。
-	var restored BlockRef
-	restored.p = ps.BlockRef.p
-	tail, err := restored.bh.Unmarshal(ps.BlockRef.bh.Marshal(nil))
-	if err != nil {
-		t.Fatalf("cannot unmarshal block header: %v", err)
-	}
-	if len(tail) > 0 {
-		t.Fatalf("unexpected non-empty tail after unmarshaling block header: len(tail)=%d", len(tail))
-	}
-	var got Block
-	restored.MustReadBlock(&got)
-	if err := got.UnmarshalData(); err != nil {
-		t.Fatalf("原始 Block 解码失败: %v", err)
-	}
-	timestamps, values := got.AppendRowsWithTimeRangeFilter(nil, nil, tr)
-	if !reflect.DeepEqual(values, b.values[downsampleFeatureSum]) {
-		t.Fatalf("时间戳精度提示降低了值精度: %v", values)
-	}
-	if len(timestamps) != len(b.timestamps) || timestamps[0] != b.timestamps[0] || timestamps[len(timestamps)-1] != b.timestamps[len(b.timestamps)-1] {
-		t.Fatalf("时间戳边界错误: %v", timestamps)
-	}
-	for i := 1; i < len(timestamps); i++ {
-		if timestamps[i] < timestamps[i-1] {
-			t.Fatalf("时间戳未执行顺序修复: %v", timestamps)
+	for feature := uint8(0); feature < downsampleFeaturesCount; feature++ {
+		q := DownsampleQueryField{ResolutionMs: 300000, Feature: feature}
+		ps.initWithDownsampleField(p, []TSID{b.tsid}, tr, &q)
+		if !ps.NextBlock() {
+			t.Fatalf("未找到共享精度 block: %v", ps.Error())
+		}
+		if ps.BlockRef.bh.PrecisionBits != 64 {
+			t.Fatalf("字段 %d 未保留共享精度64: %d", feature, ps.BlockRef.bh.PrecisionBits)
+		}
+		// 复刻单机版 BlockRef.Init(PartRef, data) 语义：仅保留 part 指针 + header 序列化往返。
+		var restored BlockRef
+		restored.p = ps.BlockRef.p
+		tail, err := restored.bh.Unmarshal(ps.BlockRef.bh.Marshal(nil))
+		if err != nil {
+			t.Fatalf("cannot unmarshal block header: %v", err)
+		}
+		if len(tail) > 0 {
+			t.Fatalf("unexpected non-empty tail after unmarshaling block header: len(tail)=%d", len(tail))
+		}
+		var got Block
+		restored.MustReadBlock(&got)
+		if err := got.UnmarshalData(); err != nil {
+			t.Fatalf("原始 Block 解码失败: %v", err)
+		}
+		if got.bh.PrecisionBits != 64 {
+			t.Fatalf("字段 %d 的原生 Block 往返丢失共享精度64", feature)
+		}
+		timestamps, values := got.AppendRowsWithTimeRangeFilter(nil, nil, tr)
+		if !reflect.DeepEqual(values, b.values[feature]) {
+			t.Fatalf("字段 %d 的共享精度64值往返错误: %v", feature, values)
+		}
+		if !reflect.DeepEqual(timestamps, b.timestamps) {
+			t.Fatalf("字段 %d 的共享精度64时间戳往返错误: %v", feature, timestamps)
+		}
+		if ps.NextBlock() || ps.Error() != nil {
+			t.Fatalf("字段 %d 返回多余 block 或读取失败: %v", feature, ps.Error())
 		}
 	}
 }

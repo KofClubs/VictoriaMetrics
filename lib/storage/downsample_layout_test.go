@@ -86,7 +86,7 @@ func TestDownsampleFilePhysicalLayout(t *testing.T) {
 					groupMin = min(groupMin, b.timestamps[0])
 					groupMax = max(groupMax, b.timestamps[n-1])
 					timestampsOffset := uint64(len(expectedTimestamps))
-					timestampsPayload, timestampsType, firstTimestamp := encoding.MarshalTimestamps(nil, b.timestamps, b.timestampPrecisionBits)
+					timestampsPayload, timestampsType, firstTimestamp := encoding.MarshalTimestamps(nil, b.timestamps, b.precisionBits)
 					expectedTimestamps = append(expectedTimestamps, timestampsPayload...)
 					decodedTimestamps, err := encoding.UnmarshalTimestamps(nil, timestampsPayload, timestampsType, firstTimestamp, n)
 					if err != nil || !reflect.DeepEqual(decodedTimestamps, b.timestamps) {
@@ -95,8 +95,8 @@ func TestDownsampleFilePhysicalLayout(t *testing.T) {
 					for col := 0; col < 5; col++ {
 						h := index[(i*5+col)*clusterDownsampleFieldHeaderBytes : (i*5+col+1)*clusterDownsampleFieldHeaderBytes]
 						integers, scale := decimal.AppendFloatToDecimal(nil, b.values[col])
-						payload, mt, first := encoding.MarshalValues(nil, integers, b.precisionBits[col])
-						if resolution != b.resolution || readDownsampleLayoutInt64(h[0:8]) != b.resolution || h[8] != byte(col+1) || h[9] != b.timestampPrecisionBits || readDownsampleLayoutTSID(h[10:42]) != b.tsid || binary.BigEndian.Uint32(h[90:94]) != uint32(n) {
+						payload, mt, first := encoding.MarshalValues(nil, integers, b.precisionBits)
+						if resolution != b.resolution || readDownsampleLayoutInt64(h[0:8]) != b.resolution || h[8] != byte(col+1) || h[9] != b.precisionBits || readDownsampleLayoutTSID(h[10:42]) != b.tsid || binary.BigEndian.Uint32(h[90:94]) != uint32(n) {
 							t.Fatalf("批次 %d 特征 %d 的标识、精度或 RowsCount 错误", nextBlock+i, col+1)
 						}
 						if readDownsampleLayoutInt64(h[42:50]) != b.timestamps[0] || readDownsampleLayoutInt64(h[50:58]) != b.timestamps[n-1] {
@@ -105,7 +105,7 @@ func TestDownsampleFilePhysicalLayout(t *testing.T) {
 						checkDownsampleLayoutPayload(t, h[66:74], h[82:86], timestampsOffset, timestampsPayload, files["timestamps.bin"])
 						checkDownsampleLayoutPayload(t, h[74:82], h[86:90], uint64(len(expectedValues)), payload, files["values.bin"])
 						u := binary.BigEndian.Uint16(h[94:96])
-						if readDownsampleLayoutInt64(h[58:66]) != first || int16(u>>1)^-int16(u&1) != scale || h[96] != byte(timestampsType) || h[97] != byte(mt) || h[98] != b.precisionBits[col] {
+						if readDownsampleLayoutInt64(h[58:66]) != first || int16(u>>1)^-int16(u&1) != scale || h[96] != byte(timestampsType) || h[97] != byte(mt) || h[98] != b.precisionBits {
 							t.Fatalf("批次 %d 特征 %d 的原生 Block 编码字段错误", nextBlock+i, col+1)
 						}
 						expectedValues = append(expectedValues, payload...)
@@ -163,7 +163,7 @@ func makeDownsampleLayoutBlocks(blocksPerResolution int, singleRow bool) []*down
 		for i := 0; i < blocksPerResolution; i++ {
 			b := &downsampleBatch{
 				tsid:       TSID{AccountID: 0x11223344 + uint32(i/132), ProjectID: 0x55667788 + uint32(i%132/66), MetricGroupID: 0x123456789abcdef0, JobID: 0x23456789, InstanceID: 0x3456789a, MetricID: uint64(i/2 + 1)},
-				resolution: resolution, timestampPrecisionBits: 64, precisionBits: [5]uint8{64, 64, 64, 64, 64},
+				resolution: resolution, precisionBits: 64,
 			}
 			n := 4 + i%3
 			if singleRow {

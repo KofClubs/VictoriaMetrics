@@ -15,10 +15,9 @@ import (
 )
 
 func fileTestDownsampleBlock(tsid uint64, resolution int64) *downsampleBatch {
-	b := &downsampleBatch{tsid: TSID{MetricID: tsid}, resolution: resolution, timestamps: []int64{minUnixMilli + 1, minUnixMilli + resolution + 1}, timestampPrecisionBits: 64}
+	b := &downsampleBatch{tsid: TSID{MetricID: tsid}, resolution: resolution, timestamps: []int64{minUnixMilli + 1, minUnixMilli + resolution + 1}, precisionBits: 64}
 	for i := range b.values {
 		b.values[i] = []float64{float64(i + 1), float64(i + 6)}
-		b.precisionBits[i] = 64
 	}
 	b.values[downsampleFeatureCount] = []float64{3, 3}
 	return b
@@ -682,11 +681,11 @@ func TestDownsampleReaderSeekHighCardinality(t *testing.T) {
 	}
 }
 
-// TestDownsampleNativeBlockReuse 验证文件 writer 的每个特征使用独立 Block，且 reader 返回标准解码状态。
+// TestDownsampleNativeBlockReuse 验证五个独立 Block 共用精度，且 reader 返回原生 codec 的标准解码状态。
 func TestDownsampleNativeBlockReuse(t *testing.T) {
-	for _, timestampPrecision := range []uint8{64, 8} {
-		t.Run(fmt.Sprintf("timestamps_precision_%d", timestampPrecision), func(t *testing.T) {
-			batch := &downsampleBatch{tsid: TSID{MetricID: 10}, resolution: 300000, timestampPrecisionBits: timestampPrecision, precisionBits: [5]uint8{64, 32, 64, 16, 52}}
+	for _, precision := range []uint8{64, 8} {
+		t.Run(fmt.Sprintf("shared_precision_%d", precision), func(t *testing.T) {
+			batch := &downsampleBatch{tsid: TSID{MetricID: 10}, resolution: 300000, precisionBits: precision}
 			for row := 0; row < 1024; row++ {
 				batch.timestamps = append(batch.timestamps, minUnixMilli+int64(row)*300000+int64((row*row*7919)%299999))
 				for feature := range batch.values {
@@ -705,7 +704,7 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 			var stored [5]Block
 			for feature := range w.blocks {
 				fb := &w.blocks[feature]
-				if fb.bh.TSID != batch.tsid || fb.bh.RowsCount != 1024 || fb.nextIdx != 0 || len(fb.values) != 0 || len(fb.timestamps) != 0 || len(fb.headerData) != marshaledBlockHeaderSize || fb.bh.PrecisionBits != batch.precisionBits[feature] {
+				if fb.bh.TSID != batch.tsid || fb.bh.RowsCount != 1024 || fb.nextIdx != 0 || len(fb.values) != 0 || len(fb.timestamps) != 0 || len(fb.headerData) != marshaledBlockHeaderSize || fb.bh.PrecisionBits != batch.precisionBits {
 					t.Fatalf("特征 %d 未保持原生 Block 的编码状态", feature)
 				}
 				var originalHeader blockHeader
@@ -730,22 +729,25 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 			if err := r.Init(p, 300000); err != nil || !r.NextHeader() {
 				t.Fatalf("无法定位批次: %v / %v", err, r.Error())
 			}
+			if r.Header().Timestamps.PrecisionBits != precision {
+				t.Fatal("时间戳未保留共享精度")
+			}
 			for feature := range stored {
 				want := &stored[feature]
-				if err := want.unmarshalDataWithTimestampPrecision(timestampPrecision); err != nil {
+				if err := want.UnmarshalData(); err != nil {
 					t.Fatal(err)
 				}
 				var got Block
 				if err := r.ReadFieldBlock(&got, uint8(feature)); err != nil {
 					t.Fatal(err)
 				}
-				if !reflect.DeepEqual(got.timestamps, want.timestamps) || !reflect.DeepEqual(got.values, want.values) || got.bh.Scale != want.bh.Scale || got.bh.PrecisionBits != batch.precisionBits[feature] || len(got.timestampsData) != 0 || len(got.valuesData) != 0 || got.nextIdx != 0 {
+				if !reflect.DeepEqual(got.timestamps, want.timestamps) || !reflect.DeepEqual(got.values, want.values) || got.bh.Scale != want.bh.Scale || got.bh.PrecisionBits != batch.precisionBits || len(got.timestampsData) != 0 || len(got.valuesData) != 0 || got.nextIdx != 0 {
 					t.Fatalf("特征 %d 未通过原生 Block 完成解码", feature)
 				}
 				// 查询用 header 直接进入既有 BlockRef，验证扩展格式不需要专用查询 decoder。
 				bh, err := r.FieldHeader(uint8(feature))
-				if err != nil || bh.PrecisionBits != min(timestampPrecision, batch.precisionBits[feature]) {
-					t.Fatalf("查询用精度提示错误: %+v / %v", bh, err)
+				if err != nil || bh.PrecisionBits != precision {
+					t.Fatalf("查询未保留共享精度: %+v / %v", bh, err)
 				}
 				var br BlockRef
 				br.init(p, &bh)
@@ -865,18 +867,32 @@ func TestDownsampleFieldHeaderSharedTimestamps(t *testing.T) {
 	if len(base) != 5*(10+marshaledBlockHeaderSize) || downsampleFieldHeaderSize != 10+marshaledBlockHeaderSize {
 		t.Fatal("文件条目长度未与原生 blockHeader 保持一致")
 	}
+	for feature := 0; feature < 5; feature++ {
+		var h downsampleFieldHeader
+		if err := h.unmarshal(base[feature*downsampleFieldHeaderSize : (feature+1)*downsampleFieldHeaderSize]); err != nil {
+			t.Fatal(err)
+		}
+		if h.TimestampPrecisionBits != 64 || h.BlockHeader.PrecisionBits != h.TimestampPrecisionBits {
+			t.Fatalf("特征 %d 的磁盘 header 未保留共享精度64: %+v", feature, h)
+		}
+	}
 	mutations := map[string]func(*downsampleFieldHeader){
 		"resolution":          func(h *downsampleFieldHeader) { h.ResolutionMs = 3600000 },
 		"feature":             func(h *downsampleFieldHeader) { h.Feature = 1 },
 		"timestamp_precision": func(h *downsampleFieldHeader) { h.TimestampPrecisionBits = 8 },
-		"tsid":                func(h *downsampleFieldHeader) { h.BlockHeader.TSID.MetricID++ },
-		"account_id":          func(h *downsampleFieldHeader) { h.BlockHeader.TSID.AccountID++ },
-		"project_id":          func(h *downsampleFieldHeader) { h.BlockHeader.TSID.ProjectID++ },
-		"rows":                func(h *downsampleFieldHeader) { h.BlockHeader.RowsCount++ },
-		"minimum":             func(h *downsampleFieldHeader) { h.BlockHeader.MinTimestamp++ },
-		"maximum":             func(h *downsampleFieldHeader) { h.BlockHeader.MaxTimestamp++ },
-		"timestamp_offset":    func(h *downsampleFieldHeader) { h.BlockHeader.TimestampsBlockOffset++ },
-		"timestamp_size":      func(h *downsampleFieldHeader) { h.BlockHeader.TimestampsBlockSize++ },
+		"value_precision":     func(h *downsampleFieldHeader) { h.BlockHeader.PrecisionBits = 8 },
+		"shared_precision": func(h *downsampleFieldHeader) {
+			h.TimestampPrecisionBits = 8
+			h.BlockHeader.PrecisionBits = 8
+		},
+		"tsid":             func(h *downsampleFieldHeader) { h.BlockHeader.TSID.MetricID++ },
+		"account_id":       func(h *downsampleFieldHeader) { h.BlockHeader.TSID.AccountID++ },
+		"project_id":       func(h *downsampleFieldHeader) { h.BlockHeader.TSID.ProjectID++ },
+		"rows":             func(h *downsampleFieldHeader) { h.BlockHeader.RowsCount++ },
+		"minimum":          func(h *downsampleFieldHeader) { h.BlockHeader.MinTimestamp++ },
+		"maximum":          func(h *downsampleFieldHeader) { h.BlockHeader.MaxTimestamp++ },
+		"timestamp_offset": func(h *downsampleFieldHeader) { h.BlockHeader.TimestampsBlockOffset++ },
+		"timestamp_size":   func(h *downsampleFieldHeader) { h.BlockHeader.TimestampsBlockSize++ },
 		"timestamp_codec": func(h *downsampleFieldHeader) {
 			h.BlockHeader.TimestampsMarshalType = encoding.MarshalTypeNearestDelta2
 		},

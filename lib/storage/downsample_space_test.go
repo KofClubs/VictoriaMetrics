@@ -65,7 +65,7 @@ func TestDownsampleSpaceBoundCoversEncodedParts(t *testing.T) {
 				blockCount, rowsPerBlock = 100, 1
 			}
 			for i := 0; i < blockCount; i++ {
-				b := downsampleBatch{tsid: TSID{MetricID: uint64(i + 1)}, resolution: downsampleResolution5m, timestampPrecisionBits: 64}
+				b := downsampleBatch{tsid: TSID{MetricID: uint64(i + 1)}, resolution: downsampleResolution5m, precisionBits: 64}
 				for j := 0; j < rowsPerBlock; j++ {
 					b.timestamps = append(b.timestamps, time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()+int64(j)*downsampleResolution5m)
 					for feature := range b.values {
@@ -74,7 +74,6 @@ func TestDownsampleSpaceBoundCoversEncodedParts(t *testing.T) {
 							value = -value
 						}
 						b.values[feature] = append(b.values[feature], value)
-						b.precisionBits[feature] = 64
 					}
 				}
 				if err := w.WriteBlock(&b); err != nil {

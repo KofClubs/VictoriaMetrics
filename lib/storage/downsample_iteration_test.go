@@ -70,10 +70,7 @@ func newDownsampleIterationPart(t *testing.T) *part {
 				b.Reset()
 				b.tsid = downsampleIterationTSID(series)
 				b.resolution = resolution
-				b.timestampPrecisionBits = 64
-				for feature := range b.precisionBits {
-					b.precisionBits[feature] = 64
-				}
+				b.precisionBits = 64
 				for row := start; row < min(start+8192, rows); row++ {
 					b.timestamps = append(b.timestamps, downsampleIterationTimestamp(series, row, resolution))
 					for feature := range b.values {

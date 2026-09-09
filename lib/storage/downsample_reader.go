@@ -384,7 +384,6 @@ func (r *downsampleReader) readAt(dst []byte, file int, off uint64, size uint32)
 }
 
 // FieldHeader 返回单个特征的原生 header，供现有 BlockRef 读取链路使用。
-// 较小的 PrecisionBits 仅提示原 decoder 修复共享时间戳，不重编码 values 负载。
 func (r *downsampleReader) FieldHeader(feature uint8) (blockHeader, error) {
 	if r.p == nil || r.current.RowsCount == 0 || feature >= downsampleFeaturesCount {
 		return blockHeader{}, fmt.Errorf("降采样 reader 未定位 Block 或特征无效")
@@ -393,7 +392,6 @@ func (r *downsampleReader) FieldHeader(feature uint8) (blockHeader, error) {
 		return r.current.rawHeader, nil
 	}
 	fh := r.current.fieldHeader(int(feature))
-	fh.BlockHeader.PrecisionBits = min(fh.BlockHeader.PrecisionBits, fh.TimestampPrecisionBits)
 	return fh.BlockHeader, nil
 }
 
@@ -403,13 +401,13 @@ func (r *downsampleReader) ReadFieldBlock(dst *Block, feature uint8) error {
 		return fmt.Errorf("降采样 reader 未定位 Block 或特征无效")
 	}
 	if r.current.raw {
-		return r.readNativeBlock(dst, &r.current.rawHeader, r.current.rawHeader.PrecisionBits)
+		return r.readNativeBlock(dst, &r.current.rawHeader)
 	}
 	fh := r.current.fieldHeader(int(feature))
-	return r.readNativeBlock(dst, &fh.BlockHeader, fh.TimestampPrecisionBits)
+	return r.readNativeBlock(dst, &fh.BlockHeader)
 }
 
-func (r *downsampleReader) readNativeBlock(b *Block, h *blockHeader, timestampPrecisionBits uint8) error {
+func (r *downsampleReader) readNativeBlock(b *Block, h *blockHeader) error {
 	b.Reset()
 	if err := h.validate(); err != nil {
 		return err
@@ -434,7 +432,7 @@ func (r *downsampleReader) readNativeBlock(b *Block, h *blockHeader, timestampPr
 	}
 	b.bh.TimestampsBlockSize = uint32(len(b.timestampsData))
 	b.bh.ValuesBlockSize = uint32(len(b.valuesData))
-	return b.unmarshalDataWithTimestampPrecision(timestampPrecisionBits)
+	return b.UnmarshalData()
 }
 
 func (r *downsampleReader) ReadBlock(b *downsampleBatch) error {
@@ -447,7 +445,7 @@ func (r *downsampleReader) ReadBlock(b *downsampleBatch) error {
 	if h.raw {
 		return r.readRawBlock(b, &h.rawHeader)
 	}
-	b.timestampPrecisionBits = h.Timestamps.PrecisionBits
+	b.precisionBits = h.Timestamps.PrecisionBits
 	for i := range b.values {
 		if err := r.ReadFieldBlock(&r.block, uint8(i)); err != nil {
 			return err
@@ -456,7 +454,6 @@ func (r *downsampleReader) ReadBlock(b *downsampleBatch) error {
 			b.timestamps = append(b.timestamps[:0], r.block.timestamps...)
 		}
 		b.values[i] = decimal.AppendDecimalToFloat(b.values[i][:0], r.block.values, r.block.bh.Scale)
-		b.precisionBits[i] = r.block.bh.PrecisionBits
 		for j, v := range b.values[i] {
 			if math.IsNaN(v) {
 				b.values[i][j] = decimal.StaleNaN
@@ -467,7 +464,7 @@ func (r *downsampleReader) ReadBlock(b *downsampleBatch) error {
 }
 
 func (r *downsampleReader) readRawBlock(b *downsampleBatch, h *blockHeader) error {
-	if err := r.readNativeBlock(&r.block, h, h.PrecisionBits); err != nil {
+	if err := r.readNativeBlock(&r.block, h); err != nil {
 		return err
 	}
 	b.timestamps = append(b.timestamps[:0], r.block.timestamps...)
@@ -485,10 +482,7 @@ func (r *downsampleReader) readRawBlock(b *downsampleBatch, h *blockHeader) erro
 			b.values[i] = append(b.values[i], x)
 		}
 	}
-	b.timestampPrecisionBits = h.PrecisionBits
-	for i := range b.precisionBits {
-		b.precisionBits[i] = h.PrecisionBits
-	}
+	b.precisionBits = h.PrecisionBits
 	return nil
 }
 

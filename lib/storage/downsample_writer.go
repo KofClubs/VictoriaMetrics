@@ -61,12 +61,12 @@ func (w *downsampleWriter) WriteBlock(b *downsampleBatch) error {
 	if err := checkDownsampleWriteSpace(filepath.Dir(w.path), n); err != nil {
 		return err
 	}
-	if !validDownsampleResolution(b.resolution) || n == 0 || n > maxRowsPerBlock || b.timestampPrecisionBits < 1 || b.timestampPrecisionBits > 64 {
-		return fmt.Errorf("无效降采样 block 分辨率、行数或时间戳精度")
+	if !validDownsampleResolution(b.resolution) || n == 0 || n > maxRowsPerBlock || b.precisionBits < 1 || b.precisionBits > 64 {
+		return fmt.Errorf("无效降采样 block 分辨率、行数或精度")
 	}
 	for i := range b.values {
-		if len(b.values[i]) != n || b.precisionBits[i] < 1 || b.precisionBits[i] > 64 {
-			return fmt.Errorf("降采样列 %d 的行数或精度错误", i)
+		if len(b.values[i]) != n {
+			return fmt.Errorf("降采样列 %d 的行数错误", i)
 		}
 	}
 	for i, t := range b.timestamps {
@@ -99,13 +99,13 @@ func (w *downsampleWriter) WriteBlock(b *downsampleBatch) error {
 		}
 		var scale int16
 		w.integers, scale = decimal.AppendFloatToDecimal(w.integers[:0], w.normalized)
-		// 每个特征拥有独立的原生 Block，完整复用初始化与编码状态转换。
+		// 每个特征拥有独立的原生 Block，时间戳和 values 均沿用 raw 的精度。
 		fb := &w.blocks[i]
-		fb.Init(&b.tsid, b.timestamps, w.integers, scale, b.precisionBits[i])
-		_, timestampsData, valuesData := fb.marshalDataWithTimestampPrecision(sharedTimestampOffset, w.offsets[1], b.timestampPrecisionBits)
+		fb.Init(&b.tsid, b.timestamps, w.integers, scale, b.precisionBits)
+		_, timestampsData, valuesData := fb.MarshalData(sharedTimestampOffset, w.offsets[1])
 		if i == 0 {
 			// 时间戳负载只写入一次，后续特征引用相同的 offset 和 size。
-			h.Timestamps = downsampleColumnHeader{Feature: downsampleTimestampFeature, Offset: w.offsets[0], Size: fb.bh.TimestampsBlockSize, FirstValue: fb.bh.MinTimestamp, PrecisionBits: b.timestampPrecisionBits, MarshalType: fb.bh.TimestampsMarshalType}
+			h.Timestamps = downsampleColumnHeader{Feature: downsampleTimestampFeature, Offset: w.offsets[0], Size: fb.bh.TimestampsBlockSize, FirstValue: fb.bh.MinTimestamp, PrecisionBits: b.precisionBits, MarshalType: fb.bh.TimestampsMarshalType}
 			if err := w.writePayload(0, timestampsData); err != nil {
 				return err
 			}

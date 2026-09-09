@@ -4,20 +4,19 @@ import "sync"
 
 // downsampleBatch 是归并计算的临时批次；文件中的每个特征由独立的原生 Block 存储。
 type downsampleBatch struct {
-	tsid                   TSID
-	resolution             int64
-	timestamps             []int64
-	values                 [downsampleFeaturesCount][]float64
-	precisionBits          [downsampleFeaturesCount]uint8
-	timestampPrecisionBits uint8
+	tsid       TSID
+	resolution int64
+	timestamps []int64
+	values     [downsampleFeaturesCount][]float64
+	// 时间戳和五个 value 列共用 raw 的精度，默认 64。
+	precisionBits uint8
 }
 
 // Reset 清除逻辑状态，保留正常容量，并释放超出单 block 上限的缓冲。
 func (b *downsampleBatch) Reset() {
 	b.tsid = TSID{}
 	b.resolution = 0
-	b.timestampPrecisionBits = 0
-	b.precisionBits = [downsampleFeaturesCount]uint8{}
+	b.precisionBits = 0
 	if cap(b.timestamps) > downsampleMaxPooledRows {
 		b.timestamps = nil
 	} else {

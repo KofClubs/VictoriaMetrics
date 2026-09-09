@@ -20,11 +20,10 @@ type downsampleMergeStats struct {
 	rowsDeleted uint64
 }
 
-// downsampleWindowState 保存一个完整区间的特征及参与贡献的最低编码精度。
+// downsampleWindowState 保存一个完整区间的特征及源数据的共享精度。
 type downsampleWindowState struct {
-	acc                    downsampleAccumulator
-	precisionBits          [downsampleFeaturesCount]uint8
-	timestampPrecisionBits uint8
+	acc           downsampleAccumulator
+	precisionBits uint8
 }
 
 // downsampleMergeCursor 仅保留一个源的索引游标，不持有该源的全部数据 block。
@@ -241,10 +240,6 @@ func (m *downsampleMerger) resetOutput(tsid *TSID, resolution int64) {
 	m.output.Reset()
 	m.output.tsid = *tsid
 	m.output.resolution = resolution
-	m.output.timestampPrecisionBits = 64
-	for i := range m.output.precisionBits {
-		m.output.precisionBits[i] = 64
-	}
 }
 
 func (m *downsampleMerger) flushOutput(tsid *TSID, resolution int64) error {
@@ -285,11 +280,15 @@ func (m *downsampleMerger) mergeTSID(tsid *TSID, resolution, minTimestamp, reten
 				continue
 			}
 			b := m.output
+			if len(b.timestamps) > 0 && b.precisionBits != s.precisionBits {
+				if err := m.flushOutput(tsid, resolution); err != nil {
+					return err
+				}
+			}
+			b.precisionBits = s.precisionBits
 			b.timestamps = append(b.timestamps, s.acc.point.timestamp)
-			b.timestampPrecisionBits = min(b.timestampPrecisionBits, s.timestampPrecisionBits)
 			for feature, value := range s.acc.point.values {
 				b.values[feature] = append(b.values[feature], value)
-				b.precisionBits[feature] = min(b.precisionBits[feature], s.precisionBits[feature])
 			}
 			if len(b.timestamps) == maxRowsPerBlock {
 				if err := m.flushOutput(tsid, resolution); err != nil {
@@ -359,12 +358,8 @@ func (m *downsampleMerger) readWindow(p *part, tsid *TSID, resolution, firstBuck
 			s := &m.states[bucketID-firstBucket]
 			if !s.acc.initialized {
 				s.precisionBits = b.precisionBits
-				s.timestampPrecisionBits = b.timestampPrecisionBits
-			} else {
-				for feature := range s.precisionBits {
-					s.precisionBits[feature] = min(s.precisionBits[feature], b.precisionBits[feature])
-				}
-				s.timestampPrecisionBits = min(s.timestampPrecisionBits, b.timestampPrecisionBits)
+			} else if s.precisionBits != b.precisionBits {
+				return fmt.Errorf("同一降采样 bucket 的源精度不一致: %d vs %d", s.precisionBits, b.precisionBits)
 			}
 			point := downsamplePoint{timestamp: timestamp}
 			for feature := range point.values {

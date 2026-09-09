@@ -294,11 +294,10 @@ func createDownsampleOpenTestSummary(t *testing.T, path string) {
 	for _, resolution := range downsampleResolutions {
 		b := downsampleBatch{
 			tsid: TSID{MetricID: 1}, resolution: resolution,
-			timestamps: []int64{time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()}, timestampPrecisionBits: 64,
+			timestamps: []int64{time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()}, precisionBits: 64,
 		}
 		for i := range b.values {
 			b.values[i] = []float64{1}
-			b.precisionBits[i] = 64
 		}
 		if err := w.WriteBlock(&b); err != nil {
 			t.Fatal(err)
