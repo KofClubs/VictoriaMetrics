@@ -20,6 +20,39 @@ type downsampleTestKey struct {
 	bucket     int64
 }
 
+func TestDownsampleMergerMoreThan1024Sources(t *testing.T) {
+	const (
+		base        int64 = 1704067200000
+		sourceCount       = 1025 // 超过已移除的单次源数量限制。
+	)
+	tsid := TSID{AccountID: 11, ProjectID: 17, MetricID: 42}
+	sources := make([]*partWrapper, sourceCount)
+	for i := range sources {
+		// 每个源都拥有独立的真实内存 part，无须为大量磁盘源打开文件。
+		sources[i] = newDownsampleTestRawPart(t, []rawRow{{
+			TSID: tsid, Timestamp: base + int64(i+1), Value: float64(i + 1), PrecisionBits: 64,
+		}})
+	}
+	m := getDownsampleMerger()
+	defer putDownsampleMerger(m)
+	output, stats := runDownsampleTestMerge(t, m, sources, nil, 0)
+	if stats.rowsMerged != sourceCount || stats.rowsDeleted != 0 {
+		t.Fatalf("unexpected source statistics: %+v; want %d merged rows", stats, sourceCount)
+	}
+	// 所有源落在同一个 bucket，两个分辨率都必须包含全部贡献。
+	want := make(map[downsampleTestKey]downsampleSample)
+	for _, resolution := range downsampleResolutions {
+		want[downsampleTestKey{tsid: tsid, resolution: resolution, bucket: base / resolution}] = downsampleSample{
+			timestamp:     base + sourceCount,
+			precisionBits: 64,
+			values: [countOfDownsampleFeatures]float64{
+				sourceCount, sourceCount * (sourceCount + 1) / 2, sourceCount, 1, sourceCount,
+			},
+		}
+	}
+	assertDownsampleTestRows(t, readDownsampleTestPart(t, output.p), want)
+}
+
 func TestDownsampleMergerRepeatedMerge(t *testing.T) {
 	const base int64 = 1704067200000
 	ts := TSID{MetricID: 42}
@@ -80,8 +113,8 @@ func assertDownsampleTestPrecision64(t *testing.T, p *part) {
 	t.Helper()
 	r := getDownsampleReader()
 	defer putDownsampleReader(r)
-	b := getDownsampleBatch()
-	defer putDownsampleBatch(b)
+	b := getDownsampleDecodedResolutionFeaturesBlock()
+	defer putDownsampleDecodedResolutionFeaturesBlock(b)
 	for _, resolution := range downsampleResolutions {
 		if err := r.Init(p, resolution); err != nil {
 			t.Fatal(err)
@@ -137,11 +170,14 @@ func TestDownsampleMergerSourcePrecision(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var sources []*partWrapper
+			var rows []rawRow
 			for i, precision := range tc.precisions {
-				sources = append(sources, newDownsampleTestRawPart(t, []rawRow{{
+				row := rawRow{
 					TSID: TSID{MetricID: 42}, Timestamp: base + int64(i)*tc.offset,
 					Value: float64(i + 1), PrecisionBits: precision,
-				}}))
+				}
+				rows = append(rows, row)
+				sources = append(sources, newDownsampleTestRawPart(t, []rawRow{row}))
 			}
 			m := getDownsampleMerger()
 			defer putDownsampleMerger(m)
@@ -152,13 +188,19 @@ func TestDownsampleMergerSourcePrecision(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer w.Abort()
-				if _, err := m.Merge(sources, w, nil, nil, 0, 2); err == nil {
+				if _, err := m.Merge(sources, w, nil, nil, 0); err == nil {
 					t.Fatal("accepted different source precisions in the same bucket")
 				}
 				return
 			}
+			wantRows := referenceDownsampleTestRows(rows, nil, 0)
+			wantMerged := uint64(len(rows))
 			for round := 0; round < 2; round++ {
-				output, _ := runDownsampleTestMerge(t, m, sources, nil, 0)
+				output, stats := runDownsampleTestMerge(t, m, sources, nil, 0)
+				if stats.rowsMerged != wantMerged || stats.rowsDeleted != 0 {
+					t.Fatalf("round %d changed source statistics: %+v; want %d merged rows", round, stats, wantMerged)
+				}
+				assertDownsampleTestRows(t, readDownsampleTestPart(t, output.p), wantRows)
 				r := getDownsampleReader()
 				defer putDownsampleReader(r)
 				for _, resolution := range downsampleResolutions {
@@ -167,7 +209,7 @@ func TestDownsampleMergerSourcePrecision(t *testing.T) {
 					}
 					blocks := 0
 					for r.NextHeader() {
-						var b downsampleBatch
+						var b downsampleDecodedResolutionFeaturesBlock
 						if err := r.ReadBlock(&b); err != nil {
 							t.Fatal(err)
 						}
@@ -193,40 +235,122 @@ func TestDownsampleMergerSourcePrecision(t *testing.T) {
 					}
 				}
 				sources = []*partWrapper{output}
+				wantMerged = output.p.ph.RowsCount
 			}
 		})
 	}
 }
 
-func TestDownsampleMergerOverlappingBlocksAndWindows(t *testing.T) {
-	const base int64 = 1704067200000
-	ts := TSID{MetricID: 42}
-	rows := make([]rawRow, maxRowsPerBlock+257)
-	for i := range rows {
-		rows[i] = rawRow{TSID: ts, Timestamp: base + int64(i)*1000, Value: float64(i%7 - 3), PrecisionBits: 64}
+type downsampleStateObserverWriter struct {
+	downsampleFileWriter
+	observe func()
+}
+
+func (w *downsampleStateObserverWriter) Write(b []byte) (int, error) {
+	w.observe()
+	return w.downsampleFileWriter.Write(b)
+}
+
+func TestDownsampleMergerDynamicBucketRange(t *testing.T) {
+	const (
+		base int64 = 1704067200000
+		day  int64 = 24 * 60 * 60 * 1000
+	)
+	shortBefore, long, shortAfter := TSID{MetricID: 1}, TSID{MetricID: 2}, TSID{MetricID: 3}
+	rows := []rawRow{
+		// 相邻点恰好跨越 5m 边界，但仍属于同一小时。
+		{TSID: shortBefore, Timestamp: base + 299999, Value: 2, PrecisionBits: 64},
+		{TSID: shortBefore, Timestamp: base + 300000, Value: 3, PrecisionBits: 64},
+		{TSID: long, Timestamp: base + 31*day + 3000, Value: 8, PrecisionBits: 64},
+		// 相邻点同时跨越 5m 和 1h 边界。
+		{TSID: shortAfter, Timestamp: base + 3599999, Value: -2, PrecisionBits: 64},
+		{TSID: shortAfter, Timestamp: base + 3600000, Value: 7, PrecisionBits: 64},
 	}
-	// 手工构造同一 part 中时间范围重叠的两个 block，均跨越多个双区间窗口。
-	var blocks [][]rawRow
-	for offset := 0; offset < 2; offset++ {
-		var block []rawRow
-		for i := 0; i < 130; i++ {
-			block = append(block, rawRow{TSID: ts, Timestamp: base + int64(i+offset)*60000, Value: float64(offset + 2), PrecisionBits: 64})
-		}
-		blocks = append(blocks, block)
+	// 直接调用 merger 的合成跨月测试；生产源来自同一个月分区。
+	// 两个 block 的时间范围重叠，最大时间在第二个 block，最小时间在另一个源。
+	blocks := [][]rawRow{
+		{
+			{TSID: long, Timestamp: base + 1000, Value: 2, PrecisionBits: 64},
+			{TSID: long, Timestamp: base + 31*day + 1000, Value: 3, PrecisionBits: 64},
+			{TSID: long, Timestamp: base + 62*day + 299999, Value: 4, PrecisionBits: 64},
+		},
+		{
+			{TSID: long, Timestamp: base + 2*day + 1000, Value: 5, PrecisionBits: 64},
+			{TSID: long, Timestamp: base + 31*day + 2000, Value: 6, PrecisionBits: 64},
+			{TSID: long, Timestamp: base + 63*day + 1000, Value: 7, PrecisionBits: 64},
+		},
 	}
-	all := append([]rawRow(nil), rows...)
+	first := []rawRow{{TSID: long, Timestamp: base + 500, Value: 11, PrecisionBits: 64}}
+	sources := []*partWrapper{
+		newDownsampleTestRawPart(t, rows),
+		newDownsampleTestOverlappingPart(t, blocks),
+		newDownsampleTestRawPart(t, first),
+	}
+	all := append(append([]rawRow(nil), rows...), first...)
 	for _, block := range blocks {
 		all = append(all, block...)
 	}
 	m := getDownsampleMerger()
 	defer putDownsampleMerger(m)
-	output, stats := runDownsampleTestMerge(t, m, []*partWrapper{
-		newDownsampleTestRawPart(t, rows), newDownsampleTestOverlappingPart(t, blocks),
-	}, nil, 0)
-	if stats.rowsMerged != uint64(len(all)) {
-		t.Fatalf("unexpected source rows; got %d; want %d", stats.rowsMerged, len(all))
+	type observedRange struct {
+		metricID   uint64
+		resolution int64
+		buckets    int
 	}
-	assertDownsampleTestRows(t, readDownsampleTestPart(t, output.p), referenceDownsampleTestRows(all, nil, 0))
+	// 63 天含首尾 bucket：5m 为 18145，1h 为 1513；短序列不受 part 范围影响。
+	wantRanges := []observedRange{
+		{1, downsampleResolution5m, 2}, {2, downsampleResolution5m, 18145}, {3, downsampleResolution5m, 2},
+		{1, downsampleResolution1h, 1}, {2, downsampleResolution1h, 1513}, {3, downsampleResolution1h, 2},
+	}
+	wantMerged := uint64(len(all))
+	// raw 首次聚合和 summary 重写都按当前分辨率的 header 范围开槽。
+	for round := 0; round < 2; round++ {
+		w := getDownsampleWriter()
+		defer putDownsampleWriter(w)
+		path := filepath.Join(t.TempDir(), "part")
+		if err := w.Init(path, -5); err != nil {
+			t.Fatal(err)
+		}
+		defer w.Abort()
+		var observed []observedRange
+		w.timestampsWriter = &downsampleStateObserverWriter{downsampleFileWriter: w.timestampsWriter, observe: func() {
+			observed = append(observed, observedRange{w.blocks[0].bh.TSID.MetricID, w.resolution, len(m.currentTSIDBucketSamples)})
+		}}
+		stats, err := m.Merge(sources, w, nil, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.rowsMerged != wantMerged || stats.rowsDeleted != 0 {
+			t.Fatalf("round %d: unexpected source statistics: %+v; want %d merged rows", round, stats, wantMerged)
+		}
+		if len(observed) != len(wantRanges) {
+			t.Fatalf("round %d: unexpected output ranges: got %+v; want %+v", round, observed, wantRanges)
+		}
+		for i, want := range wantRanges {
+			if observed[i] != want {
+				t.Fatalf("round %d output %d used the wrong TSID bucket range: got %+v; want %+v", round, i, observed[i], want)
+			}
+		}
+		if _, err := w.Finish(); err != nil {
+			t.Fatal(err)
+		}
+		p, err := openDownsamplePart(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer p.MustClose()
+		assertDownsampleTestRows(t, readDownsampleTestPart(t, p), referenceDownsampleTestRows(all, nil, 0))
+		sources = []*partWrapper{{p: p}}
+		wantMerged = p.ph.RowsCount
+	}
+
+	// 同一 merger 再处理长序列的一个点，前一作业的桶和统计不能带入新结果。
+	reusedRows := []rawRow{{TSID: long, Timestamp: base + 4000, Value: -17, PrecisionBits: 64}}
+	reused, stats := runDownsampleTestMerge(t, m, []*partWrapper{newDownsampleTestRawPart(t, reusedRows)}, nil, 0)
+	if stats.rowsMerged != 1 || stats.rowsDeleted != 0 {
+		t.Fatalf("merger reuse retained old statistics: %+v", stats)
+	}
+	assertDownsampleTestRows(t, readDownsampleTestPart(t, reused.p), referenceDownsampleTestRows(reusedRows, nil, 0))
 }
 
 func TestDownsampleMergerRetentionAndDeletedMetricID(t *testing.T) {
@@ -253,6 +377,26 @@ func TestDownsampleMergerRetentionAndDeletedMetricID(t *testing.T) {
 	assertDownsampleTestRows(t, readDownsampleTestPart(t, merged.p), want)
 }
 
+func TestDownsampleMergerEmptyTSIDBeforeRetainedTSID(t *testing.T) {
+	const base int64 = 1704067200000
+	rows := []rawRow{
+		{TSID: TSID{MetricID: 1}, Timestamp: base + 1, Value: 100, PrecisionBits: 8},
+		{TSID: TSID{MetricID: 1}, Timestamp: base + downsampleResolution5m + 1, Value: 200, PrecisionBits: 8},
+		{TSID: TSID{MetricID: 2}, Timestamp: base + downsampleResolution1h + 1, Value: 3, PrecisionBits: 64},
+	}
+	deadline := base + downsampleResolution1h
+	m := getDownsampleMerger()
+	defer putDownsampleMerger(m)
+	output, stats := runDownsampleTestMerge(t, m, []*partWrapper{newDownsampleTestRawPart(t, rows)}, nil, deadline)
+	if stats.rowsDeleted != 2 || stats.rowsMerged != 1 {
+		t.Fatalf("unexpected empty TSID statistics: %+v", stats)
+	}
+	if output.p.ph.BlocksCount != 2*countOfDownsampleFeatures || output.p.ph.RowsCount != 2*countOfDownsampleFeatures {
+		t.Fatalf("empty TSID produced output blocks or rows: %+v", output.p.ph)
+	}
+	assertDownsampleTestRows(t, readDownsampleTestPart(t, output.p), referenceDownsampleTestRows(rows, nil, deadline))
+}
+
 func TestDownsampleMergerSpecialValues(t *testing.T) {
 	const base int64 = 1704067200000
 	rows := []rawRow{
@@ -264,10 +408,10 @@ func TestDownsampleMergerSpecialValues(t *testing.T) {
 	want := make(map[downsampleTestKey]downsampleSample)
 	for _, resolution := range downsampleResolutions {
 		want[downsampleTestKey{TSID{MetricID: 7}, resolution, base / resolution}] = downsampleSample{
-			base + 120000, [5]float64{math.Inf(-1), decimal.StaleNaN, 2, math.Inf(-1), math.Inf(1)},
+			timestamp: base + 120000, values: [5]float64{math.Inf(-1), decimal.StaleNaN, 2, math.Inf(-1), math.Inf(1)}, precisionBits: 64,
 		}
 		want[downsampleTestKey{TSID{MetricID: 8}, resolution, base / resolution}] = downsampleSample{
-			base + 120000, [5]float64{5, decimal.StaleNaN, 2, decimal.StaleNaN, decimal.StaleNaN},
+			timestamp: base + 120000, values: [5]float64{5, decimal.StaleNaN, 2, decimal.StaleNaN, decimal.StaleNaN}, precisionBits: 64,
 		}
 	}
 	m := getDownsampleMerger()
@@ -305,20 +449,30 @@ func TestDownsampleMergerSummaryPhysicalStatistics(t *testing.T) {
 
 func TestDownsampleMergerOutputBlockBoundary(t *testing.T) {
 	const base int64 = 1704067200000
-	rows := make([]rawRow, maxRowsPerBlock+1)
-	for i := range rows {
-		rows[i] = rawRow{
-			TSID: TSID{MetricID: 7}, Timestamp: base + int64(i)*downsampleResolution5m,
-			Value: float64(i % 5), PrecisionBits: 64,
-		}
+	for _, tc := range []struct {
+		name       string
+		bucketStep int64
+	}{
+		{name: "dense", bucketStep: 1},
+		{name: "sparse", bucketStep: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := make([]rawRow, maxRowsPerBlock+1)
+			for i := range rows {
+				rows[i] = rawRow{
+					TSID: TSID{MetricID: 7}, Timestamp: base + int64(i)*tc.bucketStep*downsampleResolution5m,
+					Value: float64(i % 5), PrecisionBits: 64,
+				}
+			}
+			m := getDownsampleMerger()
+			defer putDownsampleMerger(m)
+			output, _ := runDownsampleTestMerge(t, m, []*partWrapper{newDownsampleTestRawPart(t, rows)}, nil, 0)
+			if output.p.ph.BlocksCount != 3*countOfDownsampleFeatures {
+				t.Fatalf("expected split 5m blocks and a 1h block; got %d", output.p.ph.BlocksCount)
+			}
+			assertDownsampleTestRows(t, readDownsampleTestPart(t, output.p), referenceDownsampleTestRows(rows, nil, 0))
+		})
 	}
-	m := getDownsampleMerger()
-	defer putDownsampleMerger(m)
-	output, _ := runDownsampleTestMergeWindow(t, m, []*partWrapper{newDownsampleTestRawPart(t, rows)}, nil, 0, downsampleWindowBuckets)
-	if output.p.ph.BlocksCount < 3 {
-		t.Fatalf("expected split 5m blocks and a 1h block; got %d", output.p.ph.BlocksCount)
-	}
-	assertDownsampleTestRows(t, readDownsampleTestPart(t, output.p), referenceDownsampleTestRows(rows, nil, 0))
 }
 
 func TestDownsampleMergerCancellation(t *testing.T) {
@@ -334,7 +488,7 @@ func TestDownsampleMergerCancellation(t *testing.T) {
 	}
 	stopCh := make(chan struct{})
 	close(stopCh)
-	stats, err := m.Merge([]*partWrapper{raw}, w, stopCh, nil, 0, 2)
+	stats, err := m.Merge([]*partWrapper{raw}, w, stopCh, nil, 0)
 	if !errors.Is(err, errForciblyStopped) {
 		t.Fatalf("unexpected cancellation result: %v", err)
 	}
@@ -353,9 +507,9 @@ func TestDownsampleMergerCancellation(t *testing.T) {
 func TestDownsampleMergerSharedPrecisionAndColumnScales(t *testing.T) {
 	const base int64 = 1704067200000
 	var sources []*partWrapper
-	var decoded []*downsampleBatch
+	var decoded []*downsampleDecodedResolutionFeaturesBlock
 	for source := 0; source < 2; source++ {
-		block := &downsampleBatch{
+		block := &downsampleDecodedResolutionFeaturesBlock{
 			tsid: TSID{MetricID: 42}, resolution: downsampleResolution5m,
 			precisionBits: 64,
 		}
@@ -375,7 +529,7 @@ func TestDownsampleMergerSharedPrecisionAndColumnScales(t *testing.T) {
 			putDownsampleWriter(w)
 			t.Fatal(err)
 		}
-		if err := w.WriteBlock(block); err != nil {
+		if err := writeDownsampleTestBlock(w, block); err != nil {
 			putDownsampleWriter(w)
 			t.Fatal(err)
 		}
@@ -427,10 +581,14 @@ func TestDownsampleMergerSharedPrecisionAndColumnScales(t *testing.T) {
 			point, ok := points[bucket]
 			if !ok {
 				point.timestamp = timestamp
+				point.precisionBits = block.precisionBits
 				for feature := range point.values {
 					point.values[feature] = block.values[feature][row]
 				}
 			} else {
+				if point.precisionBits != block.precisionBits {
+					t.Fatal("reference summary inputs have different precisions in one bucket")
+				}
 				if timestamp > point.timestamp || timestamp == point.timestamp && block.values[0][row] > point.values[0] {
 					point.timestamp, point.values[0] = timestamp, block.values[0][row]
 				}
@@ -447,7 +605,7 @@ func TestDownsampleMergerSharedPrecisionAndColumnScales(t *testing.T) {
 		buckets = append(buckets, bucket)
 	}
 	sort.Slice(buckets, func(i, j int) bool { return buckets[i] < buckets[j] })
-	expected := &downsampleBatch{
+	expected := &downsampleDecodedResolutionFeaturesBlock{
 		tsid: TSID{MetricID: 42}, resolution: downsampleResolution5m,
 		precisionBits: 64,
 	}
@@ -471,7 +629,7 @@ func TestDownsampleMergerSharedPrecisionAndColumnScales(t *testing.T) {
 			blocks := 0
 			for {
 				assertDownsampleTestHeaderPrecision(t, r, 64)
-				var batch downsampleBatch
+				var batch downsampleDecodedResolutionFeaturesBlock
 				if err := r.ReadBlock(&batch); err != nil {
 					t.Fatal(err)
 				}
@@ -496,9 +654,9 @@ func TestDownsampleMergerSharedPrecisionAndColumnScales(t *testing.T) {
 	}
 }
 
-func roundTripDownsampleTestReferenceBlock(t *testing.T, source *downsampleBatch) *downsampleBatch {
+func roundTripDownsampleTestReferenceBlock(t *testing.T, source *downsampleDecodedResolutionFeaturesBlock) *downsampleDecodedResolutionFeaturesBlock {
 	t.Helper()
-	result := &downsampleBatch{
+	result := &downsampleDecodedResolutionFeaturesBlock{
 		tsid: source.tsid, resolution: source.resolution,
 		precisionBits: source.precisionBits,
 	}
@@ -523,10 +681,10 @@ func roundTripDownsampleTestReferenceBlock(t *testing.T, source *downsampleBatch
 	return result
 }
 
-func downsampleTestBlockRows(block *downsampleBatch) map[downsampleTestKey]downsampleSample {
+func downsampleTestBlockRows(block *downsampleDecodedResolutionFeaturesBlock) map[downsampleTestKey]downsampleSample {
 	rows := make(map[downsampleTestKey]downsampleSample)
 	for row, timestamp := range block.timestamps {
-		point := downsampleSample{timestamp: timestamp}
+		point := downsampleSample{timestamp: timestamp, precisionBits: block.precisionBits}
 		for feature := range point.values {
 			point.values[feature] = block.values[feature][row]
 		}
@@ -572,18 +730,13 @@ func newDownsampleTestOverlappingPart(t *testing.T, blocks [][]rawRow) *partWrap
 
 func runDownsampleTestMerge(t *testing.T, m *downsampleMerger, sources []*partWrapper, deleted *uint64set.Set, deadline int64) (*partWrapper, downsampleMergeStats) {
 	t.Helper()
-	return runDownsampleTestMergeWindow(t, m, sources, deleted, deadline, 2)
-}
-
-func runDownsampleTestMergeWindow(t *testing.T, m *downsampleMerger, sources []*partWrapper, deleted *uint64set.Set, deadline int64, windowBuckets int) (*partWrapper, downsampleMergeStats) {
-	t.Helper()
 	path := filepath.Join(t.TempDir(), "part")
 	w := getDownsampleWriter()
 	defer putDownsampleWriter(w)
 	if err := w.Init(path, -5); err != nil {
 		t.Fatal(err)
 	}
-	stats, err := m.Merge(sources, w, nil, deleted, deadline, windowBuckets)
+	stats, err := m.Merge(sources, w, nil, deleted, deadline)
 	if err != nil {
 		w.Abort()
 		t.Fatalf("cannot merge: %s", err)
@@ -607,8 +760,8 @@ func readDownsampleTestPart(t *testing.T, p *part) map[downsampleTestKey]downsam
 	result := make(map[downsampleTestKey]downsampleSample)
 	r := getDownsampleReader()
 	defer putDownsampleReader(r)
-	b := getDownsampleBatch()
-	defer putDownsampleBatch(b)
+	b := getDownsampleDecodedResolutionFeaturesBlock()
+	defer putDownsampleDecodedResolutionFeaturesBlock(b)
 	for _, resolution := range downsampleResolutions {
 		if err := r.Init(p, resolution); err != nil {
 			t.Fatal(err)
@@ -622,7 +775,7 @@ func readDownsampleTestPart(t *testing.T, p *part) map[downsampleTestKey]downsam
 				if _, ok := result[key]; ok {
 					t.Fatalf("multiple rows for target bucket %+v", key)
 				}
-				point := downsampleSample{timestamp: timestamp}
+				point := downsampleSample{timestamp: timestamp, precisionBits: b.precisionBits}
 				for feature := range point.values {
 					point.values[feature] = b.values[feature][i]
 				}
@@ -638,6 +791,7 @@ func readDownsampleTestPart(t *testing.T, p *part) map[downsampleTestKey]downsam
 
 func referenceDownsampleTestRows(rows []rawRow, deleted *uint64set.Set, deadline int64) map[downsampleTestKey]downsampleSample {
 	groups := make(map[downsampleTestKey][]downsampleTestSample)
+	precisions := make(map[downsampleTestKey]uint8)
 	for _, row := range rows {
 		if deleted != nil && deleted.Has(row.TSID.MetricID) {
 			continue
@@ -649,11 +803,14 @@ func referenceDownsampleTestRows(rows []rawRow, deleted *uint64set.Set, deadline
 			}
 			key := downsampleTestKey{row.TSID, resolution, bucket}
 			groups[key] = append(groups[key], downsampleTestSample{row.Timestamp, row.Value})
+			precisions[key] = row.PrecisionBits
 		}
 	}
 	result := make(map[downsampleTestKey]downsampleSample)
 	for key, samples := range groups {
-		result[key] = referenceDownsampleTestPoint(samples)
+		point := referenceDownsampleTestPoint(samples)
+		point.precisionBits = precisions[key]
+		result[key] = point
 	}
 	return result
 }

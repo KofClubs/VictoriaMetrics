@@ -10,34 +10,34 @@ import (
 
 var downsampleBenchmarkPoint downsampleSample
 
-func BenchmarkDownsampleAccumulator(b *testing.B) {
+func BenchmarkDownsampleSample(b *testing.B) {
 	const rowsCount = 8192
-	for _, summary := range []bool{false, true} {
+	for _, sampleInput := range []bool{false, true} {
 		name := "Raw"
-		if summary {
-			name = "Summary"
+		if sampleInput {
+			name = "Sample"
 		}
 		b.Run(name, func(b *testing.B) {
 			points := make([]downsampleSample, rowsCount)
 			for i := range points {
 				v := float64(i%17 - 8)
-				points[i] = downsampleSample{minUnixMilli + int64(i), [5]float64{v, v * 16, 16, v - 2, v + 2}}
+				points[i] = downsampleSample{timestamp: minUnixMilli + int64(i), values: [countOfDownsampleFeatures]float64{v, v * 16, 16, v - 2, v + 2}, precisionBits: 64}
 			}
-			var a downsampleAccumulator
+			var a downsampleSample
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				a.Reset()
 				for j := range points {
-					if summary {
-						a.AddSummary(&points[j])
+					if sampleInput {
+						a.Merge(&points[j])
 					} else {
-						a.AddRawRow(points[j].timestamp, points[j].values[downsampleFeatureLast])
+						a.MergeRaw(points[j].timestamp, points[j].values[downsampleFeatureLast], points[j].precisionBits)
 					}
 				}
 			}
 			b.StopTimer()
-			downsampleBenchmarkPoint = a.sample
+			downsampleBenchmarkPoint = a
 			reportDownsampleBenchmarkRows(b, rowsCount)
 		})
 	}
@@ -78,7 +78,7 @@ func BenchmarkDownsampleMerge(b *testing.B) {
 					if err := w.Init(path, -5); err != nil {
 						b.Fatal(err)
 					}
-					if _, err := m.Merge(sources, w, nil, nil, 0, downsampleWindowBuckets); err != nil {
+					if _, err := m.Merge(sources, w, nil, nil, 0); err != nil {
 						b.Fatal(err)
 					}
 					if _, err := w.Finish(); err != nil {
@@ -104,8 +104,8 @@ func BenchmarkDownsampleFileRead(b *testing.B) {
 			fileBytes := downsampleBenchmarkFileSize(b, p.path)
 			r := getDownsampleReader()
 			defer putDownsampleReader(r)
-			block := getDownsampleBatch()
-			defer putDownsampleBatch(block)
+			block := getDownsampleDecodedResolutionFeaturesBlock()
+			defer putDownsampleDecodedResolutionFeaturesBlock(block)
 			var count float64
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -141,6 +141,15 @@ func BenchmarkDownsampleFileWrite(b *testing.B) {
 			root := b.TempDir()
 			p := newDownsampleBenchmarkFile(b, newDownsampleBenchmarkSources(b, workload), filepath.Join(root, "source")).p
 			blocks := readDownsampleBenchmarkBlocks(b, p)
+			// 测试数据转置不计入 writer 基准；生产直接接收 merger 的样本切片。
+			blockSamples := make([][]downsampleSample, len(blocks))
+			for i, block := range blocks {
+				var err error
+				blockSamples[i], err = downsampleTestBlockSamples(block)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
 			w := getDownsampleWriter()
 			defer putDownsampleWriter(w)
 			var outputBytes uint64
@@ -153,8 +162,8 @@ func BenchmarkDownsampleFileWrite(b *testing.B) {
 				if err := w.Init(path, -5); err != nil {
 					b.Fatal(err)
 				}
-				for _, block := range blocks {
-					if err := w.WriteBlock(block); err != nil {
+				for blockIndex, block := range blocks {
+					if err := w.WriteSamples(&block.tsid, block.resolution, blockSamples[blockIndex], nil); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -216,7 +225,7 @@ func newDownsampleBenchmarkFile(b *testing.B, sources []*partWrapper, path strin
 	if err := w.Init(path, -5); err != nil {
 		b.Fatal(err)
 	}
-	if _, err := m.Merge(sources, w, nil, nil, 0, downsampleWindowBuckets); err != nil {
+	if _, err := m.Merge(sources, w, nil, nil, 0); err != nil {
 		b.Fatal(err)
 	}
 	if _, err := w.Finish(); err != nil {
@@ -232,18 +241,18 @@ func newDownsampleBenchmarkFile(b *testing.B, sources []*partWrapper, path strin
 	return pw
 }
 
-func readDownsampleBenchmarkBlocks(b *testing.B, p *part) []*downsampleBatch {
+func readDownsampleBenchmarkBlocks(b *testing.B, p *part) []*downsampleDecodedResolutionFeaturesBlock {
 	b.Helper()
 	r := getDownsampleReader()
 	defer putDownsampleReader(r)
-	var blocks []*downsampleBatch
+	var blocks []*downsampleDecodedResolutionFeaturesBlock
 	for _, resolution := range downsampleResolutions {
 		if err := r.Init(p, resolution); err != nil {
 			b.Fatal(err)
 		}
 		for r.NextHeader() {
-			block := getDownsampleBatch()
-			b.Cleanup(func() { putDownsampleBatch(block) })
+			block := getDownsampleDecodedResolutionFeaturesBlock()
+			b.Cleanup(func() { putDownsampleDecodedResolutionFeaturesBlock(block) })
 			if err := r.ReadBlock(block); err != nil {
 				b.Fatal(err)
 			}

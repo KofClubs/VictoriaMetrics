@@ -57,8 +57,8 @@ func assertDownsampleWriterAborted(t *testing.T, w *downsampleWriter, path strin
 	if _, err := w.Finish(); !errors.Is(err, cause) {
 		t.Fatalf("Finish lost the failure or accepted partial output: %v", err)
 	}
-	if err := w.WriteBlock(fileTestDownsampleBlock(2, 300000)); !errors.Is(err, cause) {
-		t.Fatalf("WriteBlock lost the failure or accepted more output: %v", err)
+	if err := writeDownsampleTestBlock(w, fileTestDownsampleBlock(2, 300000)); !errors.Is(err, cause) {
+		t.Fatalf("WriteSamples lost the failure or accepted more output: %v", err)
 	}
 	if err := w.Abort(); err != nil {
 		t.Fatalf("cleanup must be idempotent: %v", err)
@@ -103,7 +103,7 @@ func TestDownsampleWriterFinalFileFailures(t *testing.T) {
 					failingFile.writeErr = io.ErrUnexpectedEOF
 					failingFile.abortErr = cause
 				}
-				err := w.WriteBlock(fileTestDownsampleBlock(1, 300000))
+				err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, 300000))
 				if err == nil {
 					_, err = w.Finish()
 				}
@@ -137,7 +137,7 @@ func TestDownsampleWriterSpillAndValidationFailures(t *testing.T) {
 				// Earlier columns already have buffered data when the third fails.
 				w.spills[2] = filestream.NewSpillWriter(filepath.Join(path, "missing"))
 			}
-			err := w.WriteBlock(fileTestDownsampleBlock(1, 300000))
+			err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, 300000))
 			if scenario != "spill_create" && err != nil {
 				t.Fatal(err)
 			}
@@ -156,7 +156,7 @@ func TestDownsampleWriterSpillAndValidationFailures(t *testing.T) {
 				}
 				_, err = w.Finish()
 			case "invalid_next_batch":
-				err = w.WriteBlock(nil)
+				err = writeDownsampleTestBlock(&w, nil)
 			}
 			if err == nil {
 				t.Fatal("expected failure")
@@ -166,7 +166,7 @@ func TestDownsampleWriterSpillAndValidationFailures(t *testing.T) {
 			if err := w.Init(path, 1); err != nil {
 				t.Fatal(err)
 			}
-			if err := w.WriteBlock(fileTestDownsampleBlock(1, 300000)); err != nil {
+			if err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, 300000)); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := w.Finish(); err != nil {
@@ -195,7 +195,7 @@ func TestDownsampleWriterFinalFilePermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.Abort()
-	if err := w.WriteBlock(fileTestDownsampleBlock(1, 300000)); err != nil {
+	if err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, 300000)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.Finish(); err != nil {

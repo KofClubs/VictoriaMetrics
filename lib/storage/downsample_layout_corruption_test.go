@@ -252,8 +252,8 @@ func checkDownsampleCrossIndexStateCleared(t *testing.T, r *downsampleReader) {
 
 func checkDownsampleCrossIndexRows(t *testing.T, r *downsampleReader, ids []uint64) {
 	t.Helper()
-	b := getDownsampleBatch()
-	defer putDownsampleBatch(b)
+	b := getDownsampleDecodedResolutionFeaturesBlock()
+	defer putDownsampleDecodedResolutionFeaturesBlock(b)
 	i := 0
 	for r.NextHeader() {
 		if i >= len(ids) || r.Header().TSID.MetricID != ids[i] {
@@ -280,11 +280,11 @@ func writeDownsampleCrossIndexPart(t *testing.T) string {
 	if err := w.Init(path, 1); err != nil {
 		t.Fatal(err)
 	}
-	// WriteBlock 暂存各 feature，实际切 index 发生在 flushResolution。
+	// WriteSamples 暂存各 feature，实际切 index 发生在 flushResolution。
 	w.indexLimit = clusterDownsampleFieldHeaderBytes
 	for _, resolution := range []int64{300000, 3600000} {
 		for id := uint64(1); id <= 4; id++ {
-			b := &downsampleBatch{tsid: TSID{MetricID: id}, resolution: resolution, precisionBits: 64}
+			b := &downsampleDecodedResolutionFeaturesBlock{tsid: TSID{MetricID: id}, resolution: resolution, precisionBits: 64}
 			base := int64(minUnixMilli)
 			if id == 2 {
 				base += 50 * resolution
@@ -295,7 +295,7 @@ func writeDownsampleCrossIndexPart(t *testing.T) string {
 					b.values[col] = append(b.values[col], float64(int(id)*10+col*4+row*row*row))
 				}
 			}
-			if err := w.WriteBlock(b); err != nil {
+			if err := writeDownsampleTestBlock(w, b); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -375,7 +375,7 @@ func TestDownsampleReaderDuplicateBatchKey(t *testing.T) {
 				for j := range b.timestamps {
 					b.timestamps[j] += int64(i) * 2 * 300000
 				}
-				if err := w.WriteBlock(b); err != nil {
+				if err := writeDownsampleTestBlock(w, b); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -479,7 +479,7 @@ func TestDownsampleReaderRawDuplicateBoundaryAllowed(t *testing.T) {
 	if err := r.Init(p, 300000); err != nil {
 		t.Fatal(err)
 	}
-	var batch downsampleBatch
+	var batch downsampleDecodedResolutionFeaturesBlock
 	count := 0
 	for r.NextHeader() {
 		if err := r.ReadBlock(&batch); err != nil {

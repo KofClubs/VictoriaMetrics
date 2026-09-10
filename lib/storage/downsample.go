@@ -23,38 +23,40 @@ const (
 	countOfDownsampleFeatures
 )
 
-// downsampleSample 保存一个区间的一份摘要；五个特征共享 timestamp。
+// downsampleSample 保存一个 bucket 的样本，并可直接合并同 bucket 的其他样本。
+// 时间戳和五个特征共用源精度；precisionBits 为 0 表示空槽，合法样本精度为 1..64。
 type downsampleSample struct {
+	// timestamp 是当前 bucket 中最新贡献的时间，用于选择 last，并作为写出时间戳。
 	timestamp int64
-	values    [countOfDownsampleFeatures]float64
+	// values 保存当前 bucket 的五个特征，按 downsampleFeature* 编号直接累加，避免额外状态包装。
+	values [countOfDownsampleFeatures]float64
+	// precisionBits 继承源精度；0 标记尚无贡献的空 bucket，写出时跳过。
+	precisionBits uint8
 }
 
-// downsampleAccumulator 归并同一 TSID、目标分辨率和区间的全部输入。
-// 调用方负责分桶、选源和 retention；此处不删除重复输入。
-type downsampleAccumulator struct {
-	sample      downsampleSample
-	initialized bool
+func (s *downsampleSample) isEmpty() bool {
+	return s.precisionBits == 0
 }
 
-// Reset 清除全部摘要状态，空区间不产生摘要行。
-func (a *downsampleAccumulator) Reset() {
-	*a = downsampleAccumulator{}
+// Reset 清除全部样本状态，使当前槽位恢复为空。
+func (s *downsampleSample) Reset() {
+	*s = downsampleSample{}
 }
 
-// AddSummary 合并一份源摘要，不改变输入，也不将摘要行重新计为一个样本。
-func (a *downsampleAccumulator) AddSummary(s *downsampleSample) {
+// Merge 将另一个样本合入当前样本，不修改输入；sum 和 count 按输入值累加。
+// 输入须携带 1..64 的源精度；调用方保证 TSID、分辨率、bucket 和精度一致，并处理选源及 retention。
+func (s *downsampleSample) Merge(other *downsampleSample) {
 	// 复制后再归并，保证输入与当前状态共用存储时仍只读取一份完整源贡献。
-	src := *s
+	src := *other
 	for i, v := range src.values {
 		src.values[i] = normalizeDownsampleValue(v)
 	}
-	if !a.initialized {
-		a.sample = src
-		a.initialized = true
+	if s.isEmpty() {
+		*s = src
 		return
 	}
 
-	dst := &a.sample
+	dst := s
 	if src.timestamp > dst.timestamp {
 		dst.timestamp = src.timestamp
 		dst.values[downsampleFeatureLast] = src.values[downsampleFeatureLast]

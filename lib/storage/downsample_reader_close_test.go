@@ -141,29 +141,41 @@ func TestDownsampleMergerResetClosesAllReaders(t *testing.T) {
 			if err := first.timestampsReader.Close(); err != nil {
 				t.Fatal(err)
 			}
-			m := downsampleMerger{cursors: []downsampleMergeCursor{{reader: first}, {reader: second}}, reader: window}
+			// first 已出堆，但仍由 readers 持有；清理不能只遍历 heap。
+			activeReaders := []*downsampleReader{first, second}
+			m := downsampleMerger{
+				currentResolutionReaders:    []*downsampleReader{first, second},
+				currentTSIDReaders:          activeReaders,
+				currentResolutionReaderHeap: downsampleReaderHeap{second},
+				currentSourceReader:         window,
+			}
 			var err error
 			switch operation {
 			case "reset":
 				err = m.Reset()
 			case "init_sources":
 				err = m.initSources(nil, downsampleResolution1h)
-				// Switching columns closes cursors; the independent window reader remains usable.
+				// Switching columns closes source readers; the independent data reader remains usable.
 				if _, statErr := window.timestampsReader.Stat(); statErr != nil {
-					t.Fatalf("initSources closed the independent window reader: %v", statErr)
+					t.Fatalf("initSources closed the independent window currentSourceReader: %v", statErr)
 				}
 				if closeErr := m.closeReaders(); closeErr != nil {
 					t.Fatal(closeErr)
 				}
 			case "merge":
-				_, err = m.Merge(nil, nil, nil, nil, 0, 1)
+				_, err = m.Merge(nil, nil, nil, nil, 0)
 			}
 			if !errors.Is(err, os.ErrClosed) {
 				t.Fatalf("%s lost reader close error: %v", operation, err)
 			}
 			assertDownsampleFilesClosed(t, files)
-			if len(m.cursors) != 0 || len(m.heap) != 0 || m.reader != nil {
+			if len(m.currentResolutionReaders) != 0 || len(m.currentTSIDReaders) != 0 || len(m.currentResolutionReaderHeap) != 0 || m.currentSourceReader != nil {
 				t.Fatal("merger retained closed readers")
+			}
+			for _, r := range activeReaders {
+				if r != nil {
+					t.Fatal("active readers backing array retained a returned reader")
+				}
 			}
 		})
 	}
@@ -204,13 +216,21 @@ func TestDownsampleMergerClosesBeforeReturning(t *testing.T) {
 			writeErr := errors.New("injected output write failure")
 			var files []*os.File
 			var closeNames []string
+			var activeReaders []*downsampleReader
 			w.timestampsWriter = &downsampleCloseTestWriter{downsampleFileWriter: w.timestampsWriter, beforeWrite: func() error {
 				if w.resolution != downsampleResolution1h || files != nil {
 					return nil
 				}
 				// The last output batch is already read. Close actual source handles to
 				// make only cleanup fail, without adding production test hooks.
-				readers := []*downsampleReader{m.cursors[0].reader, m.reader}
+				if len(m.currentResolutionReaderHeap) != 0 || len(m.currentResolutionReaders) != 1 || m.currentResolutionReaders[0].p != p {
+					t.Fatal("exhausted source reader must leave the heap but remain owned until cleanup")
+				}
+				if len(m.currentTSIDReaders) != 1 || m.currentTSIDReaders[0] != m.currentResolutionReaders[0] {
+					t.Fatal("active reader must borrow the same instance held by the complete readers list")
+				}
+				activeReaders = m.currentTSIDReaders
+				readers := []*downsampleReader{m.currentResolutionReaders[0], m.currentSourceReader}
 				for _, r := range readers {
 					files = append(files, r.timestampsReader, r.valuesReader, r.indexReader)
 					if scenario != "success" {
@@ -228,16 +248,21 @@ func TestDownsampleMergerClosesBeforeReturning(t *testing.T) {
 				}
 				return nil
 			}}
-			stats, err := m.Merge([]*partWrapper{{p: p}}, &w, stopCh, nil, 0, 1)
+			stats, err := m.Merge([]*partWrapper{{p: p}}, &w, stopCh, nil, 0)
 			if len(files) != 6 {
 				t.Fatal("test did not reach the final batch with both source readers")
 			}
 			assertDownsampleFilesClosed(t, files)
-			if len(m.cursors) != 0 || m.reader != nil {
+			if len(m.currentResolutionReaders) != 0 || len(m.currentTSIDReaders) != 0 || len(m.currentResolutionReaderHeap) != 0 || m.currentSourceReader != nil {
 				t.Fatal("Merge returned with live readers")
 			}
-			if stats.rowsMerged != 1 || m.stats != stats || m.stopCh != stopCh {
-				t.Fatalf("closing readers lost statistics or cancellation: returned=%+v; retained=%+v", stats, m.stats)
+			for _, r := range activeReaders {
+				if r != nil {
+					t.Fatal("Merge left a returned reader in the active readers backing array")
+				}
+			}
+			if stats.rowsMerged != 1 || m.mergeStats != stats || m.stopCh != stopCh {
+				t.Fatalf("closing readers lost statistics or cancellation: returned=%+v; retained=%+v", stats, m.mergeStats)
 			}
 			if scenario == "success" {
 				if err != nil {

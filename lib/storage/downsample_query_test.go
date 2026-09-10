@@ -32,7 +32,7 @@ func TestDownsampleQueryFieldParse(t *testing.T) {
 }
 
 func TestDownsampleQueryFieldBlockRef(t *testing.T) {
-	var blocks []*downsampleBatch
+	var blocks []*downsampleDecodedResolutionFeaturesBlock
 	for _, resolution := range downsampleResolutions {
 		for _, id := range []uint64{10, 20, 30} {
 			b := fileTestDownsampleBlock(id, resolution)

@@ -103,7 +103,7 @@ func (pt *partition) mergeDownsampleParts(pws []*partWrapper, dstPartType partTy
 		err = errors.Join(err, cleanupErr)
 	}()
 	deadline := startTime.UnixMilli() - pt.s.retentionMsecs
-	stats, err := m.Merge(pws, w, stopCh, pt.idb.getDeletedMetricIDs(), deadline, downsampleWindowBuckets)
+	stats, err := m.Merge(pws, w, stopCh, pt.idb.getDeletedMetricIDs(), deadline)
 	rowsMerged.Add(stats.rowsMerged)
 	rowsDeleted.Add(stats.rowsDeleted)
 	if err != nil {
@@ -365,14 +365,4 @@ func (pt *partition) getFilePartsToMerge(pws []*partWrapper, maxOutBytes uint64)
 		result = append(result, candidate.pw)
 	}
 	return result
-}
-
-// splitDownsampleMergeBatch 限制强制 merge 和最终 flush 的单次源数量。
-// 原调度未找到均衡组合时可能返回全部源，剩余项必须留给后续批次。
-func splitDownsampleMergeBatch(selected, remaining []*partWrapper) ([]*partWrapper, []*partWrapper) {
-	if len(selected) <= downsampleMaxMergeSources {
-		return selected, remaining
-	}
-	remaining = append(remaining, selected[downsampleMaxMergeSources:]...)
-	return selected[:downsampleMaxMergeSources:downsampleMaxMergeSources], remaining
 }

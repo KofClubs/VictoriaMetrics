@@ -10,38 +10,29 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/uint64set"
 )
 
-const (
-	downsampleWindowBuckets   = 1024
-	downsampleMaxMergeSources = 1024
-)
+// 31 天在 5m 分辨率下最多 8928 个 bucket，池最多保留两倍容量。
+// 这仅控制缓存回收；每个 TSID 的有效槽数由其 block 时间范围决定。
+const downsampleMaxPooledBuckets = 8928 * 2
 
 // downsampleMergeStats 统计实际处理的源物理行，不重复累计原始源的两个分辨率。
 type downsampleMergeStats struct {
-	rowsMerged  uint64
+	// rowsMerged 记录保留的源物理行；raw 仅在首个分辨率累计，降采样行按五个特征换算。
+	rowsMerged uint64
+	// rowsDeleted 记录删除或完全过期的源物理行，避免 raw 在两个分辨率中被重复累计。
 	rowsDeleted uint64
 }
 
-// downsampleWindowState 保存一个完整区间的特征及源数据的共享精度。
-type downsampleWindowState struct {
-	acc           downsampleAccumulator
-	precisionBits uint8
-}
+type downsampleReaderHeap []*downsampleReader
 
-// downsampleMergeCursor 仅保留一个源的索引游标，不持有该源的全部数据 block。
-type downsampleMergeCursor struct {
-	p      *part
-	reader *downsampleReader
+func (h downsampleReaderHeap) Len() int { return len(h) }
+func (h downsampleReaderHeap) Less(i, j int) bool {
+	// 堆只用于按 TSID 收集全部源及其 block 时间范围，不要求同一 TSID 的 block 跨源按时间排序。
+	// 样本按 timestamp 累加到对应 bucket，last 显式比较 timestamp；最终按 bucket 顺序输出。
+	return h[i].Header().TSID.Less(&h[j].Header().TSID)
 }
-
-type downsampleCursorHeap []*downsampleMergeCursor
-
-func (h downsampleCursorHeap) Len() int { return len(h) }
-func (h downsampleCursorHeap) Less(i, j int) bool {
-	return h[i].reader.Header().TSID.Less(&h[j].reader.Header().TSID)
-}
-func (h downsampleCursorHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
-func (h *downsampleCursorHeap) Push(any)     { panic("BUG: unexpected downsample heap push") }
-func (h *downsampleCursorHeap) Pop() any {
+func (h downsampleReaderHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *downsampleReaderHeap) Push(any)     { panic("BUG: unexpected downsample heap push") }
+func (h *downsampleReaderHeap) Pop() any {
 	a := *h
 	v := a[len(a)-1]
 	a[len(a)-1] = nil
@@ -49,85 +40,90 @@ func (h *downsampleCursorHeap) Pop() any {
 	return v
 }
 
-// downsampleMerger 以完整区间窗口归并重叠 block，所有源贡献只计入所属窗口一次。
+// downsampleMerger 按 TSID 的完整时间范围归并重叠 block，所有源贡献只计入所属 bucket 一次。
 type downsampleMerger struct {
-	cursors       []downsampleMergeCursor
-	heap          downsampleCursorHeap
-	activeSources []*part
-	states        []downsampleWindowState
-	reader        *downsampleReader
-	input         *downsampleBatch
-	output        *downsampleBatch
-	writer        *downsampleWriter
-	stopCh        <-chan struct{}
-	stats         downsampleMergeStats
+	// currentResolutionReaders 持有当前分辨率的全部源 reader，包括已出堆及初始化失败的实例，保证统一释放。
+	currentResolutionReaders []*downsampleReader
+	// currentResolutionReaderHeap 按 TSID 排序尚未读完索引的源 reader，每个分辨率建一次堆。
+	currentResolutionReaderHeap downsampleReaderHeap
+	// currentTSIDReaders 借用当前 TSID 涉及的源 reader；每次收集前清空，归还 reader 前移除借用引用。
+	currentTSIDReaders []*downsampleReader
+	// currentTSIDBucketSamples 保存当前分辨率、当前 TSID 的完整 bucket 范围；按 header 时间范围精确开槽，空槽精度为 0。
+	currentTSIDBucketSamples []downsampleSample
+	// currentSourceReader 读取当前源的实际数据，与已推进至下一 TSID 的索引 reader 分开，避免破坏堆的遍历位置。
+	currentSourceReader *downsampleReader
+	// currentSourceBlock 复用当前源、当前分辨率的多特征解码缓冲；读完即累加进 bucket，不保留整个源的数据。
+	currentSourceBlock *downsampleDecodedResolutionFeaturesBlock
+	// partWriter 借用本次 merge 的目标 writer；直接接收 bucket 样本，Finish/Abort 由调用方统一负责。
+	partWriter *downsampleWriter
+	// stopCh 在索引扫描、数据聚合和写出期间检查取消；关闭 reader 时保留，供发布前再次检查。
+	stopCh <-chan struct{}
+	// mergeStats 累计整次 merge 的源行统计；跨分辨率保留，Reset 才清零，避免 raw 行重复计数。
+	mergeStats downsampleMergeStats
 }
 
 // Reset 释放借用对象与源引用；正常工作缓冲可供下一次作业复用。
 func (m *downsampleMerger) Reset() error {
 	err := m.closeReaders()
-	if m.input != nil {
-		putDownsampleBatch(m.input)
-		m.input = nil
+	if m.currentSourceBlock != nil {
+		putDownsampleDecodedResolutionFeaturesBlock(m.currentSourceBlock)
+		m.currentSourceBlock = nil
 	}
-	if m.output != nil {
-		putDownsampleBatch(m.output)
-		m.output = nil
+	if cap(m.currentTSIDBucketSamples) > downsampleMaxPooledBuckets {
+		m.currentTSIDBucketSamples = nil
+	} else {
+		clear(m.currentTSIDBucketSamples)
+		m.currentTSIDBucketSamples = m.currentTSIDBucketSamples[:0]
 	}
-	clear(m.activeSources)
-	m.activeSources = m.activeSources[:0]
-	clear(m.states)
-	m.states = m.states[:0]
-	m.writer = nil
+	m.partWriter = nil
 	m.stopCh = nil
-	m.stats = downsampleMergeStats{}
-	// 强制 merge 可能临时涉及大量 part，池不长期保留这种峰值容量。
-	if cap(m.cursors) > 1024 {
-		m.cursors = nil
+	m.mergeStats = downsampleMergeStats{}
+	// 强制 merge 可能临时涉及大量 part；这里只限制池中保留的容量，不限制归并源数量。
+	if cap(m.currentResolutionReaders) > 1024 {
+		m.currentResolutionReaders = nil
 	}
-	if cap(m.heap) > 1024 {
-		m.heap = nil
+	if cap(m.currentResolutionReaderHeap) > 1024 {
+		m.currentResolutionReaderHeap = nil
 	}
-	if cap(m.activeSources) > 1024 {
-		m.activeSources = nil
-	}
-	if cap(m.states) > downsampleWindowBuckets {
-		m.states = nil
+	if cap(m.currentTSIDReaders) > 1024 {
+		m.currentTSIDReaders = nil
 	}
 	return err
 }
 
-func (m *downsampleMerger) resetCursors() error {
+func (m *downsampleMerger) resetReaders() error {
+	// 先移除借用引用，再归还 reader，避免保留已回到对象池的实例。
+	clear(m.currentTSIDReaders)
+	m.currentTSIDReaders = m.currentTSIDReaders[:0]
+	clear(m.currentResolutionReaderHeap)
+	m.currentResolutionReaderHeap = m.currentResolutionReaderHeap[:0]
 	var err error
-	for i := range m.cursors {
-		c := &m.cursors[i]
-		if c.reader != nil {
-			err = errors.Join(err, putDownsampleReader(c.reader))
+	for i, currentResolutionReader := range m.currentResolutionReaders {
+		if currentResolutionReader != nil {
+			err = errors.Join(err, putDownsampleReader(currentResolutionReader))
 		}
-		*c = downsampleMergeCursor{}
+		m.currentResolutionReaders[i] = nil
 	}
-	m.cursors = m.cursors[:0]
-	clear(m.heap)
-	m.heap = m.heap[:0]
+	m.currentResolutionReaders = m.currentResolutionReaders[:0]
 	return err
 }
 
-// closeReaders 在 Merge 返回前释放源文件，但保留统计和取消信号供 Finish/发布前检查。
+// closeReaders 在 Merge 返回前释放 reader 及自有文件，但保留统计和取消信号供 Finish/发布前检查。
 func (m *downsampleMerger) closeReaders() error {
-	err := m.resetCursors()
-	if m.reader != nil {
-		err = errors.Join(err, putDownsampleReader(m.reader))
-		m.reader = nil
+	err := m.resetReaders()
+	if m.currentSourceReader != nil {
+		err = errors.Join(err, putDownsampleReader(m.currentSourceReader))
+		m.currentSourceReader = nil
 	}
 	return err
 }
 
 // Merge 不关闭 writer；调用方在成功后 Finish，失败或取消时 Abort。
 // 所有自有 reader 均在返回前关闭，关闭失败与归并错误一起返回，不能发布部分结果。
-// pws 的引用由调用方持有，必须覆盖整个归并和目标发布过程。
-func (m *downsampleMerger) Merge(pws []*partWrapper, w *downsampleWriter, stopCh <-chan struct{}, dmis *uint64set.Set, retentionDeadline int64, windowBuckets int) (_ downsampleMergeStats, err error) {
+// sourceParts 的引用由调用方持有，必须覆盖整个归并和目标发布过程。
+func (m *downsampleMerger) Merge(sourceParts []*partWrapper, partWriter *downsampleWriter, stopCh <-chan struct{}, deletedMetricIDs *uint64set.Set, retentionDeadline int64) (_ downsampleMergeStats, err error) {
 	if err := m.Reset(); err != nil {
-		return m.stats, err
+		return m.mergeStats, err
 	}
 	defer func() {
 		closeErr := m.closeReaders()
@@ -137,55 +133,43 @@ func (m *downsampleMerger) Merge(pws []*partWrapper, w *downsampleWriter, stopCh
 		}
 		err = errors.Join(err, closeErr)
 	}()
-	if len(pws) > downsampleMaxMergeSources {
-		return m.stats, fmt.Errorf("downsampling merge has %d sources; maximum is %d", len(pws), downsampleMaxMergeSources)
-	}
-	if windowBuckets < 1 || windowBuckets > downsampleWindowBuckets {
-		return m.stats, fmt.Errorf("downsampling window must contain 1..%d buckets; got %d", downsampleWindowBuckets, windowBuckets)
-	}
-	m.writer = w
+	m.partWriter = partWriter
 	m.stopCh = stopCh
-	m.reader = getDownsampleReader()
-	m.input = getDownsampleBatch()
-	m.output = getDownsampleBatch()
-	if cap(m.states) < windowBuckets {
-		m.states = make([]downsampleWindowState, windowBuckets)
-	} else {
-		m.states = m.states[:windowBuckets]
-	}
+	m.currentSourceReader = getDownsampleReader()
+	m.currentSourceBlock = getDownsampleDecodedResolutionFeaturesBlock()
 	var sourceRows uint64
-	for _, pw := range pws {
-		if pw == nil || pw.p == nil {
-			return m.stats, fmt.Errorf("nil downsampling source part")
+	for _, sourcePart := range sourceParts {
+		if sourcePart == nil || sourcePart.p == nil {
+			return m.mergeStats, fmt.Errorf("nil downsampling source part")
 		}
-		if math.MaxUint64-sourceRows < pw.p.ph.RowsCount {
-			return m.stats, fmt.Errorf("downsampling source row count overflows")
+		if math.MaxUint64-sourceRows < sourcePart.p.ph.RowsCount {
+			return m.mergeStats, fmt.Errorf("downsampling source row count overflows")
 		}
-		sourceRows += pw.p.ph.RowsCount
+		sourceRows += sourcePart.p.ph.RowsCount
 	}
-	for _, resolution := range downsampleResolutions {
-		if err := m.initSources(pws, resolution); err != nil {
-			return m.stats, err
+	for _, currentResolution := range downsampleResolutions {
+		if err := m.initSources(sourceParts, currentResolution); err != nil {
+			return m.mergeStats, err
 		}
-		for len(m.heap) > 0 {
+		for len(m.currentResolutionReaderHeap) > 0 {
 			if err := m.checkStopped(); err != nil {
-				return m.stats, err
+				return m.mergeStats, err
 			}
-			tsid := m.heap[0].reader.Header().TSID
-			deleted := dmis != nil && dmis.Has(tsid.MetricID)
-			minTimestamp, err := m.collectSources(&tsid, resolution, deleted)
+			currentTSID := m.currentResolutionReaderHeap[0].Header().TSID
+			deleted := deletedMetricIDs != nil && deletedMetricIDs.Has(currentTSID.MetricID)
+			currentTSIDTimeRange, err := m.collectSources(&currentTSID, currentResolution, deleted)
 			if err != nil {
-				return m.stats, err
+				return m.mergeStats, err
 			}
 			if deleted {
 				continue
 			}
-			if err := m.mergeTSID(&tsid, resolution, minTimestamp, retentionDeadline); err != nil {
-				return m.stats, fmt.Errorf("cannot downsample TSID %+v at resolution %d: %w", tsid, resolution, err)
+			if err := m.mergeTSID(&currentTSID, currentResolution, currentTSIDTimeRange, retentionDeadline); err != nil {
+				return m.mergeStats, fmt.Errorf("cannot downsample TSID %+v at resolution %d: %w", currentTSID, currentResolution, err)
 			}
 		}
 	}
-	return m.stats, m.checkStopped()
+	return m.mergeStats, m.checkStopped()
 }
 
 func (m *downsampleMerger) checkStopped() error {
@@ -197,172 +181,131 @@ func (m *downsampleMerger) checkStopped() error {
 	}
 }
 
-func (m *downsampleMerger) initSources(pws []*partWrapper, resolution int64) error {
-	if err := m.resetCursors(); err != nil {
+func (m *downsampleMerger) initSources(sourceParts []*partWrapper, currentResolution int64) error {
+	if err := m.resetReaders(); err != nil {
 		return err
 	}
-	if cap(m.cursors) < len(pws) {
-		m.cursors = make([]downsampleMergeCursor, len(pws))
+	if cap(m.currentResolutionReaders) < len(sourceParts) {
+		m.currentResolutionReaders = make([]*downsampleReader, len(sourceParts))
 	} else {
-		m.cursors = m.cursors[:len(pws)]
+		m.currentResolutionReaders = m.currentResolutionReaders[:len(sourceParts)]
 	}
-	for i, pw := range pws {
+	for i, sourcePart := range sourceParts {
 		if err := m.checkStopped(); err != nil {
 			return err
 		}
-		c := &m.cursors[i]
-		c.p = pw.p
-		c.reader = getDownsampleReader()
-		if err := c.reader.Init(c.p, resolution); err != nil {
+		currentResolutionReader := getDownsampleReader()
+		m.currentResolutionReaders[i] = currentResolutionReader
+		if err := currentResolutionReader.Init(sourcePart.p, currentResolution); err != nil {
 			return err
 		}
-		if c.reader.NextHeader() {
-			m.heap = append(m.heap, c)
-		} else if err := c.reader.Error(); err != nil {
+		if currentResolutionReader.NextHeader() {
+			m.currentResolutionReaderHeap = append(m.currentResolutionReaderHeap, currentResolutionReader)
+		} else if err := currentResolutionReader.Error(); err != nil {
 			return err
 		}
 	}
-	heap.Init(&m.heap)
+	heap.Init(&m.currentResolutionReaderHeap)
 	return nil
 }
 
-// collectSources 消费当前 TSID 的所有索引项，并将各源游标推进到下一个 TSID。
-func (m *downsampleMerger) collectSources(tsid *TSID, resolution int64, deleted bool) (int64, error) {
-	clear(m.activeSources)
-	m.activeSources = m.activeSources[:0]
-	minTimestamp := int64(math.MaxInt64)
-	for len(m.heap) > 0 && m.heap[0].reader.Header().TSID == *tsid {
-		c := m.heap[0]
-		m.activeSources = append(m.activeSources, c.p)
+// collectSources 从当前 TSID 的所有 block header 收集完整时间范围，并将各源游标推进到下一个 TSID。
+func (m *downsampleMerger) collectSources(currentTSID *TSID, currentResolution int64, deleted bool) (TimeRange, error) {
+	clear(m.currentTSIDReaders)
+	m.currentTSIDReaders = m.currentTSIDReaders[:0]
+	currentTSIDTimeRange := TimeRange{MinTimestamp: math.MaxInt64, MaxTimestamp: math.MinInt64}
+	for len(m.currentResolutionReaderHeap) > 0 && m.currentResolutionReaderHeap[0].Header().TSID == *currentTSID {
+		currentTSIDReader := m.currentResolutionReaderHeap[0]
+		m.currentTSIDReaders = append(m.currentTSIDReaders, currentTSIDReader)
 		for {
 			if err := m.checkStopped(); err != nil {
-				return 0, err
+				return TimeRange{}, err
 			}
-			h := c.reader.Header()
-			minTimestamp = min(minTimestamp, h.MinTimestamp)
-			if deleted && (c.p.dsMetadata != nil || resolution == downsampleResolution5m) {
-				m.stats.rowsDeleted += uint64(h.RowsCount) * downsampleSourceRowWidth(c.p)
+			currentBlockHeader := currentTSIDReader.Header()
+			currentTSIDTimeRange.MinTimestamp = min(currentTSIDTimeRange.MinTimestamp, currentBlockHeader.MinTimestamp)
+			currentTSIDTimeRange.MaxTimestamp = max(currentTSIDTimeRange.MaxTimestamp, currentBlockHeader.MaxTimestamp)
+			if deleted && (currentTSIDReader.p.dsMetadata != nil || currentResolution == downsampleResolution5m) {
+				m.mergeStats.rowsDeleted += uint64(currentBlockHeader.RowsCount) * downsampleSourceRowWidth(currentTSIDReader.p)
 			}
-			if !c.reader.NextHeader() {
-				if err := c.reader.Error(); err != nil {
-					return 0, err
+			if !currentTSIDReader.NextHeader() {
+				if err := currentTSIDReader.Error(); err != nil {
+					return TimeRange{}, err
 				}
-				heap.Pop(&m.heap)
+				heap.Pop(&m.currentResolutionReaderHeap)
 				break
 			}
-			if c.reader.Header().TSID != *tsid {
-				heap.Fix(&m.heap, 0)
+			if currentTSIDReader.Header().TSID != *currentTSID {
+				heap.Fix(&m.currentResolutionReaderHeap, 0)
 				break
 			}
 		}
 	}
-	return minTimestamp, nil
+	return currentTSIDTimeRange, nil
 }
 
-func (m *downsampleMerger) resetOutput(tsid *TSID, resolution int64) {
-	m.output.Reset()
-	m.output.tsid = *tsid
-	m.output.resolution = resolution
-}
-
-func (m *downsampleMerger) flushOutput(tsid *TSID, resolution int64) error {
-	if len(m.output.timestamps) == 0 {
-		return nil
-	}
+func (m *downsampleMerger) mergeTSID(currentTSID *TSID, currentResolution int64, currentTSIDTimeRange TimeRange, retentionDeadline int64) error {
 	if err := m.checkStopped(); err != nil {
 		return err
 	}
-	if err := m.writer.WriteBlock(m.output); err != nil {
-		return err
+	if currentTSIDTimeRange.MinTimestamp > currentTSIDTimeRange.MaxTimestamp {
+		return fmt.Errorf("invalid downsampling TSID time range [%d, %d]", currentTSIDTimeRange.MinTimestamp, currentTSIDTimeRange.MaxTimestamp)
 	}
-	m.resetOutput(tsid, resolution)
-	return nil
-}
-
-func (m *downsampleMerger) mergeTSID(tsid *TSID, resolution, minTimestamp, retentionDeadline int64) error {
-	firstBucket, err := downsampleBucketID(minTimestamp, resolution)
+	firstBucketID, err := downsampleBucketID(currentTSIDTimeRange.MinTimestamp, currentResolution)
 	if err != nil {
 		return err
 	}
-	m.resetOutput(tsid, resolution)
-	for firstBucket != math.MaxInt64 {
-		if err := m.checkStopped(); err != nil {
-			return err
-		}
-		clear(m.states)
-		lastBucket := min(firstBucket+int64(len(m.states))-1, maxUnixMilli/resolution)
-		nextBucket := int64(math.MaxInt64)
-		for _, p := range m.activeSources {
-			if err := m.readWindow(p, tsid, resolution, firstBucket, lastBucket, retentionDeadline, &nextBucket); err != nil {
-				return err
-			}
-		}
-		for i := range m.states {
-			s := &m.states[i]
-			if !s.acc.initialized {
-				continue
-			}
-			b := m.output
-			if len(b.timestamps) > 0 && b.precisionBits != s.precisionBits {
-				if err := m.flushOutput(tsid, resolution); err != nil {
-					return err
-				}
-			}
-			b.precisionBits = s.precisionBits
-			b.timestamps = append(b.timestamps, s.acc.sample.timestamp)
-			for feature, value := range s.acc.sample.values {
-				b.values[feature] = append(b.values[feature], value)
-			}
-			if len(b.timestamps) == maxRowsPerBlock {
-				if err := m.flushOutput(tsid, resolution); err != nil {
-					return err
-				}
-			}
-		}
-		firstBucket = nextBucket
-	}
-	return m.flushOutput(tsid, resolution)
-}
-
-// readWindow 仅读取与窗口相交的 block；未来数据仅用于跳过空区间。
-func (m *downsampleMerger) readWindow(p *part, tsid *TSID, resolution, firstBucket, lastBucket, retentionDeadline int64, nextBucket *int64) error {
-	if err := m.reader.Init(p, resolution); err != nil {
+	lastBucketID, err := downsampleBucketID(currentTSIDTimeRange.MaxTimestamp, currentResolution)
+	if err != nil {
 		return err
 	}
-	m.reader.SetFilter(tsid, firstBucket*resolution, maxUnixMilli)
-	for m.reader.NextHeader() {
+	// 两端已通过时间域和分辨率校验；合法 bucket 总数可安全转换为 int。
+	bucketCount := int(lastBucketID - firstBucketID + 1)
+	if cap(m.currentTSIDBucketSamples) < bucketCount {
+		m.currentTSIDBucketSamples = make([]downsampleSample, bucketCount)
+	} else {
+		m.currentTSIDBucketSamples = m.currentTSIDBucketSamples[:bucketCount]
+		clear(m.currentTSIDBucketSamples)
+	}
+	for _, currentTSIDReader := range m.currentTSIDReaders {
+		if err := m.readSource(currentTSIDReader.p, currentTSID, currentResolution, currentTSIDTimeRange, firstBucketID, retentionDeadline); err != nil {
+			return err
+		}
+	}
+	// writer 直接借用 bucket 样本并逐列编码，不再构造另一份五列输出 Block。
+	return m.partWriter.WriteSamples(currentTSID, currentResolution, m.currentTSIDBucketSamples, m.stopCh)
+}
+
+// readSource 读取一个源中当前 TSID 的全部 block，按整体时间范围累加到对应槽位。
+func (m *downsampleMerger) readSource(sourcePart *part, currentTSID *TSID, currentResolution int64, currentTSIDTimeRange TimeRange, firstBucketID, retentionDeadline int64) error {
+	if err := m.currentSourceReader.Init(sourcePart, currentResolution); err != nil {
+		return err
+	}
+	m.currentSourceReader.SetFilter(currentTSID, currentTSIDTimeRange.MinTimestamp, currentTSIDTimeRange.MaxTimestamp)
+	for m.currentSourceReader.NextHeader() {
 		if err := m.checkStopped(); err != nil {
 			return err
 		}
-		h := m.reader.Header()
-		if h.MinTimestamp/resolution > lastBucket {
-			*nextBucket = min(*nextBucket, h.MinTimestamp/resolution)
-			break
-		}
-		if err := m.reader.ReadBlock(m.input); err != nil {
+		if err := m.currentSourceReader.ReadBlock(m.currentSourceBlock); err != nil {
 			return err
 		}
-		b := m.input
-		for i, timestamp := range b.timestamps {
-			bucketID, err := downsampleBucketID(timestamp, resolution)
+		currentSourceBlock := m.currentSourceBlock
+		for currentRow, timestamp := range currentSourceBlock.timestamps {
+			bucketID, err := downsampleBucketID(timestamp, currentResolution)
 			if err != nil {
 				return err
 			}
-			if bucketID < firstBucket {
-				continue
+			currentBucketSlot := bucketID - firstBucketID
+			if currentBucketSlot < 0 || currentBucketSlot >= int64(len(m.currentTSIDBucketSamples)) {
+				return fmt.Errorf("downsampling timestamp %d is outside TSID bucket range for [%d, %d]", timestamp, currentTSIDTimeRange.MinTimestamp, currentTSIDTimeRange.MaxTimestamp)
 			}
-			if bucketID > lastBucket {
-				*nextBucket = min(*nextBucket, bucketID)
-				continue
-			}
-			bucketEnd, err := downsampleBucketEnd(timestamp, resolution)
+			bucketEnd, err := downsampleBucketEnd(timestamp, currentResolution)
 			if err != nil {
 				return err
 			}
-			if p.dsMetadata != nil || resolution == downsampleResolution5m {
+			if sourcePart.dsMetadata != nil || currentResolution == downsampleResolution5m {
 				// 原始行只有两个目标区间均过期才计为删除；第二次读取不重复统计。
 				expired := bucketEnd <= retentionDeadline
-				if p.dsMetadata == nil && expired {
+				if sourcePart.dsMetadata == nil && expired {
 					coarseEnd, err := downsampleBucketEnd(timestamp, downsampleResolution1h)
 					if err != nil {
 						return err
@@ -370,28 +313,26 @@ func (m *downsampleMerger) readWindow(p *part, tsid *TSID, resolution, firstBuck
 					expired = coarseEnd <= retentionDeadline
 				}
 				if expired {
-					m.stats.rowsDeleted += downsampleSourceRowWidth(p)
+					m.mergeStats.rowsDeleted += downsampleSourceRowWidth(sourcePart)
 				} else {
-					m.stats.rowsMerged += downsampleSourceRowWidth(p)
+					m.mergeStats.rowsMerged += downsampleSourceRowWidth(sourcePart)
 				}
 			}
 			if bucketEnd <= retentionDeadline {
 				continue
 			}
-			s := &m.states[bucketID-firstBucket]
-			if !s.acc.initialized {
-				s.precisionBits = b.precisionBits
-			} else if s.precisionBits != b.precisionBits {
-				return fmt.Errorf("同一降采样 bucket 的源精度不一致: %d vs %d", s.precisionBits, b.precisionBits)
+			currentBucketSample := &m.currentTSIDBucketSamples[currentBucketSlot]
+			if !currentBucketSample.isEmpty() && currentBucketSample.precisionBits != currentSourceBlock.precisionBits {
+				return fmt.Errorf("同一降采样 bucket 的源精度不一致: %d vs %d", currentBucketSample.precisionBits, currentSourceBlock.precisionBits)
 			}
-			point := downsampleSample{timestamp: timestamp}
-			for feature := range point.values {
-				point.values[feature] = b.values[feature][i]
+			currentSourceSample := downsampleSample{timestamp: timestamp, precisionBits: currentSourceBlock.precisionBits}
+			for currentFeature := range currentSourceSample.values {
+				currentSourceSample.values[currentFeature] = currentSourceBlock.values[currentFeature][currentRow]
 			}
-			s.acc.AddSummary(&point)
+			currentBucketSample.Merge(&currentSourceSample)
 		}
 	}
-	return m.reader.Error()
+	return m.currentSourceReader.Error()
 }
 
 func getDownsampleMerger() *downsampleMerger {

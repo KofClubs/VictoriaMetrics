@@ -179,11 +179,11 @@ func TestDownsampleFilePhysicalLayout(t *testing.T) {
 	}
 }
 
-func makeDownsampleLayoutBlocks(blocksPerResolution int, singleRow bool) []*downsampleBatch {
-	var blocks []*downsampleBatch
+func makeDownsampleLayoutBlocks(blocksPerResolution int, singleRow bool) []*downsampleDecodedResolutionFeaturesBlock {
+	var blocks []*downsampleDecodedResolutionFeaturesBlock
 	for _, resolution := range []int64{300000, 3600000} {
 		for i := 0; i < blocksPerResolution; i++ {
-			b := &downsampleBatch{
+			b := &downsampleDecodedResolutionFeaturesBlock{
 				tsid:       TSID{AccountID: 0x11223344 + uint32(i/132), ProjectID: 0x55667788 + uint32(i%132/66), MetricGroupID: 0x123456789abcdef0, JobID: 0x23456789, InstanceID: 0x3456789a, MetricID: uint64(i/2 + 1)},
 				resolution: resolution, precisionBits: 64,
 			}

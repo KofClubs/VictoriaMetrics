@@ -1093,9 +1093,6 @@ func (pt *partition) mergePartsToFilesWithDownsampling(pws []*partWrapper, stopC
 	wg := getWaitGroup()
 	for len(pws) > 0 {
 		pwsToMerge, pwsRemaining := getPartsForOptimalMerge(pws)
-		if downsampling {
-			pwsToMerge, pwsRemaining = splitDownsampleMergeBatch(pwsToMerge, pwsRemaining)
-		}
 		concurrencyCh <- struct{}{}
 		if downsampling {
 			errGlobalLock.Lock()

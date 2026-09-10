@@ -60,8 +60,8 @@ func newDownsampleIterationPart(t *testing.T) *part {
 		t.Fatal(err)
 	}
 	w.indexLimit = (downsampleIterationWideSeries + 1) * marshaledBlockHeaderSize
-	b := getDownsampleBatch()
-	defer putDownsampleBatch(b)
+	b := getDownsampleDecodedResolutionFeaturesBlock()
+	defer putDownsampleDecodedResolutionFeaturesBlock(b)
 	var expectedRows uint64
 	for _, resolution := range []int64{300000, 3600000} {
 		for series := 0; series < downsampleIterationSeries; series++ {
@@ -78,7 +78,7 @@ func newDownsampleIterationPart(t *testing.T) *part {
 						b.values[feature] = append(b.values[feature], downsampleIterationValue(series, row, resolution, uint8(feature)))
 					}
 				}
-				if err := w.WriteBlock(b); err != nil {
+				if err := writeDownsampleTestBlock(w, b); err != nil {
 					t.Fatalf("写入分辨率 %d、序列 %d、起始行 %d: %v", resolution, series, start, err)
 				}
 			}

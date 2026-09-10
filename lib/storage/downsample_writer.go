@@ -25,32 +25,32 @@ type downsampleFileWriter interface {
 
 // downsampleWriter 在全部列与索引同步完成后才返回可发布的 partHeader。
 type downsampleWriter struct {
-	path             string
-	timestampsWriter downsampleFileWriter // timestamps.bin
-	valuesWriter     downsampleFileWriter // values.bin
-	indexWriter      downsampleFileWriter // index.bin
-	metaindexWriter  downsampleFileWriter // metaindex.bin
-	timestampsOffset uint64
-	valuesOffset     uint64
-	indexOffset      uint64
-	compressLevel    int
-	ph               partHeader
-	previous         blockHeader
-	resolution       int64
-	spills           [countOfDownsampleFeatures]*filestream.SpillWriter
-	spillData        []byte
-	// indexLimit 可在测试中缩小，生产默认 maxBlockSize。
-	indexLimit    int
-	hasPrevious   bool
-	mr            downsampleMetaindexRow
-	indexData     []byte
-	metaindexData []byte
-	compressed    []byte
-	blocks        [countOfDownsampleFeatures]Block
-	integers      []int64
-	normalized    []float64
-	finished      bool
-	err           error // 部分写入失败后禁止重试或发布；只能 Abort/reset。
+	path                   string                                             // 本 writer 拥有的目标目录，发布前可由 Abort 删除。
+	timestampsWriter       downsampleFileWriter                               // timestamps.bin
+	valuesWriter           downsampleFileWriter                               // values.bin
+	indexWriter            downsampleFileWriter                               // index.bin
+	metaindexWriter        downsampleFileWriter                               // metaindex.bin
+	timestampsOffset       uint64                                             // timestamps.bin 的下一写入位置。
+	valuesOffset           uint64                                             // values.bin 的下一写入位置。
+	indexOffset            uint64                                             // index.bin 的下一写入位置。
+	compressLevel          int                                                // index 与 metaindex 的 ZSTD 压缩级别。
+	ph                     partHeader                                         // 已成功编码批次的 part 统计。
+	previous               blockHeader                                        // 上一批次编码前的时间范围，用于跨批次排序检查。
+	resolution             int64                                              // 当前 spill 中的数据分辨率。
+	spills                 [countOfDownsampleFeatures]*filestream.SpillWriter // 当前分辨率的五个特征 spill。
+	spillData              []byte                                             // 从 spill 读取一个已编码 value block 的临时缓冲。
+	indexLimit             int                                                // 测试可缩小的 index 上限；生产默认 maxBlockSize。
+	hasPrevious            bool                                               // 是否已经成功写入至少一个批次。
+	mr                     downsampleMetaindexRow                             // 当前 index block 对应的 metaindex 行。
+	indexData              []byte                                             // 当前 index block 的未压缩 header 数据。
+	metaindexData          []byte                                             // 当前 part 的全部未压缩 metaindex 行。
+	compressed             []byte                                             // index/metaindex 共用的压缩缓冲。
+	blocks                 [countOfDownsampleFeatures]Block                   // 当前批次的五个原生单特征 Block。
+	currentBlockTimestamps []int64                                            // 当前输出 block 的有效时间戳，不含空槽。
+	integers               []int64                                            // 当前特征转换成 decimal 后的整数缓冲。
+	normalized             []float64                                          // 当前特征的浮点缓冲，NaN 已规范化。
+	finished               bool                                               // 最终文件已关闭并同步，等待调用方发布。
+	err                    error                                              // 首次失败后禁止重试或发布，只能 Abort/reset。
 }
 
 func (w *downsampleWriter) Init(path string, compressLevel int) error {
@@ -87,7 +87,9 @@ func (w *downsampleWriter) Init(path string, compressLevel int) error {
 	return nil
 }
 
-func (w *downsampleWriter) WriteBlock(b *downsampleBatch) (err error) {
+// WriteSamples 借用当前 TSID 的 bucket 槽，按有效行数和精度拆成原生 Block。
+// 空槽不输出；输入只读，写入结束后不保留其引用。
+func (w *downsampleWriter) WriteSamples(tsid *TSID, resolution int64, bucketSamples []downsampleSample, stopCh <-chan struct{}) (err error) {
 	if w.err != nil {
 		return w.err
 	}
@@ -100,25 +102,81 @@ func (w *downsampleWriter) WriteBlock(b *downsampleBatch) (err error) {
 			err = w.fail(err)
 		}
 	}()
-	if b == nil {
-		return fmt.Errorf("降采样批次为空")
+	if tsid == nil || !validDownsampleResolution(resolution) {
+		return fmt.Errorf("无效降采样 TSID 或分辨率")
 	}
-	n := len(b.timestamps)
-	if !validDownsampleResolution(b.resolution) || n == 0 || n > maxRowsPerBlock || b.precisionBits < 1 || b.precisionBits > 64 {
-		return fmt.Errorf("无效降采样 block 分辨率、行数或精度")
-	}
-	for i := range b.values {
-		if len(b.values[i]) != n {
-			return fmt.Errorf("降采样列 %d 的行数错误", i)
+	var start, rows int
+	var precisionBits uint8
+	for i := range bucketSamples {
+		if err := checkDownsampleWriteStopped(stopCh); err != nil {
+			return err
+		}
+		s := &bucketSamples[i]
+		if s.isEmpty() {
+			continue
+		}
+		if s.precisionBits > 64 || s.timestamp < minUnixMilli || s.timestamp > maxUnixMilli {
+			return fmt.Errorf("无效降采样样本精度或时间戳")
+		}
+		if rows > 0 && precisionBits != s.precisionBits {
+			if err := w.writeSamplesBlock(tsid, resolution, bucketSamples[start:i], precisionBits, stopCh); err != nil {
+				return err
+			}
+			rows = 0
+		}
+		if rows == 0 {
+			start = i
+			precisionBits = s.precisionBits
+		}
+		rows++
+		if rows == maxRowsPerBlock {
+			if err := w.writeSamplesBlock(tsid, resolution, bucketSamples[start:i+1], precisionBits, stopCh); err != nil {
+				return err
+			}
+			rows = 0
 		}
 	}
-	for i, t := range b.timestamps {
-		if t < minUnixMilli || t > maxUnixMilli || (i > 0 && t <= b.timestamps[i-1]) || (i > 0 && t/b.resolution == b.timestamps[i-1]/b.resolution) {
+	if rows > 0 {
+		if err := w.writeSamplesBlock(tsid, resolution, bucketSamples[start:], precisionBits, stopCh); err != nil {
+			return err
+		}
+	}
+	return checkDownsampleWriteStopped(stopCh)
+}
+
+func checkDownsampleWriteStopped(stopCh <-chan struct{}) error {
+	select {
+	case <-stopCh:
+		return errForciblyStopped
+	default:
+		return nil
+	}
+}
+
+// writeSamplesBlock 只提取一份时间戳和一个特征列，不构造完整的五列解码 block。
+func (w *downsampleWriter) writeSamplesBlock(tsid *TSID, resolution int64, samples []downsampleSample, precisionBits uint8, stopCh <-chan struct{}) error {
+	w.currentBlockTimestamps = w.currentBlockTimestamps[:0]
+	for i := range samples {
+		if err := checkDownsampleWriteStopped(stopCh); err != nil {
+			return err
+		}
+		s := &samples[i]
+		if s.isEmpty() {
+			continue
+		}
+		t := s.timestamp
+		n := len(w.currentBlockTimestamps)
+		if n > 0 && (t <= w.currentBlockTimestamps[n-1] || t/resolution == w.currentBlockTimestamps[n-1]/resolution) {
 			return fmt.Errorf("编码前的降采样时间戳或 bucket 顺序错误")
 		}
+		w.currentBlockTimestamps = append(w.currentBlockTimestamps, t)
 	}
-	h := blockHeader{TSID: b.tsid, RowsCount: uint32(n), MinTimestamp: b.timestamps[0], MaxTimestamp: b.timestamps[n-1]}
-	if w.hasPrevious && (b.resolution < w.resolution || (b.resolution == w.resolution && (downsampleHeaderLess(&h, &w.previous) || (h.TSID == w.previous.TSID && h.MinTimestamp/b.resolution <= w.previous.MaxTimestamp/b.resolution)))) {
+	n := len(w.currentBlockTimestamps)
+	if n == 0 || n > maxRowsPerBlock {
+		return fmt.Errorf("无效降采样 block 行数")
+	}
+	h := blockHeader{TSID: *tsid, RowsCount: uint32(n), MinTimestamp: w.currentBlockTimestamps[0], MaxTimestamp: w.currentBlockTimestamps[n-1]}
+	if w.hasPrevious && (resolution < w.resolution || (resolution == w.resolution && (downsampleHeaderLess(&h, &w.previous) || (h.TSID == w.previous.TSID && h.MinTimestamp/resolution <= w.previous.MaxTimestamp/resolution)))) {
 		return fmt.Errorf("降采样 block 排序错误或编码前 bucket 重复")
 	}
 	if ^uint64(0)-w.ph.RowsCount < uint64(n)*countOfDownsampleFeatures || ^uint64(0)-w.ph.BlocksCount < countOfDownsampleFeatures {
@@ -127,16 +185,24 @@ func (w *downsampleWriter) WriteBlock(b *downsampleBatch) (err error) {
 	if err := checkDownsampleWriteSpace(filepath.Dir(w.path), n); err != nil {
 		return err
 	}
-	if w.hasPrevious && b.resolution != w.resolution {
+	if w.hasPrevious && resolution != w.resolution {
 		if err := w.flushResolution(); err != nil {
 			return err
 		}
 	}
-	w.resolution = b.resolution
+	w.resolution = resolution
 	sharedTimestampOffset := w.timestampsOffset
-	for i := range b.values {
+	for feature := range w.blocks {
 		w.normalized = w.normalized[:0]
-		for _, v := range b.values[i] {
+		for i := range samples {
+			if err := checkDownsampleWriteStopped(stopCh); err != nil {
+				return err
+			}
+			s := &samples[i]
+			if s.isEmpty() {
+				continue
+			}
+			v := s.values[feature]
 			if math.IsNaN(v) {
 				v = decimal.StaleNaN
 			}
@@ -145,20 +211,26 @@ func (w *downsampleWriter) WriteBlock(b *downsampleBatch) (err error) {
 		var scale int16
 		w.integers, scale = decimal.AppendFloatToDecimal(w.integers[:0], w.normalized)
 		// 每个特征拥有独立的原生 Block，时间戳和 values 均沿用 raw 的精度。
-		fb := &w.blocks[i]
-		fb.Init(&b.tsid, b.timestamps, w.integers, scale, b.precisionBits)
+		fb := &w.blocks[feature]
+		fb.Init(tsid, w.currentBlockTimestamps, w.integers, scale, precisionBits)
 		_, timestampsData, _ := fb.MarshalData(sharedTimestampOffset, 0)
-		if i > 0 && (!bytes.Equal(timestampsData, w.blocks[0].timestampsData) || !sameDownsampleTimestamps(&fb.bh, &w.blocks[0].bh)) {
+		if feature > 0 && (!bytes.Equal(timestampsData, w.blocks[0].timestampsData) || !sameDownsampleTimestamps(&fb.bh, &w.blocks[0].bh)) {
 			return fmt.Errorf("同一批次的 Block 时间戳编码不一致")
 		}
 		if err := validateDownsampleHeader(&fb.bh); err != nil {
 			return err
 		}
 	}
+	if err := checkDownsampleWriteStopped(stopCh); err != nil {
+		return err
+	}
 	if err := writeDownsamplePayload(w.timestampsWriter, &w.timestampsOffset, w.blocks[0].timestampsData); err != nil {
 		return err
 	}
 	for i := range w.blocks {
+		if err := checkDownsampleWriteStopped(stopCh); err != nil {
+			return err
+		}
 		if w.spills[i] == nil {
 			w.spills[i] = filestream.NewSpillWriter(w.path)
 		}
@@ -512,6 +584,11 @@ func (w *downsampleWriter) reset() {
 		w.normalized = nil
 	} else {
 		w.normalized = w.normalized[:0]
+	}
+	if cap(w.currentBlockTimestamps) > downsampleMaxPooledRows {
+		w.currentBlockTimestamps = nil
+	} else {
+		w.currentBlockTimestamps = w.currentBlockTimestamps[:0]
 	}
 }
 

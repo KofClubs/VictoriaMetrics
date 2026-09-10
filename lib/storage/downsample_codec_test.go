@@ -14,8 +14,8 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 )
 
-func fileTestDownsampleBlock(tsid uint64, resolution int64) *downsampleBatch {
-	b := &downsampleBatch{tsid: TSID{MetricID: tsid}, resolution: resolution, timestamps: []int64{minUnixMilli + 1, minUnixMilli + resolution + 1}, precisionBits: 64}
+func fileTestDownsampleBlock(tsid uint64, resolution int64) *downsampleDecodedResolutionFeaturesBlock {
+	b := &downsampleDecodedResolutionFeaturesBlock{tsid: TSID{MetricID: tsid}, resolution: resolution, timestamps: []int64{minUnixMilli + 1, minUnixMilli + resolution + 1}, precisionBits: 64}
 	for i := range b.values {
 		b.values[i] = []float64{float64(i + 1), float64(i + 6)}
 	}
@@ -23,7 +23,7 @@ func fileTestDownsampleBlock(tsid uint64, resolution int64) *downsampleBatch {
 	return b
 }
 
-func writeFileTestDownsamplePart(t *testing.T, blocks ...*downsampleBatch) string {
+func writeFileTestDownsamplePart(t *testing.T, blocks ...*downsampleDecodedResolutionFeaturesBlock) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "part")
 	w := getDownsampleWriter()
@@ -32,7 +32,7 @@ func writeFileTestDownsamplePart(t *testing.T, blocks ...*downsampleBatch) strin
 		t.Fatal(err)
 	}
 	for _, b := range blocks {
-		if err := w.WriteBlock(b); err != nil {
+		if err := writeDownsampleTestBlock(w, b); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -43,7 +43,7 @@ func writeFileTestDownsamplePart(t *testing.T, blocks ...*downsampleBatch) strin
 }
 
 func TestDownsampleFileRoundtrip(t *testing.T) {
-	blocks := []*downsampleBatch{fileTestDownsampleBlock(1, 300000), fileTestDownsampleBlock(2, 300000), fileTestDownsampleBlock(1, 3600000)}
+	blocks := []*downsampleDecodedResolutionFeaturesBlock{fileTestDownsampleBlock(1, 300000), fileTestDownsampleBlock(2, 300000), fileTestDownsampleBlock(1, 3600000)}
 	blocks[1].values[downsampleFeatureSum][0] = decimal.StaleNaN
 	path := writeFileTestDownsamplePart(t, blocks...)
 	if ds, err := detectDownsampleFormat(path); err != nil || !ds {
@@ -59,8 +59,8 @@ func TestDownsampleFileRoundtrip(t *testing.T) {
 	}
 	r := getDownsampleReader()
 	defer putDownsampleReader(r)
-	b := getDownsampleBatch()
-	defer putDownsampleBatch(b)
+	b := getDownsampleDecodedResolutionFeaturesBlock()
+	defer putDownsampleDecodedResolutionFeaturesBlock(b)
 	i := 0
 	for _, res := range []int64{300000, 3600000} {
 		if err := r.Init(p, res); err != nil {
@@ -124,7 +124,7 @@ func TestDownsampleFileConstantAndFilter(t *testing.T) {
 	if h.ValuesBlockSize != 0 || h.ValuesMarshalType != encoding.MarshalTypeConst {
 		t.Fatalf("常量列未使用零负载: %+v", h)
 	}
-	var got downsampleBatch
+	var got downsampleDecodedResolutionFeaturesBlock
 	if err := r.ReadBlock(&got); err != nil {
 		t.Fatal(err)
 	}
@@ -228,10 +228,10 @@ func TestDownsampleWriterOrderAbortAndPool(t *testing.T) {
 	if err := w.Init(path, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.WriteBlock(fileTestDownsampleBlock(1, 3600000)); err != nil {
+	if err := writeDownsampleTestBlock(w, fileTestDownsampleBlock(1, 3600000)); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.WriteBlock(fileTestDownsampleBlock(1, 300000)); err == nil {
+	if err := writeDownsampleTestBlock(w, fileTestDownsampleBlock(1, 300000)); err == nil {
 		t.Fatal("未拒绝分辨率逆序")
 	}
 	if err := w.Abort(); err != nil {
@@ -241,14 +241,14 @@ func TestDownsampleWriterOrderAbortAndPool(t *testing.T) {
 		t.Fatal("取消未清理目标")
 	}
 	putDownsampleWriter(w)
-	b := getDownsampleBatch()
+	b := getDownsampleDecodedResolutionFeaturesBlock()
 	b.timestamps = make([]int64, downsampleMaxPooledRows+1)
 	b.values[0] = make([]float64, downsampleMaxPooledRows+1)
 	b.Reset()
 	if b.timestamps != nil || b.values[0] != nil || b.resolution != 0 {
 		t.Fatal("block 未释放异常容量")
 	}
-	putDownsampleBatch(b)
+	putDownsampleDecodedResolutionFeaturesBlock(b)
 }
 
 func TestDownsampleReaderRawInmemory(t *testing.T) {
@@ -266,7 +266,7 @@ func TestDownsampleReaderRawInmemory(t *testing.T) {
 	if !r.NextHeader() {
 		t.Fatal(r.Error())
 	}
-	var b downsampleBatch
+	var b downsampleDecodedResolutionFeaturesBlock
 	if err := r.ReadBlock(&b); err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +307,7 @@ func TestDownsampleFileAllConstantPayloads(t *testing.T) {
 	if !r.NextHeader() {
 		t.Fatal(r.Error())
 	}
-	var got downsampleBatch
+	var got downsampleDecodedResolutionFeaturesBlock
 	if err := r.ReadBlock(&got); err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +334,7 @@ func TestDownsampleReaderReadErrors(t *testing.T) {
 	if err := os.Truncate(filepath.Join(path, valuesFilename), 0); err != nil {
 		t.Fatal(err)
 	}
-	var got downsampleBatch
+	var got downsampleDecodedResolutionFeaturesBlock
 	if err := r.ReadBlock(&got); err == nil {
 		t.Fatal("截断数据未报告读取错误")
 	}
@@ -366,7 +366,7 @@ func TestDownsampleWriterAbortAfterFinish(t *testing.T) {
 	if err := w.Init(path, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.WriteBlock(fileTestDownsampleBlock(1, 300000)); err != nil {
+	if err := writeDownsampleTestBlock(w, fileTestDownsampleBlock(1, 300000)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.Finish(); err != nil {
@@ -435,7 +435,7 @@ func TestDownsampleReaderLargeRawBlock(t *testing.T) {
 	if !r.NextHeader() {
 		t.Fatal(r.Error())
 	}
-	var b downsampleBatch
+	var b downsampleDecodedResolutionFeaturesBlock
 	if err := r.ReadBlock(&b); err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +445,7 @@ func TestDownsampleReaderLargeRawBlock(t *testing.T) {
 }
 
 func TestDownsamplePoolNormalAndLargeCapacity(t *testing.T) {
-	var b downsampleBatch
+	var b downsampleDecodedResolutionFeaturesBlock
 	for i := 0; i < downsampleMaxRawRows; i++ {
 		b.timestamps = append(b.timestamps, int64(i))
 		b.values[0] = append(b.values[0], float64(i))
@@ -481,7 +481,7 @@ func TestDownsampleFileMultiIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	for id := uint64(1); id <= 400; id++ {
-		if err := w.WriteBlock(fileTestDownsampleBlock(id, 300000)); err != nil {
+		if err := writeDownsampleTestBlock(w, fileTestDownsampleBlock(id, 300000)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -506,7 +506,7 @@ func TestDownsampleFileMultiIndex(t *testing.T) {
 	if !r.NextHeader() || r.Header().TSID != tsid {
 		t.Fatalf("跨 index block 定位失败: %v", r.Error())
 	}
-	var b downsampleBatch
+	var b downsampleDecodedResolutionFeaturesBlock
 	if err := r.ReadBlock(&b); err != nil {
 		t.Fatal(err)
 	}
@@ -532,7 +532,7 @@ func TestDownsampleReaderSeekResolutionAndSharedTSID(t *testing.T) {
 			for col := range b.values {
 				b.values[col] = b.values[col][:1]
 			}
-			if err := w.WriteBlock(b); err != nil {
+			if err := writeDownsampleTestBlock(w, b); err != nil {
 				t.Fatal(err)
 			}
 			if i%2 == 1 {
@@ -682,7 +682,7 @@ func TestDownsampleReaderSeekHighCardinality(t *testing.T) {
 func TestDownsampleNativeBlockReuse(t *testing.T) {
 	for _, precision := range []uint8{64, 8} {
 		t.Run(fmt.Sprintf("shared_precision_%d", precision), func(t *testing.T) {
-			batch := &downsampleBatch{tsid: TSID{MetricID: 10}, resolution: 300000, precisionBits: precision}
+			batch := &downsampleDecodedResolutionFeaturesBlock{tsid: TSID{MetricID: 10}, resolution: 300000, precisionBits: precision}
 			for row := 0; row < 1024; row++ {
 				batch.timestamps = append(batch.timestamps, minUnixMilli+int64(row)*300000+int64((row*row*7919)%299999))
 				for feature := range batch.values {
@@ -695,7 +695,7 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 			if err := w.Init(path, 1); err != nil {
 				t.Fatal(err)
 			}
-			if err := w.WriteBlock(batch); err != nil {
+			if err := writeDownsampleTestBlock(w, batch); err != nil {
 				t.Fatal(err)
 			}
 			var stored [5]Block
@@ -968,7 +968,7 @@ func TestDownsampleClusterTenantIndexBoundaries(t *testing.T) {
 	}
 	r := getDownsampleReader()
 	defer putDownsampleReader(r)
-	var got downsampleBatch
+	var got downsampleDecodedResolutionFeaturesBlock
 	for resolutionIndex, resolution := range downsampleResolutions {
 		if err := r.Init(p, resolution); err != nil {
 			t.Fatal(err)
