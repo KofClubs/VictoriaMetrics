@@ -7,7 +7,46 @@ import (
 	"testing"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 )
+
+func TestDownsampleDecodedBlockCapacity(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rows int
+		keep bool
+	}{
+		{"normal", downsampleMaxRawRows, true},
+		{"oversized", downsampleMaxPooledRows + 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := downsampleDecodedResolutionFeaturesBlock{tsid: TSID{MetricID: 1}, resolution: downsampleResolution5m, precisionBits: 64}
+			for i := 0; i < tc.rows; i++ {
+				b.timestamps = append(b.timestamps, int64(i))
+				for feature := range b.values {
+					b.values[feature] = append(b.values[feature], float64(i+feature))
+				}
+			}
+			timestampsCap := cap(b.timestamps)
+			var valuesCaps [countOfDownsampleFeatures]int
+			for feature := range b.values {
+				valuesCaps[feature] = cap(b.values[feature])
+			}
+			b.Reset()
+			if b.tsid != (TSID{}) || b.resolution != 0 || b.precisionBits != 0 {
+				t.Fatal("decoded block retained its logical state after Reset")
+			}
+			if len(b.timestamps) != 0 || tc.keep && cap(b.timestamps) != timestampsCap || !tc.keep && b.timestamps != nil {
+				t.Fatalf("unexpected timestamp capacity after Reset: got %d; previous %d; keep %v", cap(b.timestamps), timestampsCap, tc.keep)
+			}
+			for feature := range b.values {
+				if len(b.values[feature]) != 0 || tc.keep && cap(b.values[feature]) != valuesCaps[feature] || !tc.keep && b.values[feature] != nil {
+					t.Fatalf("unexpected feature %d capacity after Reset: got %d; previous %d; keep %v", feature, cap(b.values[feature]), valuesCaps[feature], tc.keep)
+				}
+			}
+		})
+	}
+}
 
 func TestDownsampleBucket(t *testing.T) {
 	for _, resolution := range downsampleResolutions {
@@ -56,24 +95,39 @@ func TestDownsampleBucket(t *testing.T) {
 	}
 }
 
-func TestDownsampleNormalizeValue(t *testing.T) {
-	for _, v := range []float64{0, math.Copysign(0, -1), 1.25, -2.5, math.SmallestNonzeroFloat64, math.MaxFloat64, math.Inf(1), math.Inf(-1)} {
-		got := normalizeDownsampleValue(v)
-		if math.Float64bits(got) != math.Float64bits(v) {
-			t.Fatalf("normalization changed non-NaN value %v to %v", v, got)
-		}
-	}
+func TestDownsampleSampleMergeNormalization(t *testing.T) {
+	values := []float64{0, math.Copysign(0, -1), 1.25, -2.5, math.SmallestNonzeroFloat64, math.MaxFloat64, math.Inf(1), math.Inf(-1)}
 	for _, bits := range []uint64{0x7ff0000000000001, 0x7ff8000000000001, 0xfff8000000001234, math.Float64bits(decimal.StaleNaN)} {
-		got := normalizeDownsampleValue(math.Float64frombits(bits))
-		if math.Float64bits(got) != math.Float64bits(decimal.StaleNaN) {
-			t.Fatalf("NaN %x wasn't normalized; got %x", bits, math.Float64bits(got))
+		values = append(values, math.Float64frombits(bits))
+	}
+	for _, value := range values {
+		src := downsampleSample{
+			timestamp:     minUnixMilli + 1,
+			values:        [countOfDownsampleFeatures]float64{value, value, value, value, value},
+			precisionBits: 32,
+		}
+		original := src
+		var got downsampleSample
+		got.Merge(&src)
+		if got.isEmpty() || got.timestamp != src.timestamp || got.precisionBits != src.precisionBits {
+			t.Fatalf("first sample lost its timestamp or precision: %+v", got)
+		}
+		wantBits := math.Float64bits(value)
+		if math.IsNaN(value) {
+			wantBits = math.Float64bits(decimal.StaleNaN)
+		}
+		for feature := range got.values {
+			if bits := math.Float64bits(got.values[feature]); bits != wantBits {
+				t.Fatalf("column %d first input %x became %x; want %x", feature, math.Float64bits(value), bits, wantBits)
+			}
+			if math.Float64bits(src.values[feature]) != math.Float64bits(original.values[feature]) {
+				t.Fatalf("source column %d was modified", feature)
+			}
+		}
+		if src.timestamp != original.timestamp || src.precisionBits != original.precisionBits {
+			t.Fatal("source timestamp or precision was modified")
 		}
 	}
-}
-
-type downsampleTestSample struct {
-	timestamp int64
-	value     float64
 }
 
 func TestDownsampleSampleMergeRaw(t *testing.T) {
@@ -123,6 +177,11 @@ func TestDownsampleSampleMergeRaw(t *testing.T) {
 			name:    "all-stale",
 			samples: []downsampleTestSample{{1, nan}, {2, stale}},
 			want:    downsampleSample{timestamp: 2, values: [countOfDownsampleFeatures]float64{stale, stale, 2, stale, stale}, precisionBits: 64},
+		},
+		{
+			name:    "same-timestamp-all-nan",
+			samples: []downsampleTestSample{{1, nan}, {1, stale}},
+			want:    downsampleSample{timestamp: 1, values: [countOfDownsampleFeatures]float64{stale, stale, 2, stale, stale}, precisionBits: 64},
 		},
 		{
 			name:    "opposite-infinities",
@@ -182,7 +241,8 @@ func TestDownsampleSampleMerge(t *testing.T) {
 func TestDownsampleSampleNaNColumns(t *testing.T) {
 	for feature := 0; feature < countOfDownsampleFeatures; feature++ {
 		for _, markerFirst := range []bool{false, true} {
-			base := downsampleSample{timestamp: minUnixMilli + 1, values: [countOfDownsampleFeatures]float64{3, 10, 2, 1, 9}, precisionBits: 64}
+			// min(-Inf, NaN) 和 max(+Inf, NaN) 仍须传播标记，且不能依赖输入顺序。
+			base := downsampleSample{timestamp: minUnixMilli + 1, values: [countOfDownsampleFeatures]float64{3, 10, 2, math.Inf(-1), math.Inf(1)}, precisionBits: 64}
 			marked := downsampleSample{timestamp: minUnixMilli + 2, values: [countOfDownsampleFeatures]float64{4, 20, 3, 2, 12}, precisionBits: 64}
 			marked.values[feature] = math.Float64frombits(0xfff8000000001234)
 			originalBits := math.Float64bits(marked.values[feature])
@@ -194,7 +254,7 @@ func TestDownsampleSampleNaNColumns(t *testing.T) {
 				a.Merge(&base)
 				a.Merge(&marked)
 			}
-			want := downsampleSample{timestamp: minUnixMilli + 2, values: [countOfDownsampleFeatures]float64{4, 30, 5, 1, 12}, precisionBits: 64}
+			want := downsampleSample{timestamp: minUnixMilli + 2, values: [countOfDownsampleFeatures]float64{4, 30, 5, math.Inf(-1), math.Inf(1)}, precisionBits: 64}
 			want.values[feature] = decimal.StaleNaN
 			assertDownsamplePoint(t, &a, &want)
 			if math.Float64bits(marked.values[feature]) != originalBits {
@@ -203,14 +263,23 @@ func TestDownsampleSampleNaNColumns(t *testing.T) {
 		}
 	}
 
-	// NaN 的算术来源不增加状态，也不影响其他列。
-	left := downsampleSample{timestamp: minUnixMilli, values: [countOfDownsampleFeatures]float64{2, math.Inf(1), 1, 2, 2}, precisionBits: 64}
-	right := downsampleSample{timestamp: minUnixMilli + 1, values: [countOfDownsampleFeatures]float64{3, math.Inf(-1), 1, 3, 3}, precisionBits: 64}
-	var a downsampleSample
-	a.Merge(&left)
-	a.Merge(&right)
-	want := downsampleSample{timestamp: minUnixMilli + 1, values: [countOfDownsampleFeatures]float64{3, decimal.StaleNaN, 2, 2, 3}, precisionBits: 64}
-	assertDownsamplePoint(t, &a, &want)
+	// sum/count 的相反无穷值相加产生 NaN；两个输入方向均须规范化，且不影响其他列。
+	left := downsampleSample{timestamp: minUnixMilli, values: [countOfDownsampleFeatures]float64{2, math.Inf(1), math.Inf(-1), 2, 2}, precisionBits: 64}
+	right := downsampleSample{timestamp: minUnixMilli + 1, values: [countOfDownsampleFeatures]float64{3, math.Inf(-1), math.Inf(1), 3, 3}, precisionBits: 64}
+	want := downsampleSample{timestamp: minUnixMilli + 1, values: [countOfDownsampleFeatures]float64{3, decimal.StaleNaN, decimal.StaleNaN, 2, 3}, precisionBits: 64}
+	for _, reverse := range []bool{false, true} {
+		var a downsampleSample
+		if reverse {
+			a.Merge(&right)
+			a.Merge(&left)
+		} else {
+			a.Merge(&left)
+			a.Merge(&right)
+		}
+		assertDownsamplePoint(t, &a, &want)
+		a.Merge(&a)
+		assertDownsamplePoint(t, &a, &want)
+	}
 }
 
 func TestDownsampleSampleReset(t *testing.T) {
@@ -303,54 +372,82 @@ func TestDownsampleSampleRandomizedReference(t *testing.T) {
 	}
 }
 
-func groupDownsampleTestSamples(samples []downsampleTestSample, resolution int64) map[int64][]downsampleTestSample {
-	groups := make(map[int64][]downsampleTestSample)
-	for _, sample := range samples {
-		bucket := sample.timestamp / resolution
-		groups[bucket] = append(groups[bucket], sample)
+func TestDownsampleHeaderValidation(t *testing.T) {
+	path := writeFileTestDownsamplePart(t, fileTestDownsampleBlock(1, 300000))
+	p, err := openDownsamplePart(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return groups
-}
-
-// referenceDownsampleTestPoint 分别扫描原始样本，独立计算有限小整数的参考统计。
-func referenceDownsampleTestPoint(samples []downsampleTestSample) downsampleSample {
-	p := downsampleSample{precisionBits: 64}
-	for _, sample := range samples {
-		if sample.timestamp > p.timestamp {
-			p.timestamp = sample.timestamp
-		}
+	defer p.MustClose()
+	r := getDownsampleReader()
+	defer putDownsampleReader(r)
+	if err := r.Init(p, 300000); err != nil {
+		t.Fatal(err)
 	}
-	p.values[downsampleFeatureLast] = math.Inf(-1)
-	p.values[downsampleFeatureMin] = math.Inf(1)
-	p.values[downsampleFeatureMax] = math.Inf(-1)
-	p.values[downsampleFeatureCount] = float64(len(samples))
-	for _, sample := range samples {
-		p.values[downsampleFeatureSum] += sample.value
-		p.values[downsampleFeatureMin] = math.Min(p.values[downsampleFeatureMin], sample.value)
-		p.values[downsampleFeatureMax] = math.Max(p.values[downsampleFeatureMax], sample.value)
-		if sample.timestamp == p.timestamp && sample.value > p.values[downsampleFeatureLast] {
-			p.values[downsampleFeatureLast] = sample.value
-		}
+	if !r.NextHeader() {
+		t.Fatal(r.Error())
 	}
-	return p
-}
-
-func assertDownsamplePoint(t *testing.T, got, want *downsampleSample) {
-	t.Helper()
-	if got.precisionBits != want.precisionBits {
-		t.Fatalf("unexpected precision bits; got %d; want %d", got.precisionBits, want.precisionBits)
+	base := *r.Header()
+	cases := map[string]func(*blockHeader){
+		"rows":                        func(h *blockHeader) { h.RowsCount = 0 },
+		"too_many_rows":               func(h *blockHeader) { h.RowsCount = maxRowsPerBlock + 1 },
+		"precision":                   func(h *blockHeader) { h.PrecisionBits = 0 },
+		"type":                        func(h *blockHeader) { h.ValuesMarshalType = 255 },
+		"size":                        func(h *blockHeader) { h.ValuesBlockSize = math.MaxUint32 },
+		"time_domain":                 func(h *blockHeader) { h.MinTimestamp = minUnixMilli - 1 },
+		"column_offset":               func(h *blockHeader) { h.ValuesBlockOffset = math.MaxUint64 },
+		"single_row_delta2":           func(h *blockHeader) { h.RowsCount = 1; h.ValuesMarshalType = encoding.MarshalTypeNearestDelta2 },
+		"single_row_timestamp_delta2": func(h *blockHeader) { h.RowsCount = 1; h.TimestampsMarshalType = encoding.MarshalTypeZSTDNearestDelta2 },
 	}
-	if got.timestamp != want.timestamp {
-		t.Fatalf("unexpected timestamp; got %d; want %d", got.timestamp, want.timestamp)
-	}
-	for feature, expected := range want.values {
-		actual := got.values[feature]
-		if math.IsNaN(expected) {
-			if math.Float64bits(actual) != math.Float64bits(decimal.StaleNaN) {
-				t.Fatalf("column %d wasn't normalized to StaleNaN; got %x", feature, math.Float64bits(actual))
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := base
+			mutate(&h)
+			var got blockHeader
+			_, err := got.Unmarshal(h.Marshal(nil))
+			if err == nil {
+				err = validateDownsampleHeader(&got)
 			}
-		} else if actual != expected {
-			t.Fatalf("unexpected column %d; got %v; want %v", feature, actual, expected)
+			if err == nil {
+				t.Fatal("未拒绝非法 header")
+			}
+		})
+	}
+	var got blockHeader
+	if _, err := got.Unmarshal(base.Marshal(nil)[:marshaledBlockHeaderSize-1]); err == nil {
+		t.Fatal("未拒绝截断 header")
+	}
+}
+
+func BenchmarkDownsampleSample(b *testing.B) {
+	const rowsCount = 8192
+	for _, sampleInput := range []bool{false, true} {
+		name := "Raw"
+		if sampleInput {
+			name = "Sample"
 		}
+		b.Run(name, func(b *testing.B) {
+			points := make([]downsampleSample, rowsCount)
+			for i := range points {
+				v := float64(i%17 - 8)
+				points[i] = downsampleSample{timestamp: minUnixMilli + int64(i), values: [countOfDownsampleFeatures]float64{v, v * 16, 16, v - 2, v + 2}, precisionBits: 64}
+			}
+			var a downsampleSample
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				a.Reset()
+				for j := range points {
+					if sampleInput {
+						a.Merge(&points[j])
+					} else {
+						a.MergeRaw(points[j].timestamp, points[j].values[downsampleFeatureLast], points[j].precisionBits)
+					}
+				}
+			}
+			b.StopTimer()
+			downsampleBenchmarkPoint = a
+			reportDownsampleBenchmarkRows(b, rowsCount)
+		})
 	}
 }

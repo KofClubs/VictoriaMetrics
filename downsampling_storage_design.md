@@ -20,6 +20,8 @@
 
 内存数据的缓冲、序列化和内存归并使用原始格式。降采样处理目标为磁盘文件的写出或归并任务，IndexDB、TSID 分配和原始数据接收流程使用原有实现。
 
+降采样专属生产代码按 block、metaindex row、reader、writer、merger、part、partition、query 八个模块组织。block 定义样本、分桶计算、多特征解码缓冲及 header 校验；metaindex row 定义索引行及其编解码；part 管理格式标识和元数据大小限制；query 包含字段解析、查询协议编解码和 part 搜索定位。各模块的代码导航与调用边界见实现说明。
+
 ## 2. 数据语义
 
 ### 2.1 分桶与特征计算
@@ -38,7 +40,7 @@
 
 相同时间戳的 `last` 优先选择非 NaN 值；两者均为非 NaN 时选择较大值。该选择规则只影响 `last`，不会删除其他特征的输入。降采样不执行去重，所有进入 bucket 的输入均参与计算。
 
-降采样计算将所有 NaN 统一为 `decimal.StaleNaN`。较新的标记可以覆盖较早的 `last` 数值；`sum`、`min`、`max` 按特征传播标记。原始标记样本仍向 `count` 贡献 1。计算产生的 NaN 同样规范化；原始数据接收阶段对 NaN 的处理由原有流程决定。
+`downsampleSample.Merge` 在每次合并结束时统一扫描五个结果值，将输入及运算产生的 NaN 规范化为 `decimal.StaleNaN`。reader 负责原生解码，writer 直接编码聚合后的样本，两者均不另行扫描或改写 NaN。较新的标记可以覆盖较早的 `last` 数值；`sum`、`count`、`min`、`max` 按特征传播标记。原始标记样本仍向 `count` 贡献 1；原始数据接收阶段对 NaN 的处理由原有流程决定。
 
 ### 2.2 精度与编码
 
@@ -212,7 +214,7 @@ resolution → TSID → 源 part → Block 批次 → feature
 bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 ```
 
-`currentTSIDBucketSamples` 按该范围设置长度，包含中间空 bucket；容量不足才分配，否则清空有效范围后复用。31 天在 5m 和 1h 分辨率下分别最多需要 8928 和 744 个槽。`downsampleMaxPooledBuckets=8928*2` 只控制 Reset 时保留的池缓存容量，不限制本次计算的槽数。
+`currentTSIDBucketSamples` 按该范围设置长度，包含中间空 bucket；容量不足才分配，否则清空有效范围后复用。31 天在 5m 和 1h 分辨率下分别最多需要 8928 和 744 个槽。`downsampleMaxPooledBuckets=8928*2` 只控制 `reset` 时保留的池缓存容量，不限制本次计算的槽数。
 
 随后，`currentSourceReader` 重新定位这些源的当前 TSID，读取 payload 并累加到对应槽位。索引扫描与数据读取使用不同 reader，避免数据读取改变堆中已推进的索引位置。所有源贡献完成后，样本切片直接交给 writer，之后再处理下一个 TSID。
 
@@ -310,11 +312,11 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 索引 reader 各自只保留当前 index block，源 part 的 metaindex 整体驻留内存。merger 的聚合状态按当前 TSID 的时间范围分配。writer 保留当前批次及其编码缓冲、临时文件读回缓冲、当前未输出的 index，以及整个目标 part 尚未压缩的 metaindex；压缩时复用压缩缓冲。
 
-这些是单项边界，不是进程内存的统一额度。总占用还受源 part 数量、并发任务、对象池保留容量和系统页缓存影响。reader 指针切片的容量回收阈值为 1024，bucket 切片的容量回收阈值为 17856；Reset 会清除源引用。这些阈值只控制池缓存容量，不限制任务规模。
+这些是单项边界，不是进程内存的统一额度。总占用还受源 part 数量、并发任务、对象池保留容量和系统页缓存影响。`reset` 清除 `currentResolutionReaders`、`currentResolutionReaderHeap` 和 `currentTSIDReaders` 中的全部源引用，将切片长度归零，保留底层数组用于复用；reader 指针切片不设容量丢弃阈值。bucket 切片仍以 `downsampleMaxPooledBuckets = 17856` 控制 `reset` 后保留的池缓存容量，该阈值不限制任务的 bucket 数量。
 
 ### 6.3 磁盘空间预算
 
-令 `R` 为两个分辨率合计的降采样逻辑行数，`B` 为多特征批次数，`F=5`、`H=89`、`M=113`。`estimateDownsampleOutputSize` 采用以下保守预算：
+令 `R` 为两个分辨率合计的降采样逻辑行数，`B` 为多特征批次数，`F=5`、`H=89`、`M=113`。[downsample_writer.go](lib/storage/downsample_writer.go) 中的 `estimateDownsampleOutputSize` 采用以下保守预算：
 
 | 部分 | 字节数上界 |
 |---|---|
@@ -323,9 +325,9 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 | 与最终输出同时存在的 spill | `10 × R × F + F × B × H` |
 | metadata | 64 KiB |
 
-原始输入按两个目标分辨率估算；降采样源的物理行数除以五并向上取整。未知 TSID 分布时取 `B=R`，按每行单独占据 Block 和 index 的情况估算。加法和乘法在溢出时饱和到 `math.MaxUint64`，不将删除源文件作为可用空间。
+[downsample_part.go](lib/storage/downsample_part.go) 中的 `estimateDownsamplePartSize` 根据源统计计算所需行数：原始输入按两个目标分辨率估算；降采样源的物理行数除以五并向上取整。未知 TSID 分布时取 `B=R`，按每行单独占据 Block 和 index 的情况估算。writer 中的空间加法和乘法在溢出时饱和到 `math.MaxUint64`，不将删除源文件作为可用空间。
 
-进程内所有目录的降采样任务共享磁盘预算，并保留 `freeDiskSpaceLimitBytes` 指定的最低空闲空间。已释放的预算继续计入占用两秒，覆盖空闲空间查询的缓存周期。writer 在写批次、读回 spill 和最终输出前重新查询可用磁盘空间，该查询仍有两秒缓存。预算检查不能替代实际 I/O 错误处理。
+[downsample_partition.go](lib/storage/downsample_partition.go) 管理预算类型、进程级预算、预留与缓存有效期。进程内所有目录的降采样任务共享磁盘预算，并保留 `freeDiskSpaceLimitBytes` 指定的最低空闲空间。已释放的预算继续计入占用两秒，覆盖空闲空间查询的缓存周期。writer 在写批次、读回 spill 和最终输出前重新查询可用磁盘空间，该查询仍有两秒缓存；空间不足返回可识别的 `errDownsampleNoSpace`。预算检查不能替代实际 I/O 错误处理。
 
 ## 7. 发布、失败处理与启动
 
@@ -343,11 +345,13 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 writer 的验证、写入、读回和关闭错误会阻止发布，并触发 Abort；后续写入继续返回已记录的错误。reader 会尝试关闭所有自有句柄并聚合关闭错误，借用的降采样句柄仍由 part 管理。清理失败同样返回错误；只有实际删除成功，才能认为目标已清理。
 
+`Merge` 返回前归还全部 reader 和多特征解码对象，统计按值返回。对象归还或句柄关闭后清除引用，后续重置不重复释放该资源。writer 的 `reset` 只清理内存状态；`Abort` 负责未发布目标的资源清理，目录删除失败时保留路径及已有错误，后续仅重试尚未完成的删除。降采样专属错误和日志均使用英文，并以 `[downsampling]` 开头。
+
 降采样任务的普通错误和取消以错误返回，调度层结束本次任务。周期刷盘保留失败源；关闭或快照所需的最终刷盘，在降采样失败后将剩余内存源按原始格式持久化。最终刷盘还会在持有 `partsLock` 时同步清单目录，即使没有剩余内存源也执行。
 
 原始格式回退或最终持久化仍失败时，采用存储层的致命错误处理。通用文件系统接口、已提交源回收和引用计数等程序不变量保留原有语义，不统一转换为可忽略的降采样错误。
 
-启动预检查在取得目录锁、检查恢复状态之后，IndexDB 和后台任务初始化之前执行。存在 `parts.json` 时，预检查只检查清单引用的活动 part；缺少清单时，按原有目录发现规则识别 small、big 下的 part。
+启动预检查、分区发现和活动清单解析由 `downsample_partition.go` 负责。预检查在取得目录锁、检查恢复状态之后，IndexDB 和后台任务初始化之前执行。存在 `parts.json` 时，预检查只检查清单引用的活动 part；缺少清单时，按原有目录发现规则识别 small、big 下的 part。
 
 分区发现排除快照目录、空目录和带有 `.delete-this-dir` 删除标记的目录。清单中的非法 part 名称、未知字段、重复字段、重复 part 名称，以及活动 part 目录缺失，均返回错误。存在活动降采样 part 时必须启用降采样，快照中的非活动文件不构成此开关冲突。
 

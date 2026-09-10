@@ -33,27 +33,102 @@ Go 单元测试、race 和 vet 均以退出码 0 为通过条件；Python 单元
 
 ## storage 单元测试
 
-以下文件均位于 `lib/storage/`。测试使用独立的原始输入参考值或原生编码器校验结果；实际文件布局另有按固定字节偏移解析的检查。
+降采样生产代码分为 8 个文件；测试文件均位于 `lib/storage`，使用 `package storage`，按生产文件归类为 8 个同名 `_test.go`，另有 `downsample_supplement_test.go`。这 9 个文件共包含 95 个顶层测试和 4 个基准测试。测试使用独立的原始输入参考值或原生编码器校验结果；实际文件布局另有按固定字节偏移解析的检查。
 
-### 分桶与样本计算
+### 样本与解码 block
 
-文件：[downsample_test.go](lib/storage/downsample_test.go)。
+生产文件：[downsample_block.go](lib/storage/downsample_block.go)；测试文件：[downsample_block_test.go](lib/storage/downsample_block_test.go)。
 
 | 测试 | 验证内容 |
 |---|---|
+| `TestDownsampleDecodedBlockCapacity` | Reset 清除 TSID、分辨率和精度；时间列与五个特征列保留正常容量，释放超过池阈值的缓冲。 |
 | `TestDownsampleBucket` | 5m/1h 的区间边界、非法时间和分辨率、时间域最后一个区间的右端点。 |
-| `TestDownsampleNormalizeValue` | 保留有限值、正负零和无穷值；不同 NaN 位模式统一为 StaleNaN。 |
+| `TestDownsampleSampleMergeNormalization` | 首次 Merge 保留五列的有限值、正负零和无穷值位模式；不同 NaN 位模式统一为 StaleNaN，源样本保持不变。 |
 | `TestDownsampleSampleMergeRaw` | 将原始样本展开为五个特征，检查重复时间戳、乱序输入、时间戳相同时 last 的比较规则，以及 NaN/Inf 的计算规则。 |
 | `TestDownsampleSampleMerge` | 合并已有五特征样本，累加非整数 count；1/32/64 精度继承、首次复制、重复及自引用输入、源样本不变。 |
-| `TestDownsampleSampleNaNColumns` | 检查五列分别出现 NaN、输入次序变化和算术产生 NaN 时的计算结果，并确认源样本未被修改。 |
+| `TestDownsampleSampleNaNColumns` | 检查五列分别出现 NaN、输入次序变化、sum/count 异号无穷相加及自合并的结果，验证 min/max 遇到 NaN 与无穷时仍传播 NaN，并确认源样本未被修改。 |
 | `TestDownsampleSampleReset` | 空状态、带精度的 StaleNaN 样本、重复 Reset、清空后使用另一精度。 |
 | `TestDownsampleSampleRandomizedReference` | 原始样本直接聚合、多级分组合并、5m 再合并为 1h，与独立参考值一致。 |
+| `TestDownsampleHeaderValidation` | 拒绝 header 的非法行数、精度、编码、时间、负载大小与偏移，检查单行二阶差分编码和截断。 |
 
-`downsample_testutil_test.go` 提供将原始样本展开为五个特征、转换测试数据的辅助函数，不含独立测试。
+### metaindex 行编码
 
-### 归并与直接写样本
+生产文件：[downsample_metaindex_row.go](lib/storage/downsample_metaindex_row.go)；测试文件：[downsample_metaindex_row_test.go](lib/storage/downsample_metaindex_row_test.go)。
 
-文件：[downsample_merger_test.go](lib/storage/downsample_merger_test.go)。
+| 测试 | 验证内容 |
+|---|---|
+| `TestDownsampleMetaindexTimeBounds` | 拒绝 metaindex 时间范围低于或高于支持的时间域。 |
+
+### 磁盘 part 与元数据
+
+生产文件：[downsample_part.go](lib/storage/downsample_part.go)；测试文件：[downsample_part_test.go](lib/storage/downsample_part_test.go)。
+
+| 测试 | 验证内容 |
+|---|---|
+| `TestDownsampleMetadataValidation` | 拒绝缺少必需字段的降采样 metadata，以及超出支持时间域的 part 统计。 |
+| `TestDownsampleRejectsUnknownVersionAndMarker` | 预检查及打开 part 时拒绝未知格式版本、语义版本和 metaindex/index 标记。 |
+| `TestDownsampleLayoutMetaindexIdentityCorruption` | 拒绝 metaindex 中非法特征、分辨率或不一致的租户身份。 |
+| `TestEstimateDownsamplePartSize` | 分别估算原始源、降采样源及混合源的输出空间，检查空输入、非法输入和溢出边界。 |
+
+### 读取、定位与文件所有权
+
+生产文件：[downsample_reader.go](lib/storage/downsample_reader.go)；测试文件：[downsample_reader_test.go](lib/storage/downsample_reader_test.go)。
+
+| 测试 | 验证内容 |
+|---|---|
+| `TestDownsampleFileRoundtrip` | 多 TSID、两个分辨率、五特征及 NaN 的完整写入和读回；物理统计与格式识别。 |
+| `TestDownsampleFileConstantAndFilter` | 常量 count 列使用零负载；时间过滤保留完整相交 block，TSID 过滤和没有数据的分辨率返回正确结果。 |
+| `TestDownsampleReaderRawInmemory` | 读取原始内存 part，展开五特征；普通值和 StaleNaN 各贡献一次 count。 |
+| `TestDownsampleFileAllConstantPayloads` | 单行数据的时间列和全部特征列均为零负载，空文件仍可识别格式并完整读回。 |
+| `TestDownsampleReaderReadErrors` | values 文件在打开后被截断时，读取必须返回错误。 |
+| `TestDownsampleCodecRowCountAndDecodeLimit` | 拒绝单行二阶差分编码，以及解压后超过声明行数所允许大小的列负载；检查 `checkDownsampleExtent` 对负载偏移溢出的拒绝。 |
+| `TestDownsampleReaderLargeRawBlock` | 完整读取原始链路允许的双倍行数 block，五特征展开不截断。 |
+| `TestDownsampleReaderSeekResolutionAndSharedTSID` | 直接定位分辨率范围；同一 TSID 跨相邻 index 时不遗漏，按时间过滤；缺失 TSID 二分跳过无关 index。 |
+| `TestDownsampleReaderRawSeekEqualBoundaryAndReuse` | 在原始 metaindex 中定位 TSID；目标与某行首个 TSID 相等时，保留前一个 index，避免遗漏跨 index 的同 TSID 重叠 block。同一源重新初始化时复用文件句柄。 |
+| `TestDownsampleClusterTenantIndexBoundaries` | 按完整 TSID 过滤 AccountID、ProjectID 和相邻 index 的首尾项；复用 reader 时完整读取该 TSID 的两个 block，不混入其他租户。 |
+| `TestDownsampleIterationReaderReuse` | 多次切换分辨率、特征、过滤条件及缺失 TSID 后，reader 不遗漏或重复数据。 |
+| `TestDownsampleReaderCrossIndexOffsets` | 拒绝跨 index 的非法偏移和负载范围。 |
+| `TestDownsampleReaderCrossIndexFilterAndReset` | 跨 index 过滤及二分定位正确，Close 清除上一次索引边界状态，允许跳过不相交 index。 |
+| `TestDownsampleReaderCrossIndexSkippedCorruption` | 过滤读取不补读已跳过的损坏 index；全量扫描及正常打开 part 的校验均须读取并拒绝该损坏。 |
+| `TestDownsampleLayoutIndexTenantCorruption` | 打开 part 及逐 header 读取均拒绝 index 内混入其他租户。 |
+| `TestDownsampleReaderDuplicateBatchKey` | 拒绝降采样 block 的重复键，包括跨 index 边界的重复。 |
+| `TestDownsampleReaderRawDuplicateBoundaryAllowed` | 允许原始 block 具有相同时间边界，并完整读取各自的样本。 |
+| `TestDownsampleReaderCloseOwnFiles` | 释放 reader 及特征 reader 自行打开的全部文件，合并返回真实关闭错误；重复 Close 不再关闭文件。 |
+| `TestDownsampleReaderCloseBorrowedFiles` | 归还特征 reader 并清除引用，但不关闭借用的降采样 part 文件。 |
+| `TestDownsampleReaderSetFilterReleasesPeers` | 切换过滤条件时归还全部特征 reader，保留父 reader 文件；关闭失败可见，后续过滤和关闭不重复归还。 |
+| `TestDownsampleReaderInitFailureReleasesPartialSource` | 新源初始化中途失败时释放已打开的文件，清除状态后可重新初始化。 |
+| `TestDownsampleReaderInitCloseFailure` | 换源时旧句柄关闭失败，保留实际错误，不继续打开新源。 |
+| `TestDownsampleReaderSharedTimestampsValuesOnly` | 首列解码后关闭独立时间戳句柄，后四列仍只解码 values 并复用同一时间戳缓冲；单列查询及下一次多特征读取必须重新读时间戳。 |
+| `TestDownsampleReaderSharedTimestampsSwitches` | block、TSID、源 part、分辨率切换后，与各列单独使用原生 Block 读取的结果一致。 |
+| `TestDownsampleReaderSharedTimestampsValidation` | 拒绝不一致的共享时间列描述及损坏的 values。 |
+
+### 写入、布局与失败清理
+
+生产文件：[downsample_writer.go](lib/storage/downsample_writer.go)；测试文件：[downsample_writer_test.go](lib/storage/downsample_writer_test.go)。
+
+| 测试 | 验证内容 |
+|---|---|
+| `TestDownsampleWriterOrderAbort` | 拒绝分辨率逆序写入；Abort 删除目标目录。 |
+| `TestDownsampleWriterExistingDirectory` | 拒绝已有目录，随后 Abort 不删除该目录中原有文件。 |
+| `TestDownsampleWriterBufferCapacity` | writer 的整数、单列浮点值和时间戳缓冲在 reset 后清空内容、保留正常容量，并释放异常容量。 |
+| `TestDownsampleNativeBlockReuse` | 各特征使用原生 Block 编解码；8/64 精度、共享时间戳、查询 BlockRef 读取和编码状态一致。 |
+| `TestDownsampleFilePhysicalLayout` | 独立按 89 字节 header、113 字节 metaindex 解析真实文件；四个子场景为多 block/分辨率、738 批次跨 index、租户切 row、零负载列。检查列顺序、共享时间戳、连续偏移、文件完整覆盖及统计。 |
+| `TestEstimateDownsampleOutputSize` | 用独立布局公式核验共享时间列、五特征、索引、spill 和 metadata 的空间预算，以及每行和每批次的增量。 |
+| `TestDownsampleSpaceEstimateOverflow` | 用大整数参考检查空间估算、加法和乘法的饱和边界，避免回绕或提前饱和。 |
+| `TestDownsampleSpaceBoundCoversEncodedParts` | 实测最终文件与 spill 的保守峰值包络不超过预算；覆盖满 block、单行多 TSID 和频繁 index 切换。 |
+| `TestDownsampleAvailableSpaceBoundaries` | 检查安全余量、已预留空间和请求量的边界与溢出；拒绝非法写入行数，并保留空间不足错误标记。 |
+| `TestDownsampleWriterFinalFileFailures` | 四个最终二进制文件分别注入写错误、短写、关闭及 Abort 错误；原错误不丢失、每个句柄只释放一次、整个未发布目录删除。 |
+| `TestDownsampleWriterSpillAndValidationFailures` | spill 创建失败、截断 header、metadata 创建失败、后续输入无效；失败后禁止发布，清理后同一 writer 可重新初始化。 |
+| `TestDownsampleWriterFinalFilePermissions` | 最终文件权限与同进程 filestream 创建的文件一致。 |
+| `TestDownsampleWriterAbortRetriesOnlyDirectory` | 目录连续删除失败后只重试目录，已释放文件和 spill 不再关闭；保留首次写入错误及各次清理错误，清理完成后可复用 writer。 |
+| `TestDownsampleWriterFinishedTargetOwnership` | Finish 完成后保留目标，重新初始化及归还对象池不重复关闭或删除已完成文件；显式 Abort 可删除当前未发布目标。 |
+| `TestDownsampleWriterPoolKeepsPendingCleanup` | 归还 writer 时若目录仍无法删除，保留路径和错误，不将对象放回池中。 |
+| `TestDownsampleWriterSamplesPreserveInput` | 8/64 精度下写入经 Merge 构造的样本，包含由非标准 NaN 规范化得到的 StaleNaN，跳过前、中、后空槽；空输入不生成 block；写入后输入逐 bit 不变，读回与原生编码参考一致。 |
+| `TestDownsampleWriterSamplesLaterBlockFailure` | 第一块写入完成后，在第二块注入写错误或取消信号；返回相应错误，清理已写目标、中间文件和句柄，禁止继续发布。 |
+
+### 归并与 reader 释放
+
+生产文件：[downsample_merger.go](lib/storage/downsample_merger.go)；测试文件：[downsample_merger_test.go](lib/storage/downsample_merger_test.go)。
 
 | 测试 | 验证内容 |
 |---|---|
@@ -68,110 +143,68 @@ Go 单元测试、race 和 vet 均以退出码 0 为通过条件；Python 单元
 | `TestDownsampleMergerOutputBlockBoundary` | 连续与稀疏两种输入均含 8193 个有效 bucket；按有效行数拆出 8192 行 block 和尾块，不计入空槽。 |
 | `TestDownsampleMergerCancellation` | 已取消任务不统计尚未读取的数据；调用方执行 Abort 后删除目标目录，merger 可重新使用。 |
 | `TestDownsampleMergerSharedPrecisionAndColumnScales` | 各特征独立 scale、五列共享时间戳和精度，多轮合并与原生编码参考结果一致。 |
+| `TestDownsampleMergerResetClosesAllReaders` | reset、换分辨率和开始另一归并时释放全部源 reader，包括已经离开堆的实例；保留关闭错误并清除引用。 |
+| `TestDownsampleMergerClosesBeforeReturning` | 成功、关闭失败、写入与关闭同时失败、取消与关闭同时失败时，归并返回前释放全部 reader 和引用，保留实际错误。 |
 
-文件：[downsample_writer_samples_test.go](lib/storage/downsample_writer_samples_test.go)。
+### 分区、启动、发布与空间预留
 
-| 测试 | 验证内容 |
-|---|---|
-| `TestDownsampleWriterSamplesPreserveInput` | 8/64 精度下直接写样本，跳过前、中、后空槽；空输入不生成 block；写入后输入逐 bit 不变，包含非标准 NaN；读回与原生编码参考一致。 |
-| `TestDownsampleWriterSamplesLaterBlockFailure` | 第一块写入完成后，在第二块注入写错误或取消信号；返回相应错误，清理已写目标、中间文件和句柄，禁止继续发布。 |
-
-### 编码、文件格式与 reader 定位
-
-文件：[downsample_codec_test.go](lib/storage/downsample_codec_test.go)。
+生产文件：[downsample_partition.go](lib/storage/downsample_partition.go)；测试文件：[downsample_partition_test.go](lib/storage/downsample_partition_test.go)。
 
 | 测试 | 验证内容 |
 |---|---|
-| `TestDownsampleFileRoundtrip` | 多 TSID、两个分辨率、五特征及 NaN 的完整写入和读回；物理统计与格式识别。 |
-| `TestDownsampleFileConstantAndFilter`、`TestDownsampleFileAllConstantPayloads` | 常量列的零负载、时间和 TSID 过滤、没有数据的分辨率、全部常量的文件往返。 |
-| `TestDownsampleHeaderValidation`、`TestDownsampleMetadataValidation` | header 行数、精度、编码、时间、偏移和截断校验；metadata 必需字段校验。 |
-| `TestDownsampleRejectsUnknownVersionAndMarker`、`TestDownsampleTimeBounds` | 拒绝未知格式或标记，校验可写时间域及越界值。 |
-| `TestDownsampleWriterOrderAbortAndPool` | 拒绝分辨率逆序，Abort 删除目标，解码缓冲超出池容量阈值时释放。 |
-| `TestDownsampleWriterExistingDirectory` | 拒绝已有目录，随后 Abort 不删除该目录中原有文件。 |
-| `TestDownsampleWriterAbortAfterFinish` | Finish 完成后尚未提交的目标仍可由 Abort 完整删除。 |
-| `TestDownsampleReaderRawInmemory`、`TestDownsampleReaderLargeRawBlock` | 读取原始内存 part 并展开五特征，兼容原始大 block。 |
-| `TestDownsampleReaderReadErrors`、`TestDownsampleCodecRowCountAndDecodeLimit` | 读取错误、行数不一致和解码大小限制。 |
-| `TestDownsamplePoolNormalAndLargeCapacity` | reader 解码缓冲与 writer 单列缓冲保留正常容量、释放异常容量。 |
-| `TestDownsampleFileMultiIndex`、`TestDownsampleReaderSeekResolutionAndSharedTSID` | 多 index 文件、指定分辨率定位、同一 TSID 跨相邻 index、缺失 TSID 不误读其他范围。 |
-| `TestDownsampleReaderRawSeekEqualBoundaryAndReuse` | 在原始 metaindex 中定位 TSID；目标与某行首个 TSID 相等时，保留前一个 index，避免遗漏跨 index 的同 TSID 重叠 block。同一源重新初始化时复用文件句柄。 |
-| `TestDownsampleReaderSeekHighCardinality` | 在大量 TSID 的降采样 metaindex 中按分辨率和 TSID 二分定位，跳过无关索引。 |
-| `TestDownsampleNativeBlockReuse` | 各特征使用原生 Block 编解码；8/64 精度、共享时间戳、查询 BlockRef 读取和编码状态一致。 |
-| `TestDownsampleFieldHeaderSharedTimestamps` | 五列 header 必须具有相同 TSID、行数、精度和时间列描述。 |
+| `TestDownsampleFailureBeforePublication` | 取消、提交前取消、打开目标前注入错误、目标无效、提交前注入错误均保留源和原清单，清除未发布目标。 |
+| `TestDownsampleFailureSchedulers`、`TestDownsampleFailureStopsRemainingBatches` | 各调度入口收到 I/O 错误或取消后退出，停止继续调度剩余批次。 |
+| `TestDownsampleFailureFinalFlushPreservesRaw`、`TestDownsampleFailureFinalLifecycle` | 最终刷盘失败时，改以原始格式持久化数据；关闭存储和创建快照的过程中不丢数据。 |
+| `TestDownsampleFailureAfterPublication` | 提交后目录同步失败时，新目标与活动清单保持一致，旧磁盘源仍保留；不把已提交目标当作未发布结果删除。 |
+| `TestDownsampleFailureFinalSyncAfterPublication` | 提交同步失败后，最终刷盘仍再次同步目录；已发布的降采样目标不会被回退流程生成的原始文件覆盖。 |
+| `TestCheckDownsamplingOpen` | 活动清单与格式检查；覆盖空目录、原始与降采样 part 混合、快照与临时目录、部分删除、缺失 part 和损坏 metadata。 |
+| `TestCheckDownsamplingOpenInvalidManifests` | 拒绝非法 JSON、未知或重复字段、重复 part、非法名称、路径和尾部数据。 |
+| `TestMustOpenStorageDownsamplingRejectsDedup`、`TestMustOpenStorageDownsamplingRejectsDisabledModeBeforeBackgroundWork` | 拒绝降采样与非零 dedup 同时启用；未启用降采样却存在活动降采样 part 时，在后台任务启动前失败。 |
+| `TestCheckDownsamplingOpenDisabledPreservesDedup` | 未启用降采样时，启动检查不改变原有去重配置与存储文件。 |
+| `TestDownsamplePartitionInmemoryAndFailedOutput` | 内存 part 之间合并后仍保持原始格式；降采样输出失败时不替换源 part。 |
+| `TestDownsamplePartitionSmallBigMerge` | 分别生成 small 与 big 源，再合并为单个 big 目标，验证源列表变化和结果。 |
+| `TestDownsamplePartitionFilePartExpired` | 启用降采样时，原始 part 与降采样 part 均按最粗分辨率区间的右端点判定过期；关闭降采样后保留原始格式的过期边界。 |
+| `TestDownsamplePartitionFileOutput` | 单个内存 part 首次落盘及多个内存 part 合并落盘，均通过正常分区入口生成单个降采样 part，结果与原始输入参考一致。 |
+| `TestDownsampleRecoveryKeepsCommittedTargetAfterPanic` | 清单提交后在旧源回收处注入 panic；已提交目标仍可独立打开，存储重新打开后数据不变。 |
+| `TestDownsampleRecoveryDiscardsUnpublishedPart` | 再打开时丢弃未被活动清单引用的残缺 part。 |
+| `TestReserveDownsampleSpaceConcurrentAndCachedFreeSpace` | 同一文件系统并发预留不超额；释放幂等，已释放预算须等空闲空间缓存更新后才能重用。 |
+
+### 字段查询与集群协议
+
+生产文件：[downsample_query.go](lib/storage/downsample_query.go)；测试文件：[downsample_query_test.go](lib/storage/downsample_query_test.go)。
+
+| 测试 | 验证内容 |
+|---|---|
+| `TestDownsampleIterationMultiTSID` | 180 条时间线及同一 TSID 跨相邻 index；全部、非连续和缺失 TSID，边界时间窗，两个分辨率和五特征的查询遍历。 |
+| `TestDownsampleQueryFieldParse` | 接受十种合法的 `query.field`；空字段使用原始查询路径，非法值返回错误。 |
+| `TestDownsampleQueryFieldBlockRef` | 参数化验证多 TSID 的筛选及缺失项、两分辨率和五特征；另用单 TSID 的 40 行不规则时间戳与小数值检查共享精度 64。两组均经过 header 序列化和标准 BlockRef 解码，检查无字段及范围外查询为空。 |
+| `TestDownsampleQueryFieldRawIsolationAndReset` | 降采样字段查询不读取原始 part；同一 partSearch 恢复原始查询后仍能读取原始样本。 |
+| `TestDownsampleSearchProtocolValidation` | 显式比较设置字段前后的原生负载不变；扩展编码保留原生前缀，拒绝截断和非法字段；原生解码清除残留字段，并保留扩展尾部供 RPC 严格拒绝。 |
+
+### 跨模块验证与共享测试工具
+
+测试文件：[downsample_supplement_test.go](lib/storage/downsample_supplement_test.go)。保存以下两个跨模块测试，以及全部共享测试数据构造、独立参考计算、故障注入、断言和基准辅助函数。
+
+| 测试 | 验证内容 |
+|---|---|
 | `TestDownsampleClusterTenantIsolation` | 多租户写入、合并与字段查询保持隔离。 |
-| `TestDownsampleClusterTenantIndexBoundaries` | AccountID 或 ProjectID 变化时切换 metaindex row，每行仅包含同一租户。 |
+| `TestDownsampleStorageLifecycle` | 写入、刷盘、强制合并、快照、关闭和重新打开的完整存储生命周期。 |
 
-文件：[downsample_reader_shared_timestamps_test.go](lib/storage/downsample_reader_shared_timestamps_test.go)。
+storage 全量回归还会运行原始存储链路的已有测试，包括 `block_test.go` 中的 `TestBlockMarshalUnmarshalPortable`、`TestBlockUnmarshalPortableDoS`，用于验证原生 Block 编解码与异常输入限制。
 
-| 测试 | 验证内容 |
-|---|---|
-| `TestDownsampleReaderSharedTimestampsValuesOnly` | 首列解码后关闭独立时间戳句柄，后四列仍只解码 values 并复用同一时间戳缓冲；单列查询及下一次多特征读取必须重新读时间戳。 |
-| `TestDownsampleReaderSharedTimestampsSwitches` | block、TSID、源 part、分辨率切换后，与各列单独使用原生 Block 读取的结果一致。 |
-| `TestDownsampleReaderSharedTimestampsValidation` | 拒绝不一致的共享时间列描述及损坏的 values。 |
-
-布局与遍历测试：
+## app 与 API 单元测试
 
 | 文件及测试 | 验证内容 |
 |---|---|
-| [downsample_layout_test.go](lib/storage/downsample_layout_test.go)：`TestDownsampleFilePhysicalLayout` | 独立按 89 字节 header、113 字节 metaindex 解析真实文件；四个子场景为多 block/分辨率、738 批次跨 index、租户切 row、零负载列。检查列顺序、共享时间戳、连续偏移、文件完整覆盖及统计。 |
-| [downsample_iteration_test.go](lib/storage/downsample_iteration_test.go)：`TestDownsampleIterationMultiTSID` | 180 条时间线及同一 TSID 跨相邻 index；全部、非连续和缺失 TSID，边界时间窗，两个分辨率和五特征的查询遍历。 |
-| 同文件：`TestDownsampleIterationReaderReuse` | 多次切换分辨率、特征、过滤条件及缺失 TSID 后，reader 不遗漏或重复数据。 |
-| [downsample_layout_corruption_test.go](lib/storage/downsample_layout_corruption_test.go)：`TestDownsampleReaderCrossIndexOffsets` | 拒绝跨 index 的非法偏移和负载范围。 |
-| 同文件：`TestDownsampleReaderCrossIndexFilterAndReset` | 跨 index 过滤、二分定位和 Reset 清理上一次索引边界状态，允许跳过不相交 index。 |
-| 同文件：`TestDownsampleReaderCrossIndexSkippedCorruption` | 过滤读取不补读已跳过的损坏 index；全量扫描及正常打开 part 的校验均须读取并拒绝该损坏。 |
-| 同文件：`TestDownsampleLayoutMetaindexIdentityCorruption`、`TestDownsampleLayoutIndexTenantCorruption` | 拒绝 metaindex 身份不一致，以及 index 内混入其他租户。 |
-| 同文件：`TestDownsampleReaderDuplicateBatchKey`、`TestDownsampleReaderRawDuplicateBoundaryAllowed` | 拒绝降采样 block 的重复键；允许原始 block 具有相同时间边界，并完整读取各自的样本。 |
-
-### 文件关闭、写失败与发布恢复
-
-| 文件及测试 | 验证内容 |
-|---|---|
-| [downsample_reader_close_test.go](lib/storage/downsample_reader_close_test.go)：`TestDownsampleReaderCloseOwnFiles`、`TestDownsampleReaderCloseBorrowedFiles` | reader 自行打开的原始文件句柄全部释放，关闭错误合并返回；借用的降采样 part 文件句柄仍保持打开。 |
-| 同文件：`TestDownsampleReaderInitCloseFailure` | 换源时旧句柄关闭失败，保留实际错误，不继续打开新源。 |
-| 同文件：`TestDownsampleMergerResetClosesAllReaders`、`TestDownsampleMergerClosesBeforeReturning` | 已离开堆的 reader 仍由归并任务持有；成功、关闭失败、写入与关闭同时失败、取消与关闭同时失败时，全部实例和引用得到释放。 |
-| [downsample_writer_failure_test.go](lib/storage/downsample_writer_failure_test.go)：`TestDownsampleWriterFinalFileFailures` | 四个最终二进制文件分别注入写错误、短写、关闭及 Abort 错误；原错误不丢失、每个句柄只释放一次、整个未发布目录删除。 |
-| 同文件：`TestDownsampleWriterSpillAndValidationFailures` | spill 创建失败、截断 header、metadata 创建失败、后续输入无效；失败后禁止发布，清理后同一 writer 可重新初始化。 |
-| 同文件：`TestDownsampleWriterFinalFilePermissions` | 最终文件权限与同进程 filestream 创建的文件一致。 |
-| [downsample_failure_test.go](lib/storage/downsample_failure_test.go)：`TestDownsampleFailureBeforePublication` | 取消、提交前取消、打开目标前注入错误、目标无效、提交前注入错误均保留源和原清单，清除未发布目标。 |
-| 同文件：`TestDownsampleFailureSchedulers`、`TestDownsampleFailureStopsRemainingBatches` | 各调度入口收到 I/O 错误或取消后退出，停止继续调度剩余批次。 |
-| 同文件：`TestDownsampleFailureFinalFlushPreservesRaw`、`TestDownsampleFailureFinalLifecycle` | 最终刷盘失败时，改以原始格式持久化数据；关闭存储和创建快照的过程中不丢数据。 |
-| 同文件：`TestDownsampleFailureAfterPublication` | 提交后目录同步失败时，新目标与活动清单保持一致，旧磁盘源仍保留；不把已提交目标当作未发布结果删除。 |
-| 同文件：`TestDownsampleFailureFinalSyncAfterPublication` | 提交同步失败后，最终刷盘仍再次同步目录；已发布的降采样目标不会被回退流程生成的原始文件覆盖。 |
-| [downsample_recovery_test.go](lib/storage/downsample_recovery_test.go)：`TestDownsampleRecoveryKeepsCommittedTargetAfterPanic` | 清单提交后在旧源回收处注入 panic；已提交目标仍可独立打开，存储重新打开后数据不变。 |
-| 同文件：`TestDownsampleRecoveryDiscardsUnpublishedPart` | 再打开时丢弃未被活动清单引用的残缺 part。 |
-
-### 分区、启动和空间预算
-
-| 文件及测试 | 验证内容 |
-|---|---|
-| [downsample_partition_test.go](lib/storage/downsample_partition_test.go)：`TestDownsamplePartitionInmemoryAndFailedOutput` | 内存 part 之间合并后仍保持原始格式；降采样输出失败时不替换源 part。 |
-| 同文件：`TestDownsamplePartitionSmallBigMerge`、`TestDownsamplePartitionFileOutput` | small/big 归并和落盘入口生成正确目标，核验输出类型与结果。 |
-| 同文件：`TestDownsamplePartitionFilePartExpired` | 启用降采样时，原始 part 与降采样 part 均按最粗分辨率区间的右端点判定过期；关闭降采样后保留原始格式的过期边界。 |
-| 同文件：`TestDownsampleStorageLifecycle` | 写入、刷盘、强制合并、快照、关闭和重新打开的完整存储生命周期。 |
-| [downsample_open_test.go](lib/storage/downsample_open_test.go)：`TestCheckDownsamplingOpen` | 活动清单与格式检查；覆盖空目录、原始与降采样 part 混合、快照与临时目录、部分删除、缺失 part 和损坏 metadata。 |
-| 同文件：`TestCheckDownsamplingOpenInvalidManifests` | 拒绝非法 JSON、未知或重复字段、重复 part、非法名称、路径和尾部数据。 |
-| 同文件：`TestMustOpenStorageDownsamplingRejectsDedup`、`TestMustOpenStorageDownsamplingRejectsDisabledModeBeforeBackgroundWork` | 拒绝降采样与非零 dedup 同时启用；未启用降采样却存在活动降采样 part 时，在后台任务启动前失败。 |
-| 同文件：`TestCheckDownsamplingOpenDisabledPreservesDedup` | 未启用降采样时，启动检查不改变原有去重配置与存储文件。 |
-| [downsample_space_test.go](lib/storage/downsample_space_test.go)：`TestEstimateDownsamplePartSize` | 分别估算原始源、降采样源及混合源的输出空间，检查空输入、非法输入和溢出边界。 |
-| 同文件：`TestEstimateDownsampleOutputSize`、`TestDownsampleSpaceEstimateOverflow` | 独立布局公式和大整数参考验证时间列、五特征、索引、spill、metadata 预算及饱和算术。 |
-| 同文件：`TestDownsampleSpaceBoundCoversEncodedParts` | 实测最终文件与 spill 的保守峰值包络不超过预算；覆盖满 block、单行多 TSID 和频繁 index 切换。 |
-| 同文件：`TestReserveDownsampleSpaceConcurrentAndCachedFreeSpace`、`TestDownsampleAvailableSpaceBoundaries` | 并发预留、幂等释放、空闲空间缓存、安全余量和请求边界。 |
-
-### 查询与集群协议
-
-| 文件及测试 | 验证内容 |
-|---|---|
-| [lib/storage/downsample_query_test.go](lib/storage/downsample_query_test.go)：`TestDownsampleQueryFieldParse` | 接受十种合法的 `query.field`；空字段使用原始查询路径，非法值返回错误。 |
-| 同文件：`TestDownsampleQueryFieldBlockRef`、`TestDownsampleQueryFieldSharedPrecision` | 指定 TSID、分辨率、特征后仍使用标准 BlockRef；8/64 精度与共享时间列保持正确。 |
-| 同文件：`TestDownsampleQueryFieldRawIsolationAndReset`、`TestDownsampleQueryFieldDoesNotChangeSearchProtocol` | 原始查询与降采样字段查询相互隔离；复用对象不残留字段选择，原始搜索协议保持不变。 |
-| [lib/storage/downsample_search_protocol_test.go](lib/storage/downsample_search_protocol_test.go)：`TestDownsampleSearchProtocolValidation` | 扩展负载保留原始前缀；拒绝截断和非法字段；旧解码器保留扩展尾部供 RPC 严格拒绝。 |
 | [app/vmselect/prometheus/downsample_query_test.go](app/vmselect/prometheus/downsample_query_test.go)：`TestDownsampleQueryFieldHTTPParameter` | HTTP 瞬时查询和范围查询接口解析合法字段，拒绝空值、重复参数、错误转义及不支持的组合。 |
+| 同文件：`TestDownsampleQueryHTTPErrorPrefix` | 瞬时查询和范围查询缺少表达式或参数无效时，降采样请求返回带标记的英文错误，原始请求保持原有错误格式。 |
 | [app/vmselect/promql/downsample_query_test.go](app/vmselect/promql/downsample_query_test.go)：`TestDownsampleQueryFieldCacheAndCopy` | 字段查询禁用未区分特征的结果缓存，子查询配置复制保留字段与禁用缓存的状态。 |
 | [app/vmselect/netstorage/downsample_query_test.go](app/vmselect/netstorage/downsample_query_test.go)：`TestDownsampleClusterSearchQueryFieldRoundtrip` | 租户和字段选择经过集群请求序列化后不丢失，字段请求使用 `search_downsampling_v2`。 |
 | 同文件：`TestDownsampleClusterSearchRejectsPartialResults` | 字段查询遇到不支持协议或节点错误时，不以部分结果冒充成功。 |
+| 同文件：`TestDownsampleClusterSearchDeadlinePrefix` | 查询开始前已超时时，根据当前字段选择设置错误前缀，原始查询不添加降采样标记。 |
 | [lib/vmselectapi/downsample_search_test.go](lib/vmselectapi/downsample_search_test.go)：`TestDownsampleSearchRPCDispatch` | 原生与字段 RPC 分发、租户和十字段传递，返回实际 block。 |
 | 同文件：`TestDownsampleSearchRPCRejectsInvalidPayload` | 拒绝字段缺失、截断、非法值及多余尾部，错误请求不进入搜索。 |
-
-storage 全量回归还会运行原始存储链路的已有测试，包括 `block_test.go` 中的 `TestBlockMarshalUnmarshalPortable`、`TestBlockUnmarshalPortableDoS`，用于验证原生 Block 编解码与异常输入限制。
+| 同文件：`TestDownsampleSearchRPCErrorPrefixReuse` | 同一连接先执行降采样查询、再执行原始查询，验证超时响应使用当前请求的错误前缀，原始查询不继承降采样标记。 |
 
 ## filestream 单元测试
 
@@ -196,18 +229,18 @@ storage 全量回归还会运行原始存储链路的已有测试，包括 `bloc
 
 ## 性能测试
 
-入口位于 [downsample_timing_test.go](lib/storage/downsample_timing_test.go)：
+四个入口分别位于样本、归并、读取和写入对应的测试文件：
 
 ```sh
 go test ./lib/storage -run '^$' -bench '^BenchmarkDownsample' -benchmem -count=1
 ```
 
-| Benchmark | 衡量内容 |
+| 文件及 Benchmark | 衡量内容 |
 |---|---|
-| `BenchmarkDownsampleSample/Raw`、`/Sample` | 分别使用 8192 条原始样本和五特征样本，测量纯计算吞吐和内存分配。 |
-| `BenchmarkDownsampleMerge` | `Dense`、`Sparse`、`HighCardinality` 三种负载；分别测量原始源合并、多个降采样源合并，以及已合并降采样 part 的重写成本。子模式名为 `Raw`、`Summary`、`SummaryRewrite`。 |
-| `BenchmarkDownsampleFileRead` | 三种负载下遍历两个分辨率并解码全部特征的成本。 |
-| `BenchmarkDownsampleFileWrite` | 样本直接进入 writer 后的编码、写文件和同步关闭成本；测试数据转置、目录统计和删除不计时。 |
+| [downsample_block_test.go](lib/storage/downsample_block_test.go)：`BenchmarkDownsampleSample/Raw`、`/Sample` | 分别使用 8192 条原始样本和五特征样本，测量纯计算吞吐和内存分配。 |
+| [downsample_merger_test.go](lib/storage/downsample_merger_test.go)：`BenchmarkDownsampleMerge` | `Dense`、`Sparse`、`HighCardinality` 三种负载；分别测量原始源合并、多个降采样源合并，以及已合并降采样 part 的重写成本。子模式名为 `Raw`、`Summary`、`SummaryRewrite`。 |
+| [downsample_reader_test.go](lib/storage/downsample_reader_test.go)：`BenchmarkDownsampleFileRead` | 三种负载下遍历两个分辨率并解码全部特征的成本。 |
+| [downsample_writer_test.go](lib/storage/downsample_writer_test.go)：`BenchmarkDownsampleFileWrite` | 样本直接进入 writer 后的编码、写文件和同步关闭成本；测试数据转置、目录统计和删除不计时。 |
 
 结果包含 Go 的耗时、分配数和内存指标，以及测试自行报告的行吞吐、行数或文件字节指标。Benchmark 没有固定性能通过阈值；比较改动时应使用同一机器、Go 版本和参数，功能正确性仍由单元测试判定。
 

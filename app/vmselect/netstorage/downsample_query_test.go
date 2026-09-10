@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/searchutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 )
 
@@ -81,12 +83,25 @@ func TestDownsampleClusterSearchRejectsPartialResults(t *testing.T) {
 				return v.(error)
 			})
 			if withField {
-				if !errors.Is(err, unsupported) || isPartial {
+				if !errors.Is(err, unsupported) || isPartial || !strings.HasPrefix(err.Error(), "[downsampling] ") {
 					t.Fatalf("字段查询吞掉节点错误: replication=%d partial=%v err=%v", replication, isPartial, err)
 				}
 			} else if err != nil || isPartial != (replication == 1) {
 				t.Fatalf("原有查询容错行为改变: replication=%d partial=%v err=%v", replication, isPartial, err)
 			}
+		}
+	}
+}
+
+func TestDownsampleClusterSearchDeadlinePrefix(t *testing.T) {
+	for _, withField := range []bool{true, false} {
+		sq := storage.NewSearchQuery(7, 11, 86400001, 90000000, nil, 37)
+		if withField {
+			sq.DownsampleField = &storage.DownsampleQueryField{ResolutionMs: 300000, Feature: 1}
+		}
+		results, partial, err := ProcessSearchQuery(nil, false, sq, searchutil.DeadlineFromTimestamp(0))
+		if results != nil || partial || err == nil || strings.HasPrefix(err.Error(), "[downsampling] ") != withField {
+			t.Fatalf("查询超时错误前缀不匹配: field=%v results=%v partial=%v err=%v", withField, results, partial, err)
 		}
 	}
 }

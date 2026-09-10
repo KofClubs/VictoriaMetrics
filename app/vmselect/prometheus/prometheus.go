@@ -969,24 +969,37 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w
 	if err != nil {
 		return err
 	}
+	errorPrefix := ""
+	if field != nil {
+		errorPrefix = "[downsampling] "
+	}
 
 	ct := startTime.UnixNano() / 1e6
 	deadline := searchutil.GetDeadlineForQuery(r, startTime)
 	noCache := field != nil || httputil.GetBool(r, "nocache")
 	query := r.FormValue("query")
 	if len(query) == 0 {
-		return httpserver.InvalidParamError(fmt.Errorf("missing `query` arg"))
+		return httpserver.InvalidParamError(fmt.Errorf("%smissing `query` arg", errorPrefix))
 	}
 	start, err := httputil.GetTime(r, "time", ct)
 	if err != nil {
+		if field != nil {
+			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
+		}
 		return httpserver.InvalidParamError(err)
 	}
 	lookbackDelta, err := getMaxLookback(r)
 	if err != nil {
+		if field != nil {
+			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
+		}
 		return httpserver.InvalidParamError(err)
 	}
 	step, err := httputil.GetDuration(r, "step", lookbackDelta)
 	if err != nil {
+		if field != nil {
+			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
+		}
 		return httpserver.InvalidParamError(err)
 	}
 	if step <= 0 {
@@ -995,16 +1008,19 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w
 
 	maxLen := searchutil.GetMaxQueryLen()
 	if len(query) > maxLen {
-		return httpserver.InvalidParamError(fmt.Errorf("too long query; got %d bytes; mustn't exceed `-search.maxQueryLen=%d` bytes", len(query), maxLen))
+		return httpserver.InvalidParamError(fmt.Errorf(errorPrefix+"too long query; got %d bytes; mustn't exceed `-search.maxQueryLen=%d` bytes", len(query), maxLen))
 	}
 	etfs, err := searchutil.GetExtraTagFilters(r)
 	if err != nil {
+		if field != nil {
+			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
+		}
 		return httpserver.InvalidParamError(err)
 	}
 	if childQuery, windowExpr, offsetExpr := promql.IsMetricSelectorWithRollup(query); childQuery != "" {
 		window, err := windowExpr.NonNegativeDuration(step)
 		if err != nil {
-			return httpserver.InvalidParamError(fmt.Errorf("cannot parse lookbehind window in square brackets at %s: %w", query, err))
+			return httpserver.InvalidParamError(fmt.Errorf(errorPrefix+"cannot parse lookbehind window in square brackets at %s: %w", query, err))
 		}
 		offset := offsetExpr.Duration(step)
 		start -= offset
@@ -1018,6 +1034,9 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w
 
 		tagFilterss, err := getTagFilterssFromMatches([]string{childQuery})
 		if err != nil {
+			if field != nil {
+				err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
+			}
 			return httpserver.InvalidParamError(err)
 		}
 		filterss := searchutil.JoinTagFilterss(tagFilterss, etfs)
@@ -1030,37 +1049,40 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w
 			downsampleField: field,
 		}
 		if err := exportHandler(qt, at, w, cp, "promapi", 0, false); err != nil {
-			return fmt.Errorf("error when exporting data for query=%q on the time range (start=%d, end=%d): %w", childQuery, start, end, err)
+			return fmt.Errorf(errorPrefix+"error when exporting data for query=%q on the time range (start=%d, end=%d): %w", childQuery, start, end, err)
 		}
 		return nil
 	}
 	if childQuery, windowExpr, stepExpr, offsetExpr := promql.IsRollup(query); childQuery != "" {
 		if len(childQuery) > maxLen {
-			return httpserver.InvalidParamError(fmt.Errorf("too long query; got %d bytes; mustn't exceed `-search.maxQueryLen=%d` bytes", len(childQuery), maxLen))
+			return httpserver.InvalidParamError(fmt.Errorf(errorPrefix+"too long query; got %d bytes; mustn't exceed `-search.maxQueryLen=%d` bytes", len(childQuery), maxLen))
 		}
 		newStep, err := stepExpr.NonNegativeDuration(step)
 		if err != nil {
-			return httpserver.InvalidParamError(fmt.Errorf("cannot parse step in square brackets at %s: %w", query, err))
+			return httpserver.InvalidParamError(fmt.Errorf(errorPrefix+"cannot parse step in square brackets at %s: %w", query, err))
 		}
 		if newStep > 0 {
 			step = newStep
 		}
 		window, err := windowExpr.NonNegativeDuration(step)
 		if err != nil {
-			return httpserver.InvalidParamError(fmt.Errorf("cannot parse lookbehind window in square brackets at %s: %w", query, err))
+			return httpserver.InvalidParamError(fmt.Errorf(errorPrefix+"cannot parse lookbehind window in square brackets at %s: %w", query, err))
 		}
 		offset := offsetExpr.Duration(step)
 		start -= offset
 		end := start
 		start = end - window
 		if err := queryRangeHandler(qt, startTime, at, w, childQuery, start, end, step, lookbackDelta, r, ct, etfs, field); err != nil {
-			return fmt.Errorf("error when executing query=%q on the time range (start=%d, end=%d, step=%d): %w", childQuery, start, end, step, err)
+			return fmt.Errorf(errorPrefix+"error when executing query=%q on the time range (start=%d, end=%d, step=%d): %w", childQuery, start, end, step, err)
 		}
 		return nil
 	}
 
 	queryOffset, err := getLatencyOffsetMilliseconds(r)
 	if err != nil {
+		if field != nil {
+			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
+		}
 		return httpserver.InvalidParamError(err)
 	}
 	if !noCache && ct-start < queryOffset && start-ct < queryOffset {
@@ -1094,14 +1116,14 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w
 	}
 	err = populateAuthTokens(qt, ec, at, deadline)
 	if err != nil {
-		return fmt.Errorf("cannot populate auth tokens: %w", err)
+		return fmt.Errorf(errorPrefix+"cannot populate auth tokens: %w", err)
 	}
 	qs := promql.NewQueryStats(query, at, ec)
 	ec.QueryStats = qs
 
 	result, err := promql.Exec(qt, ec, query, true)
 	if err != nil {
-		return fmt.Errorf("error when executing query=%q for (time=%d, step=%d): %w", query, start, step, err)
+		return fmt.Errorf(errorPrefix+"error when executing query=%q for (time=%d, step=%d): %w", query, start, step, err)
 	}
 	if queryOffset > 0 {
 		for i := range result {
@@ -1125,7 +1147,7 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w
 
 	WriteQueryResponse(bw, ec.IsPartialResponse.Load(), result, qt, qtDone, qs)
 	if err := bw.Flush(); err != nil {
-		return fmt.Errorf("cannot flush query response to remote client: %w", err)
+		return fmt.Errorf(errorPrefix+"cannot flush query response to remote client: %w", err)
 	}
 
 	return nil
@@ -1142,38 +1164,57 @@ func QueryRangeHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Tok
 	if err != nil {
 		return err
 	}
+	errorPrefix := ""
+	if field != nil {
+		errorPrefix = "[downsampling] "
+	}
 
 	ct := startTime.UnixNano() / 1e6
 	query := r.FormValue("query")
 	if len(query) == 0 {
-		return httpserver.InvalidParamError(fmt.Errorf("missing `query` arg"))
+		return httpserver.InvalidParamError(fmt.Errorf("%smissing `query` arg", errorPrefix))
 	}
 	maxLen := searchutil.GetMaxQueryLen()
 	if len(query) > maxLen {
-		return httpserver.InvalidParamError(fmt.Errorf("too long query; got %d bytes; mustn't exceed `-search.maxQueryLen=%d` bytes", len(query), maxLen))
+		return httpserver.InvalidParamError(fmt.Errorf(errorPrefix+"too long query; got %d bytes; mustn't exceed `-search.maxQueryLen=%d` bytes", len(query), maxLen))
 	}
 	start, err := httputil.GetTime(r, "start", ct-defaultStep)
 	if err != nil {
+		if field != nil {
+			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
+		}
 		return httpserver.InvalidParamError(err)
 	}
 	end, err := httputil.GetTime(r, "end", ct)
 	if err != nil {
+		if field != nil {
+			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
+		}
 		return httpserver.InvalidParamError(err)
 	}
 	step, err := httputil.GetDuration(r, "step", defaultStep)
 	if err != nil {
+		if field != nil {
+			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
+		}
 		return httpserver.InvalidParamError(err)
 	}
 	etfs, err := searchutil.GetExtraTagFilters(r)
 	if err != nil {
+		if field != nil {
+			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
+		}
 		return httpserver.InvalidParamError(err)
 	}
 	lookbackDelta, err := getMaxLookback(r)
 	if err != nil {
+		if field != nil {
+			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
+		}
 		return httpserver.InvalidParamError(err)
 	}
 	if err := queryRangeHandler(qt, startTime, at, w, query, start, end, step, lookbackDelta, r, ct, etfs, field); err != nil {
-		return fmt.Errorf("error when executing query=%q on the time range (start=%d, end=%d, step=%d): %w", query, start, end, step, err)
+		return fmt.Errorf(errorPrefix+"error when executing query=%q on the time range (start=%d, end=%d, step=%d): %w", query, start, end, step, err)
 	}
 	return nil
 }

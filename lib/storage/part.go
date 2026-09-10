@@ -69,7 +69,7 @@ func mustOpenFilePart(path string) *part {
 	if isDownsample {
 		p, err := openDownsamplePart(path)
 		if err != nil {
-			logger.Panicf("FATAL: cannot open downsample part at %q: %s", path, err)
+			logger.Panicf("[downsampling] FATAL: cannot open downsample part at %q: %s", path, err)
 		}
 		return p
 	}

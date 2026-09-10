@@ -157,7 +157,7 @@ func main() {
 
 	storage.SetDedupInterval(*minScrapeInterval)
 	if *downsamplingEnabled && storage.GetDedupInterval() != 0 {
-		logger.Fatalf("-storage.downsampling.enabled requires -dedup.minScrapeInterval=0; got %s", *minScrapeInterval)
+		logger.Fatalf("[downsampling] -storage.downsampling.enabled requires -dedup.minScrapeInterval=0; got %s", *minScrapeInterval)
 	}
 	storage.SetDataFlushInterval(*inmemoryDataFlushInterval)
 	storage.LegacySetRetentionTimezoneOffset(*retentionTimezoneOffset)

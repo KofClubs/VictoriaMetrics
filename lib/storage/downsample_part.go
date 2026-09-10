@@ -6,12 +6,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"unsafe"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+)
+
+const (
+	downsampleVersion          = 2
+	downsampleMaxIndexSize     = 2 * maxBlockSize
+	downsampleMaxMetaindexSize = 64 << 20
+	downsampleMaxMetadataSize  = 64 << 10
+
+	// 文件前缀不属于 ZSTD 帧，原始格式 reader 会拒绝降采样文件。
+	downsampleMetaindexMagic = "VMDSMI\x00\x02"
+	downsampleIndexMagic     = "VMDSIX\x00\x02"
 )
 
 // downsamplePartMetadata 保留原有统计字段，并显式声明降采样的计算语义。
@@ -32,20 +44,20 @@ func newDownsamplePartMetadata(ph partHeader) downsamplePartMetadata {
 
 func (m *downsamplePartMetadata) validate() error {
 	if m.FormatVersion != downsampleVersion || m.SemanticsVersion != downsampleVersion || m.Mode != "downsampling" || len(m.Resolutions) != 2 || m.Resolutions[0] != 300000 || m.Resolutions[1] != 3600000 || m.BucketOrigin != 0 || m.NumericCodec != "decimal-values" || m.Retention != "bucket-end" || m.MinDedupInterval != 0 {
-		return fmt.Errorf("不支持或矛盾的降采样格式、分辨率或语义元数据")
+		return fmt.Errorf("[downsampling] unsupported or inconsistent format, resolution, or semantics metadata")
 	}
 	if m.RowsCount%countOfDownsampleFeatures != 0 || m.BlocksCount%countOfDownsampleFeatures != 0 {
-		return fmt.Errorf("降采样物理行数和 Block 数量必须按五个特征成组")
+		return fmt.Errorf("[downsampling] physical row and block counts must be grouped by five features")
 	}
 	if m.MinTimestamp < minUnixMilli || m.MaxTimestamp > maxUnixMilli {
-		return fmt.Errorf("降采样 part 时间范围超出支持域")
+		return fmt.Errorf("[downsampling] part time range is outside the supported range")
 	}
 	return validateDownsamplePartHeader(&m.partHeader)
 }
 
 func validateDownsamplePartHeader(ph *partHeader) error {
 	if ph.RowsCount == 0 || ph.BlocksCount == 0 || ph.BlocksCount > ph.RowsCount || ph.MinTimestamp > ph.MaxTimestamp {
-		return fmt.Errorf("无效 part 统计或时间范围")
+		return fmt.Errorf("[downsampling] invalid part statistics or time range")
 	}
 	return nil
 }
@@ -61,7 +73,7 @@ func readDownsampleLimitedFile(path string, limit int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(b)) > limit {
-		return nil, fmt.Errorf("文件 %q 超过大小上限 %d", path, limit)
+		return nil, fmt.Errorf("[downsampling] file %q exceeds the size limit %d", path, limit)
 	}
 	return b, nil
 }
@@ -94,14 +106,14 @@ func readDownsampleMetadata(path string) (*downsamplePartMetadata, error) {
 		// 缺少版本但含降采样语义字段时不能按 raw 格式解释。
 		for _, key := range []string{"SemanticsVersion", "Mode", "Resolutions", "BucketOrigin", "NumericCodec", "Retention"} {
 			if _, ok := fields[key]; ok {
-				return nil, fmt.Errorf("元数据缺少 FormatVersion")
+				return nil, fmt.Errorf("[downsampling] metadata is missing FormatVersion")
 			}
 		}
 		return nil, nil
 	}
 	for _, key := range []string{"FormatVersion", "SemanticsVersion", "Mode", "Resolutions", "BucketOrigin", "NumericCodec", "Retention", "RowsCount", "BlocksCount", "MinTimestamp", "MaxTimestamp", "MinDedupInterval"} {
 		if v, ok := fields[key]; !ok || bytes.Equal(bytes.TrimSpace(v), []byte("null")) {
-			return nil, fmt.Errorf("降采样元数据缺少字段 %s", key)
+			return nil, fmt.Errorf("[downsampling] metadata is missing field %s", key)
 		}
 	}
 	var m downsamplePartMetadata
@@ -118,7 +130,7 @@ func readDownsampleMetadata(path string) (*downsamplePartMetadata, error) {
 func detectDownsampleFormat(path string) (bool, error) {
 	m, err := readDownsampleMetadata(path)
 	if err != nil {
-		return false, fmt.Errorf("检查 part %q: %w", path, err)
+		return false, fmt.Errorf("[downsampling] cannot inspect part %q: %w", path, err)
 	}
 	f, err := os.Open(filepath.Join(path, metaindexFilename))
 	if err != nil {
@@ -128,14 +140,14 @@ func detectDownsampleFormat(path string) (bool, error) {
 	var magic [8]byte
 	n, err := io.ReadFull(f, magic[:])
 	if err != nil {
-		return false, fmt.Errorf("part %q 的 metaindex 标识被截断: %w", path, err)
+		return false, fmt.Errorf("[downsampling] part %q has a truncated metaindex marker: %w", path, err)
 	}
 	if m != nil {
 		if string(magic[:n]) != downsampleMetaindexMagic {
-			return false, fmt.Errorf("part %q 的降采样元数据与 metaindex 标识矛盾", path)
+			return false, fmt.Errorf("[downsampling] part %q metadata does not match its metaindex marker", path)
 		}
 	} else if !bytes.Equal(magic[:4], []byte{0x28, 0xb5, 0x2f, 0xfd}) {
-		return false, fmt.Errorf("part %q 缺少合法 raw 格式或具有未知 metaindex 标识", path)
+		return false, fmt.Errorf("[downsampling] part %q has no valid raw format or has an unknown metaindex marker", path)
 	}
 	for _, name := range []string{timestampsFilename, valuesFilename, indexFilename} {
 		st, err := os.Stat(filepath.Join(path, name))
@@ -143,7 +155,7 @@ func detectDownsampleFormat(path string) (bool, error) {
 			return false, err
 		}
 		if !st.Mode().IsRegular() {
-			return false, fmt.Errorf("part %q 的 %s 不是普通文件", path, name)
+			return false, fmt.Errorf("[downsampling] part %q file %s is not a regular file", path, name)
 		}
 	}
 	return m != nil, nil
@@ -153,21 +165,21 @@ func detectDownsampleFormat(path string) (bool, error) {
 func openDownsamplePart(path string) (_ *part, err error) {
 	m, err := readDownsampleMetadata(path)
 	if err != nil || m == nil {
-		return nil, fmt.Errorf("读取降采样元数据 %q: %v", path, err)
+		return nil, fmt.Errorf("[downsampling] cannot read part metadata %q: %v", path, err)
 	}
 	b, err := readDownsampleLimitedFile(filepath.Join(path, metaindexFilename), downsampleMaxMetaindexSize)
 	if err != nil {
 		return nil, err
 	}
 	if len(b) < len(downsampleMetaindexMagic) || string(b[:len(downsampleMetaindexMagic)]) != downsampleMetaindexMagic {
-		return nil, fmt.Errorf("降采样 metaindex 标识错误")
+		return nil, fmt.Errorf("[downsampling] invalid metaindex marker")
 	}
 	data, err := encoding.DecompressZSTDLimited(nil, b[len(downsampleMetaindexMagic):], downsampleMaxMetaindexSize)
 	if err != nil {
 		return nil, err
 	}
 	if len(data) == 0 || len(data)%downsampleMetaindexRowSize != 0 {
-		return nil, fmt.Errorf("降采样 metaindex 长度错误")
+		return nil, fmt.Errorf("[downsampling] invalid metaindex length")
 	}
 	p := &part{path: path, ph: m.partHeader, dsMetadata: m}
 	defer func() {
@@ -200,13 +212,13 @@ func openDownsamplePart(path string) (_ *part, err error) {
 			return nil, err
 		}
 		if mr.IndexBlockOffset != nextOffset {
-			return nil, fmt.Errorf("降采样 index 偏移不连续")
+			return nil, fmt.Errorf("[downsampling] index offsets are not contiguous")
 		}
 		nextOffset += uint64(mr.IndexBlockSize)
 		if len(p.dsMetaindex) > 0 {
 			prev := &p.dsMetaindex[len(p.dsMetaindex)-1]
 			if mr.ResolutionMs < prev.ResolutionMs || (mr.ResolutionMs == prev.ResolutionMs && (mr.feature < prev.feature || (mr.feature == prev.feature && mr.TSID.Less(&prev.LastTSID)))) {
-				return nil, fmt.Errorf("降采样 metaindex 排序错误")
+				return nil, fmt.Errorf("[downsampling] invalid metaindex order")
 			}
 		} else {
 			minTime = mr.MinTimestamp
@@ -215,7 +227,7 @@ func openDownsamplePart(path string) (_ *part, err error) {
 		minTime = min(minTime, mr.MinTimestamp)
 		maxTime = max(maxTime, mr.MaxTimestamp)
 		if ^uint64(0)-rows < mr.RowsCount || ^uint64(0)-blocks < uint64(mr.BlockHeadersCount) {
-			return nil, fmt.Errorf("降采样统计溢出")
+			return nil, fmt.Errorf("[downsampling] part statistics overflow")
 		}
 		rows += mr.RowsCount
 		blocks += uint64(mr.BlockHeadersCount)
@@ -223,10 +235,10 @@ func openDownsamplePart(path string) (_ *part, err error) {
 		data = data[downsampleMetaindexRowSize:]
 	}
 	if rows != p.ph.RowsCount || blocks != p.ph.BlocksCount || minTime != p.ph.MinTimestamp || maxTime != p.ph.MaxTimestamp || nextOffset != p.dsIndexSize {
-		return nil, fmt.Errorf("降采样 metaindex 与 part 统计矛盾")
+		return nil, fmt.Errorf("[downsampling] metaindex statistics do not match part statistics")
 	}
 	if err := validateDownsamplePartIndexes(p); err != nil {
-		return nil, fmt.Errorf("校验降采样 part %q: %w", path, err)
+		return nil, fmt.Errorf("[downsampling] cannot validate part %q: %w", path, err)
 	}
 	p.metaindexSizeBytes = uint64(cap(p.dsMetaindex)) * uint64(unsafe.Sizeof(downsampleMetaindexRow{}))
 	p.timestampsFile = &downsamplePartFile{f: p.dsTimestampsFile}
@@ -247,7 +259,7 @@ func openDownsamplePartDataFile(path, name string, dst **os.File, size *uint64) 
 		return err
 	}
 	if !st.Mode().IsRegular() || st.Size() < 0 {
-		return fmt.Errorf("降采样 %s 不是普通文件", name)
+		return fmt.Errorf("[downsampling] %s is not a regular file", name)
 	}
 	*size = uint64(st.Size())
 	return nil
@@ -286,7 +298,7 @@ func validateDownsamplePartIndexes(p *part) error {
 			}
 			for feature := 1; feature < countOfDownsampleFeatures; feature++ {
 				if present[feature] != present[0] {
-					return fmt.Errorf("分辨率 %d 的特征列缺失或存在多余 Block", resolution)
+					return fmt.Errorf("[downsampling] missing feature columns or extra blocks at resolution %d", resolution)
 				}
 			}
 			if !present[0] {
@@ -294,18 +306,18 @@ func validateDownsamplePartIndexes(p *part) error {
 			}
 			h := readers[0].Header()
 			if h.TimestampsBlockOffset != timestampEnd {
-				return fmt.Errorf("共享时间戳负载不连续")
+				return fmt.Errorf("[downsampling] shared timestamp payloads are not contiguous")
 			}
 			timestampEnd += uint64(h.TimestampsBlockSize)
 			for feature, r := range readers {
 				column := r.Header()
 				if !sameDownsampleTimestamps(h, column) {
-					return fmt.Errorf("分辨率 %d 的五列时间戳描述不一致", resolution)
+					return fmt.Errorf("[downsampling] the five feature columns have inconsistent timestamp descriptors at resolution %d", resolution)
 				}
 				if !seen {
 					firstValues[feature] = column.ValuesBlockOffset
 				} else if column.ValuesBlockOffset != lastValues[feature] {
-					return fmt.Errorf("特征列 values 负载不连续")
+					return fmt.Errorf("[downsampling] feature column values payloads are not contiguous")
 				}
 				lastValues[feature] = column.ValuesBlockOffset + uint64(column.ValuesBlockSize)
 			}
@@ -314,14 +326,14 @@ func validateDownsamplePartIndexes(p *part) error {
 		if seen {
 			for feature := range readers {
 				if firstValues[feature] != valuesEnd {
-					return fmt.Errorf("跨 resolution/feature 的 values 负载不连续")
+					return fmt.Errorf("[downsampling] values payloads are not contiguous across resolution/feature groups")
 				}
 				valuesEnd = lastValues[feature]
 			}
 		}
 	}
 	if timestampEnd != p.dsTimestampsSize || valuesEnd != p.dsValuesSize {
-		return fmt.Errorf("降采样负载存在截断或未引用尾部")
+		return fmt.Errorf("[downsampling] payload is truncated or contains an unreferenced tail")
 	}
 	return nil
 }
@@ -332,11 +344,39 @@ type downsamplePartFile struct{ f *os.File }
 func (f *downsamplePartFile) Path() string { return f.f.Name() }
 func (f *downsamplePartFile) MustReadAt(b []byte, off int64) {
 	if _, err := f.f.ReadAt(b, off); err != nil {
-		logger.Panicf("FATAL: 读取 %q: %s", f.f.Name(), err)
+		logger.Panicf("[downsampling] FATAL: cannot read %q: %s", f.f.Name(), err)
 	}
 }
 func (f *downsamplePartFile) MustClose() {
 	if err := f.f.Close(); err != nil {
-		logger.Panicf("FATAL: 关闭 %q: %s", f.f.Name(), err)
+		logger.Panicf("[downsampling] FATAL: cannot close %q: %s", f.f.Name(), err)
 	}
+}
+
+// estimateDownsamplePartSize 估算整个目标 part 的编码上界，不假设源 part 已被删除。
+// 估算以五个特征的聚合批次为单位；磁盘统计的五个单值 Block 行数须先换算。
+func estimateDownsamplePartSize(pws []*partWrapper) uint64 {
+	var rows uint64
+	for _, pw := range pws {
+		if pw == nil || pw.p == nil {
+			return math.MaxUint64
+		}
+		n := pw.p.ph.RowsCount
+		if pw.p.dsMetadata == nil {
+			n = multiplyDownsampleSpace(n, uint64(len(downsampleResolutions)))
+		} else {
+			// 完整摘要每行对应五个单值 Block 行；非整除统计保守向上取整。
+			physicalRows := n
+			n /= countOfDownsampleFeatures
+			if physicalRows%countOfDownsampleFeatures != 0 {
+				n++
+			}
+		}
+		rows = addDownsampleSpace(rows, n)
+	}
+	if rows == 0 {
+		return 0
+	}
+	// 不知道 TSID 分布时，每一行都可能单独占据一个 block 和一个 index block。
+	return estimateDownsampleOutputSize(rows, rows)
 }

@@ -1040,10 +1040,13 @@ func (pt *partition) flushInmemoryPartsToFiles(isFinal bool) {
 		}
 		// 关闭和 snapshot 必须保全待落盘样本。降采样作业已退出；
 		// 对仍在内存的源执行独立的原始落盘，不改变共享降采样配置。
-		downsampleMergeLogger.Warnf("falling back to raw final flush for partition %q after downsampling failure: %s", pt.name, err)
+		downsampleMergeLogger.Warnf("[downsampling] falling back to raw final flush for partition %q after merge failure: %s", pt.name, err)
 		err = pt.flushInmemoryPartsToFilesWithDownsampling(true, false)
 	}
 	if err != nil {
+		if pt.s.downsamplingEnabled {
+			logger.Panicf("[downsampling] FATAL: cannot complete final in-memory part flush: %s", err)
+		}
 		logger.Panicf("FATAL: cannot merge in-memory parts: %s", err)
 	}
 	if isFinal && pt.s.downsamplingEnabled {
@@ -1060,7 +1063,7 @@ func (pt *partition) flushInmemoryPartsToFiles(isFinal bool) {
 			}
 		}()
 		if err != nil {
-			logger.Panicf("FATAL: cannot sync final part manifest for %q: %s", pt.name, err)
+			logger.Panicf("[downsampling] FATAL: cannot sync final part manifest for %q: %s", pt.name, err)
 		}
 	}
 }
@@ -1123,6 +1126,9 @@ func (pt *partition) mergePartsToFilesWithDownsampling(pws []*partWrapper, stopC
 	putWaitGroup(wg)
 
 	if errGlobal != nil {
+		if downsampling {
+			return fmt.Errorf("[downsampling] cannot merge %d parts optimally: %w", pwsLen, errGlobal)
+		}
 		return fmt.Errorf("cannot merge %d parts optimally: %w", pwsLen, errGlobal)
 	}
 	return nil
@@ -1144,7 +1150,11 @@ func (pt *partition) ForceMergeAllParts(stopCh <-chan struct{}) error {
 	maxOutBytes := fs.MustGetFreeSpace(pt.bigPartsPath)
 	if newPartSize > maxOutBytes {
 		freeSpaceNeededBytes := newPartSize - maxOutBytes
-		forceMergeLogger.Warnf("cannot initiate force merge for the partition %s; additional space needed: %d bytes", pt.name, freeSpaceNeededBytes)
+		if pt.s.downsamplingEnabled {
+			forceMergeLogger.Warnf("[downsampling] cannot initiate force merge for partition %q; additional space needed: %d bytes", pt.name, freeSpaceNeededBytes)
+		} else {
+			forceMergeLogger.Warnf("cannot initiate force merge for the partition %s; additional space needed: %d bytes", pt.name, freeSpaceNeededBytes)
+		}
 		pt.releasePartsToMerge(pws)
 		return nil
 	}
@@ -1153,6 +1163,9 @@ func (pt *partition) ForceMergeAllParts(stopCh <-chan struct{}) error {
 	// This allows applying the configured retention, removing the deleted series
 	// and performing de-duplication if needed.
 	if err := pt.mergePartsToFiles(pws, stopCh, bigPartsConcurrencyCh, true); err != nil {
+		if pt.s.downsamplingEnabled {
+			return fmt.Errorf("[downsampling] cannot force merge %d parts from partition %q: %w", len(pws), pt.name, err)
+		}
 		return fmt.Errorf("cannot force merge %d parts from partition %q: %w", len(pws), pt.name, err)
 	}
 

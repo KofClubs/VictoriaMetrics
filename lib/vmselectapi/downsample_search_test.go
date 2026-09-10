@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,9 +21,13 @@ import (
 type downsampleSearchTestAPI struct {
 	API
 	received *storage.SearchQuery
+	initErr  error
 }
 
 func (api *downsampleSearchTestAPI) InitSearch(_ *querytracer.Tracer, sq *storage.SearchQuery, _ uint64) (BlockIterator, error) {
+	if api.initErr != nil {
+		return nil, api.initErr
+	}
 	copy := *sq
 	api.received = &copy
 	value := int64(100)
@@ -189,6 +194,90 @@ func TestDownsampleSearchRPCRejectsInvalidPayload(t *testing.T) {
 			if err == nil || received != nil {
 				t.Fatalf("非法请求进入存储 API: received=%v err=%v", received, err)
 			}
+			if got, want := strings.HasPrefix(err.Error(), "[downsampling] "), tc.rpc == "search_downsampling_v2"; got != want {
+				t.Fatalf("RPC 错误前缀不匹配: rpc=%s err=%v", tc.rpc, err)
+			}
 		})
+	}
+}
+
+func TestDownsampleSearchRPCErrorPrefixReuse(t *testing.T) {
+	client, peer := net.Pipe()
+	defer client.Close()
+	if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		defer peer.Close()
+		bc, err := handshake.VMSelectServer(peer, 0)
+		if err != nil {
+			done <- err
+			return
+		}
+		defer bc.Close()
+		s := &Server{
+			api:                &downsampleSearchTestAPI{initErr: storage.ErrDeadlineExceeded},
+			concurrencyLimitCh: make(chan struct{}, 1),
+			searchRequests:     &metrics.Counter{},
+		}
+		done <- s.processConn(&vmselectRequestCtx{bc: bc})
+	}()
+	bc, err := handshake.VMSelectClient(client, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bc.Close()
+	response := &vmselectRequestCtx{bc: bc}
+	tenant := storage.TenantToken{AccountID: 7, ProjectID: 11}
+	sq := storage.NewSearchQuery(7, 11, 86400001, 90000000, nil, 37)
+	for _, downsample := range []bool{true, false} {
+		rpc := "search_v7"
+		payload := sq.MarshalWithoutTenant(tenant.Marshal(nil))
+		if downsample {
+			rpc = "search_downsampling_v2"
+			sq.DownsampleField = &storage.DownsampleQueryField{ResolutionMs: 300000, Feature: 1}
+			payload, err = sq.MarshalDownsampleWithoutTenant(tenant.Marshal(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		request := encoding.MarshalUint64(nil, uint64(len(rpc)))
+		request = append(request, rpc...)
+		request = append(request, 0) // 禁用查询跟踪。
+		request = encoding.MarshalUint32(request, 37)
+		request = encoding.MarshalUint64(request, uint64(len(payload)))
+		request = append(request, payload...)
+		if _, err := bc.Write(request); err != nil {
+			t.Fatal(err)
+		}
+		if err := bc.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		if err := response.readDataBufBytes(maxErrorMessageSize); err != nil {
+			t.Fatal(err)
+		}
+		message := string(response.dataBuf)
+		prefix := ""
+		if downsample {
+			prefix = "[downsampling] "
+		}
+		want := prefix + "cannot execute request in 37 seconds: " + storage.ErrDeadlineExceeded.Error()
+		if message != want {
+			t.Fatalf("连接复用后的超时错误前缀错误: rpc=%s got=%q want=%q", rpc, message, want)
+		}
+		// 每次 RPC 仍按原协议写出查询跟踪帧。
+		if err := response.readDataBufBytes(maxErrorMessageSize); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

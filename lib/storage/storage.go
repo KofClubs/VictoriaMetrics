@@ -257,7 +257,7 @@ func MustOpenStorage(path string, opts OpenOptions) *Storage {
 	if err := checkDownsamplingOpen(path, opts); err != nil {
 		fs.MustClose(s.flockF)
 		s.flockF = nil
-		logger.Panicf("FATAL: cannot open storage at %q: %s", path, err)
+		logger.Panicf("[downsampling] FATAL: cannot open storage at %q: %s", path, err)
 	}
 
 	// Pre-create snapshots directory if it is missing.

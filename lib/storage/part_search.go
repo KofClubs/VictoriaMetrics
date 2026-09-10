@@ -90,7 +90,7 @@ func (ps *partSearch) initWithDownsampleField(p *part, tsids []TSID, tr TimeRang
 	ps.metaindex = p.metaindex
 	if field != nil {
 		if !field.valid() {
-			ps.err = fmt.Errorf("invalid downsampling query field")
+			ps.err = fmt.Errorf("[downsampling] invalid query field")
 			return
 		}
 		// 指定字段时只查询磁盘摘要，防止原始值冒充 sum 或 count。

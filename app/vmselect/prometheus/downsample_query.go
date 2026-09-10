@@ -17,7 +17,7 @@ func getDownsampleQueryField(r *http.Request) (*storage.DownsampleQueryField, er
 		return nil, nil
 	}
 	if len(values) != 1 || values[0] == "" {
-		return nil, httpserver.InvalidParamError(fmt.Errorf("query.field must contain exactly one non-empty resolution:feature selector"))
+		return nil, httpserver.InvalidParamError(fmt.Errorf("[downsampling] query.field must contain exactly one non-empty resolution:feature selector"))
 	}
 	field, err := storage.ParseDownsampleQueryField(values[0])
 	if err != nil {
