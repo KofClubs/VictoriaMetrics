@@ -140,7 +140,7 @@ func (pt *partition) mergeDownsampleParts(pws []*partWrapper, dstPartType partTy
 		defer func() {
 			if !published {
 				var cleanupErr error
-				for _, f := range p.dsFiles {
+				for _, f := range []*os.File{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
 					if f != nil {
 						cleanupErr = errors.Join(cleanupErr, f.Close())
 					}

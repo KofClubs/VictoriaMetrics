@@ -1,5 +1,24 @@
 # 降采样存储测试说明
 
+## 文件句柄具名重构（2026-09-10）
+
+本轮将 reader、writer 和 part 中按文件编号组织的句柄、大小、偏移改为具名字段；文件对应关系见[文件布局说明](downsampling_storage_file_layout.md#53-offset发布与失败处理)。
+初始化、读写、范围校验、Finish、Abort 和故障测试同步使用明确的文件角色。merger 本身没有文件角色数组；按 feature 索引的五列数组保留。
+本轮保持文件布局和句柄归属不变，尚未实施 `filestream.ReadAtCloser`；`lib/fs`、`lib/filestream` 均无修改。
+
+本轮验证结果：
+
+| 验证命令 | 结果 |
+|---|---|
+| `go test ./lib/storage -count=1 -timeout=10m` | 通过，27.724s |
+| `DISABLE_FSYNC_FOR_TESTING=false go test -race ./lib/storage -run '^Test(Downsample\|Downsampling\|CheckDownsampling\|MustOpenStorageDownsampling\|EstimateDownsample\|ReserveDownsample)' -count=1 -timeout=5m` | 通过，13.542s |
+| `go test -p 4 ./lib/vmselectapi ./app/vmstorage ./app/vmselect/netstorage ./app/vmselect/prometheus -run 'Test(Downsample\|Downsampling\|CheckDownsampling\|MustOpenStorageDownsampling)' -count=1 -timeout=3m` | 全部通过；vmstorage 无匹配测试，完成编译 |
+| `go vet ./lib/storage` | 通过 |
+| `git diff --check` | 通过 |
+| `git diff --exit-code HEAD -- lib/fs lib/filestream` | 通过 |
+
+本轮端到端测试由用户在仓库根目录运行 `./lib/storage/testdata/downsampling_e2e.sh`；总清单须为 `status=passed`，且每阶段退出码为 0。下方各节保留此前重构的验证记录。
+
 ## Spill 与失败清理重构（2026-09-10）
 
 本次修改生产 Go 代码，保持下述 89/113 字节布局不变。新增独立的 `filestream.SpillWriter`，最终文件使用 filestream，并补齐降采样错误返回、未发布文件清理及调度退出。

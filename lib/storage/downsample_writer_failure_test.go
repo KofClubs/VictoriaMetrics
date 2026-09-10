@@ -46,10 +46,8 @@ func assertDownsampleWriterAborted(t *testing.T, w *downsampleWriter, path strin
 	if w.path != "" || w.finished {
 		t.Fatalf("failed target is still publishable: path=%q; finished=%v", w.path, w.finished)
 	}
-	for _, f := range w.files {
-		if f != nil {
-			t.Fatal("failed writer retained a final-file handle")
-		}
+	if w.timestampsWriter != nil || w.valuesWriter != nil || w.indexWriter != nil || w.metaindexWriter != nil {
+		t.Fatal("failed writer retained a final-file handle")
 	}
 	for _, spill := range w.spills {
 		if spill != nil {
@@ -68,7 +66,7 @@ func assertDownsampleWriterAborted(t *testing.T, w *downsampleWriter, path strin
 }
 
 func TestDownsampleWriterFinalFileFailures(t *testing.T) {
-	for i, name := range []string{timestampsFilename, valuesFilename, indexFilename, metaindexFilename} {
+	for _, name := range []string{timestampsFilename, valuesFilename, indexFilename, metaindexFilename} {
 		for _, operation := range []string{"write", "short_write", "close", "abort"} {
 			t.Run(name+"/"+operation, func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "part")
@@ -77,23 +75,33 @@ func TestDownsampleWriterFinalFileFailures(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer w.Abort()
-				var files [4]*failingDownsampleFile
-				for j, f := range w.files {
-					files[j] = &failingDownsampleFile{downsampleFileWriter: f}
-					w.files[j] = files[j]
+				files := make(map[string]*failingDownsampleFile)
+				for _, file := range []struct {
+					name   string
+					writer *downsampleFileWriter
+				}{
+					{timestampsFilename, &w.timestampsWriter},
+					{valuesFilename, &w.valuesWriter},
+					{indexFilename, &w.indexWriter},
+					{metaindexFilename, &w.metaindexWriter},
+				} {
+					f := &failingDownsampleFile{downsampleFileWriter: *file.writer}
+					files[file.name] = f
+					*file.writer = f
 				}
+				failingFile := files[name]
 				cause := errors.New("injected " + operation)
 				switch operation {
 				case "write":
-					files[i].writeErr = cause
+					failingFile.writeErr = cause
 				case "short_write":
-					files[i].shortWrite = true
+					failingFile.shortWrite = true
 					cause = io.ErrShortWrite
 				case "close":
-					files[i].closeErr = cause
+					failingFile.closeErr = cause
 				case "abort":
-					files[i].writeErr = io.ErrUnexpectedEOF
-					files[i].abortErr = cause
+					failingFile.writeErr = io.ErrUnexpectedEOF
+					failingFile.abortErr = cause
 				}
 				err := w.WriteBlock(fileTestDownsampleBlock(1, 300000))
 				if err == nil {
@@ -103,12 +111,12 @@ func TestDownsampleWriterFinalFileFailures(t *testing.T) {
 					t.Fatalf("lost %s error: %v", operation, err)
 				}
 				assertDownsampleWriterAborted(t, &w, path, cause)
-				for j, f := range files {
+				for name, f := range files {
 					if f.closes+f.aborts != 1 {
-						t.Fatalf("file %d must be released once even if another fails: close=%d; abort=%d", j, f.closes, f.aborts)
+						t.Fatalf("file %s must be released once even if another fails: close=%d; abort=%d", name, f.closes, f.aborts)
 					}
 					if _, err := f.downsampleFileWriter.Write([]byte("closed")); !errors.Is(err, os.ErrClosed) {
-						t.Fatalf("file %d is still open: %v", j, err)
+						t.Fatalf("file %s is still open: %v", name, err)
 					}
 				}
 			})

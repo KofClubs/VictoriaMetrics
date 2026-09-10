@@ -172,29 +172,23 @@ func openDownsamplePart(path string) (_ *part, err error) {
 	p := &part{path: path, ph: m.partHeader, dsMetadata: m}
 	defer func() {
 		if err != nil {
-			for _, f := range p.dsFiles {
+			for _, f := range []*os.File{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
 				if f != nil {
 					_ = f.Close()
 				}
 			}
 		}
 	}()
-	for i, name := range []string{timestampsFilename, valuesFilename, indexFilename} {
-		p.dsFiles[i], err = os.Open(filepath.Join(path, name))
-		if err != nil {
-			return nil, err
-		}
-		st, e := p.dsFiles[i].Stat()
-		if e != nil {
-			return nil, e
-		}
-		if !st.Mode().IsRegular() || st.Size() < 0 {
-			return nil, fmt.Errorf("降采样 %s 不是普通文件", name)
-		}
-		p.dsFileSizes[i] = uint64(st.Size())
-		p.size += uint64(st.Size())
+	if err := openDownsamplePartDataFile(path, timestampsFilename, &p.dsTimestampsFile, &p.dsTimestampsSize); err != nil {
+		return nil, err
 	}
-	p.size += uint64(len(b))
+	if err := openDownsamplePartDataFile(path, valuesFilename, &p.dsValuesFile, &p.dsValuesSize); err != nil {
+		return nil, err
+	}
+	if err := openDownsamplePartDataFile(path, indexFilename, &p.dsIndexFile, &p.dsIndexSize); err != nil {
+		return nil, err
+	}
+	p.size = p.dsTimestampsSize + p.dsValuesSize + p.dsIndexSize + uint64(len(b))
 	var rows, blocks, nextOffset uint64
 	var minTime, maxTime int64
 	for len(data) > 0 {
@@ -202,7 +196,7 @@ func openDownsamplePart(path string) (_ *part, err error) {
 		if err := mr.unmarshal(data[:downsampleMetaindexRowSize]); err != nil {
 			return nil, err
 		}
-		if err := checkDownsampleExtent(mr.IndexBlockOffset, mr.IndexBlockSize, p.dsFileSizes[2]); err != nil {
+		if err := checkDownsampleExtent(mr.IndexBlockOffset, mr.IndexBlockSize, p.dsIndexSize); err != nil {
 			return nil, err
 		}
 		if mr.IndexBlockOffset != nextOffset {
@@ -228,17 +222,35 @@ func openDownsamplePart(path string) (_ *part, err error) {
 		p.dsMetaindex = append(p.dsMetaindex, mr)
 		data = data[downsampleMetaindexRowSize:]
 	}
-	if rows != p.ph.RowsCount || blocks != p.ph.BlocksCount || minTime != p.ph.MinTimestamp || maxTime != p.ph.MaxTimestamp || nextOffset != p.dsFileSizes[2] {
+	if rows != p.ph.RowsCount || blocks != p.ph.BlocksCount || minTime != p.ph.MinTimestamp || maxTime != p.ph.MaxTimestamp || nextOffset != p.dsIndexSize {
 		return nil, fmt.Errorf("降采样 metaindex 与 part 统计矛盾")
 	}
 	if err := validateDownsamplePartIndexes(p); err != nil {
 		return nil, fmt.Errorf("校验降采样 part %q: %w", path, err)
 	}
 	p.metaindexSizeBytes = uint64(cap(p.dsMetaindex)) * uint64(unsafe.Sizeof(downsampleMetaindexRow{}))
-	p.timestampsFile = &downsamplePartFile{f: p.dsFiles[0]}
-	p.valuesFile = &downsamplePartFile{f: p.dsFiles[1]}
-	p.indexFile = &downsamplePartFile{f: p.dsFiles[2]}
+	p.timestampsFile = &downsamplePartFile{f: p.dsTimestampsFile}
+	p.valuesFile = &downsamplePartFile{f: p.dsValuesFile}
+	p.indexFile = &downsamplePartFile{f: p.dsIndexFile}
 	return p, nil
+}
+
+// 将打开的文件立即交给调用方，即使 Stat 失败也由调用方统一关闭。
+func openDownsamplePartDataFile(path, name string, dst **os.File, size *uint64) error {
+	f, err := os.Open(filepath.Join(path, name))
+	if err != nil {
+		return err
+	}
+	*dst = f
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() || st.Size() < 0 {
+		return fmt.Errorf("降采样 %s 不是普通文件", name)
+	}
+	*size = uint64(st.Size())
+	return nil
 }
 
 // 五路只保留各自当前 index block，不建立随 part 大小增长的 header/offset 集合。
@@ -308,7 +320,7 @@ func validateDownsamplePartIndexes(p *part) error {
 			}
 		}
 	}
-	if timestampEnd != p.dsFileSizes[0] || valuesEnd != p.dsFileSizes[1] {
+	if timestampEnd != p.dsTimestampsSize || valuesEnd != p.dsValuesSize {
 		return fmt.Errorf("降采样负载存在截断或未引用尾部")
 	}
 	return nil

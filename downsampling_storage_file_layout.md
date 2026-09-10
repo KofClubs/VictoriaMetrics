@@ -282,6 +282,19 @@ spill 复用 filestream 的 bufio 池及 I/O 统计。临时数据不 fsync；�
 
 ### 5.3 offset、发布与失败处理
 
+文件句柄、大小和偏移均按文件角色命名，不使用数组下标区分文件：
+
+| 文件 | reader 字段 | writer 字段 | writer 偏移字段 |
+|---|---|---|---|
+| `timestamps.bin` | `timestampsReader` / `timestampsSize` | `timestampsWriter` | `timestampsOffset` |
+| `values.bin` | `valuesReader` / `valuesSize` | `valuesWriter` | `valuesOffset` |
+| `index.bin` | `indexReader` / `indexSize` | `indexWriter` | `indexOffset` |
+| `metaindex.bin` | 打开 part 时载入 `dsMetaindex` | `metaindexWriter` | 整体写入，无追加偏移字段 |
+| `metadata.json` | 打开 part 时解析到 `dsMetadata` | `Finish` 中的局部 writer | 整体写入，无追加偏移字段 |
+
+part 的三个长期文件句柄分别为 `dsTimestampsFile`、`dsValuesFile`、`dsIndexFile`，大小为对应的 `dsTimestampsSize`、`dsValuesSize`、`dsIndexSize`。
+五个 feature 的 `blocks`、`spills`、`peers` 仍按 feature 索引；它们不承担文件角色编号。
+
 - timestamps offset 在 `WriteBlock` 中确定，转置时不改写、不重复写入。
 - values offset 在消费 spill 时确定；index offset/size 在 `flushIndex` 压缩并追加时确定。
 - 最终 timestamps、values、index、metaindex 和 metadata 使用 `filestream.CreateExclusive`；沿用 `filestream.WriteCloser` 的写入约定，通过新增的 `Close() error` / `Abort() error` 处理正常关闭和取消。既有 `MustCreate` / `MustClose` 调用方式保持兼容。

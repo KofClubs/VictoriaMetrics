@@ -11,14 +11,17 @@ import (
 func newDownsampleCloseTestReader(t *testing.T) *downsampleReader {
 	t.Helper()
 	r := &downsampleReader{p: &part{}, ownFiles: true}
-	for i := range r.files {
+	newFile := func() *os.File {
 		f, err := os.CreateTemp(t.TempDir(), "reader-")
 		if err != nil {
 			t.Fatal(err)
 		}
-		r.files[i] = f
 		t.Cleanup(func() { _ = f.Close() })
+		return f
 	}
+	r.timestampsReader = newFile()
+	r.valuesReader = newFile()
+	r.indexReader = newFile()
 	return r
 }
 
@@ -33,9 +36,10 @@ func assertDownsampleFilesClosed(t *testing.T, files []*os.File) {
 
 func TestDownsampleReaderCloseOwnFiles(t *testing.T) {
 	r := newDownsampleCloseTestReader(t)
-	files := r.files
-	for _, i := range []int{0, 2} {
-		if err := files[i].Close(); err != nil {
+	files := []*os.File{r.timestampsReader, r.valuesReader, r.indexReader}
+	failedFiles := []*os.File{r.timestampsReader, r.indexReader}
+	for _, f := range failedFiles {
+		if err := f.Close(); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -43,13 +47,13 @@ func TestDownsampleReaderCloseOwnFiles(t *testing.T) {
 	if !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("lost actual file close error: %v", err)
 	}
-	for _, i := range []int{0, 2} {
-		if !strings.Contains(err.Error(), files[i].Name()) {
-			t.Fatalf("lost close error for file %d: %v", i, err)
+	for _, f := range failedFiles {
+		if !strings.Contains(err.Error(), f.Name()) {
+			t.Fatalf("lost close error for file %q: %v", f.Name(), err)
 		}
 	}
-	assertDownsampleFilesClosed(t, files[:])
-	if r.p != nil || r.ownFiles || r.files != [3]*os.File{} {
+	assertDownsampleFilesClosed(t, files)
+	if r.p != nil || r.ownFiles || r.timestampsReader != nil || r.valuesReader != nil || r.indexReader != nil {
 		t.Fatal("Close retained part or file ownership")
 	}
 	if err := r.Close(); err != nil {
@@ -80,7 +84,7 @@ func TestDownsampleReaderCloseBorrowedFiles(t *testing.T) {
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range p.dsFiles {
+	for _, f := range []*os.File{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
 		if _, err := f.Stat(); err != nil {
 			t.Fatalf("reader closed borrowed file %q: %v", f.Name(), err)
 		}
@@ -100,8 +104,8 @@ func TestDownsampleReaderInitCloseFailure(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			r := newDownsampleCloseTestReader(t)
-			files := r.files
-			if err := files[0].Close(); err != nil {
+			files := []*os.File{r.timestampsReader, r.valuesReader, r.indexReader}
+			if err := r.timestampsReader.Close(); err != nil {
 				t.Fatal(err)
 			}
 			next := &part{path: filepath.Join(t.TempDir(), "must-not-open")}
@@ -118,7 +122,7 @@ func TestDownsampleReaderInitCloseFailure(t *testing.T) {
 			if errors.Is(err, os.ErrNotExist) || r.p != nil {
 				t.Fatalf("Init continued opening the next source after close failed: %v", err)
 			}
-			assertDownsampleFilesClosed(t, files[:])
+			assertDownsampleFilesClosed(t, files)
 		})
 	}
 }
@@ -129,8 +133,12 @@ func TestDownsampleMergerResetClosesAllReaders(t *testing.T) {
 			first := newDownsampleCloseTestReader(t)
 			second := newDownsampleCloseTestReader(t)
 			window := newDownsampleCloseTestReader(t)
-			files := append(append(append([]*os.File{}, first.files[:]...), second.files[:]...), window.files[:]...)
-			if err := first.files[0].Close(); err != nil {
+			files := []*os.File{
+				first.timestampsReader, first.valuesReader, first.indexReader,
+				second.timestampsReader, second.valuesReader, second.indexReader,
+				window.timestampsReader, window.valuesReader, window.indexReader,
+			}
+			if err := first.timestampsReader.Close(); err != nil {
 				t.Fatal(err)
 			}
 			m := downsampleMerger{cursors: []downsampleMergeCursor{{reader: first}, {reader: second}}, reader: window}
@@ -141,7 +149,7 @@ func TestDownsampleMergerResetClosesAllReaders(t *testing.T) {
 			case "init_sources":
 				err = m.initSources(nil, downsampleResolution1h)
 				// Switching columns closes cursors; the independent window reader remains usable.
-				if _, statErr := window.files[0].Stat(); statErr != nil {
+				if _, statErr := window.timestampsReader.Stat(); statErr != nil {
 					t.Fatalf("initSources closed the independent window reader: %v", statErr)
 				}
 				if closeErr := m.closeReaders(); closeErr != nil {
@@ -196,7 +204,7 @@ func TestDownsampleMergerClosesBeforeReturning(t *testing.T) {
 			writeErr := errors.New("injected output write failure")
 			var files []*os.File
 			var closeNames []string
-			w.files[0] = &downsampleCloseTestWriter{downsampleFileWriter: w.files[0], beforeWrite: func() error {
+			w.timestampsWriter = &downsampleCloseTestWriter{downsampleFileWriter: w.timestampsWriter, beforeWrite: func() error {
 				if w.resolution != downsampleResolution1h || files != nil {
 					return nil
 				}
@@ -204,10 +212,10 @@ func TestDownsampleMergerClosesBeforeReturning(t *testing.T) {
 				// make only cleanup fail, without adding production test hooks.
 				readers := []*downsampleReader{m.cursors[0].reader, m.reader}
 				for _, r := range readers {
-					files = append(files, r.files[:]...)
+					files = append(files, r.timestampsReader, r.valuesReader, r.indexReader)
 					if scenario != "success" {
-						closeNames = append(closeNames, r.files[0].Name())
-						if err := r.files[0].Close(); err != nil {
+						closeNames = append(closeNames, r.timestampsReader.Name())
+						if err := r.timestampsReader.Close(); err != nil {
 							t.Fatal(err)
 						}
 					}

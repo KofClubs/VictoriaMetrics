@@ -49,8 +49,14 @@ type part struct {
 	// 降采样格式仅扩展磁盘 part，原始 inmemory 的缓冲与序列化保持不变。
 	dsMetadata  *downsamplePartMetadata
 	dsMetaindex []downsampleMetaindexRow
-	dsFiles     [3]*os.File
-	dsFileSizes [3]uint64
+
+	dsTimestampsFile *os.File // timestamps.bin
+	dsValuesFile     *os.File // values.bin
+	dsIndexFile      *os.File // index.bin
+
+	dsTimestampsSize uint64
+	dsValuesSize     uint64
+	dsIndexSize      uint64
 }
 
 // mustOpenFilePart opens file-based part from the given path.

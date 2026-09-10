@@ -193,15 +193,15 @@ func TestDownsampleSpaceBoundCoversEncodedParts(t *testing.T) {
 			if spillBytes != wantSpill {
 				t.Fatalf("spill must contain five headers/values, no timestamps: got %d; want %d", spillBytes, wantSpill)
 			}
-			if w.offsets[0] != timestampBytes || w.offsets[1] != 0 || w.offsets[2] != 0 {
-				t.Fatalf("before resolution flush only shared timestamps may reach final files: offsets=%v; timestamps=%d", w.offsets, timestampBytes)
+			if w.timestampsOffset != timestampBytes || w.valuesOffset != 0 || w.indexOffset != 0 {
+				t.Fatalf("before resolution flush only shared timestamps may reach final files: timestampsOffset=%d; valuesOffset=%d; indexOffset=%d; timestamps=%d", w.timestampsOffset, w.valuesOffset, w.indexOffset, timestampBytes)
 			}
 			ph, err := w.Finish()
 			if err != nil {
 				t.Fatal(err)
 			}
-			if w.offsets[0] != timestampBytes || w.offsets[1] != valuesBytes {
-				t.Fatalf("flush duplicated timestamps or lost values: offsets=%v; timestamps=%d; values=%d", w.offsets, timestampBytes, valuesBytes)
+			if w.timestampsOffset != timestampBytes || w.valuesOffset != valuesBytes {
+				t.Fatalf("flush duplicated timestamps or lost values: timestampsOffset=%d; valuesOffset=%d; timestamps=%d; values=%d", w.timestampsOffset, w.valuesOffset, timestampBytes, valuesBytes)
 			}
 			var encodedSize uint64
 			entries, err := os.ReadDir(path)

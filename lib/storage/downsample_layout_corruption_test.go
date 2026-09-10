@@ -208,7 +208,7 @@ func openDownsampleLayoutReaderFixture(t *testing.T, path string) *part {
 	}
 	p := &part{path: path, ph: metadata.partHeader, dsMetadata: metadata}
 	t.Cleanup(func() {
-		for _, f := range p.dsFiles {
+		for _, f := range []*os.File{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
 			if f != nil {
 				if err := f.Close(); err != nil {
 					t.Error(err)
@@ -216,17 +216,14 @@ func openDownsampleLayoutReaderFixture(t *testing.T, path string) *part {
 			}
 		}
 	})
-	for i, name := range []string{timestampsFilename, valuesFilename, indexFilename} {
-		f, err := os.Open(filepath.Join(path, name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		p.dsFiles[i] = f
-		st, err := f.Stat()
-		if err != nil {
-			t.Fatal(err)
-		}
-		p.dsFileSizes[i] = uint64(st.Size())
+	if err := openDownsamplePartDataFile(path, timestampsFilename, &p.dsTimestampsFile, &p.dsTimestampsSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := openDownsamplePartDataFile(path, valuesFilename, &p.dsValuesFile, &p.dsValuesSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := openDownsamplePartDataFile(path, indexFilename, &p.dsIndexFile, &p.dsIndexSize); err != nil {
+		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(path, metaindexFilename))
 	if err != nil {

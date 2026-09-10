@@ -18,27 +18,31 @@ import (
 // downsampleReader 每次只解码一个 index block，按索引定位窗口而不载入全部 header。
 // 调用方必须在 reader 存活期间持有 part 引用；返回的 header 在下次迭代时失效。
 type downsampleReader struct {
-	p            *part
-	resolution   int64
-	files        [3]*os.File
-	fileSizes    [3]uint64
-	ownFiles     bool
-	filterTSID   TSID
-	hasFilter    bool
-	minTimestamp int64
-	maxTimestamp int64
-	metaPos      int
-	metaEnd      int
-	indexPos     int
-	indexData    []byte
-	compressed   []byte
-	decompressed []byte
-	block        Block
-	current      blockHeader
-	previous     blockHeader
-	feature      uint8
-	peers        [countOfDownsampleFeatures]*downsampleReader
-	hasPrevious  bool
+	p                *part
+	resolution       int64
+	timestampsReader *os.File // timestamps.bin
+	valuesReader     *os.File // values.bin
+	indexReader      *os.File // index.bin
+	timestampsSize   uint64
+	valuesSize       uint64
+	indexSize        uint64
+	ownFiles         bool
+	filterTSID       TSID
+	hasFilter        bool
+	minTimestamp     int64
+	maxTimestamp     int64
+	metaPos          int
+	metaEnd          int
+	indexPos         int
+	indexData        []byte
+	compressed       []byte
+	decompressed     []byte
+	block            Block
+	current          blockHeader
+	previous         blockHeader
+	feature          uint8
+	peers            [countOfDownsampleFeatures]*downsampleReader
+	hasPrevious      bool
 	// 仅比较已经读取且在 index.bin 中相邻的 index，过滤跳过的区间不补读。
 	previousIndexEnd     uint64
 	previousTimestampEnd uint64
@@ -68,33 +72,57 @@ func (r *downsampleReader) Init(p *part, resolution int64, features ...uint8) er
 	r.p = p
 	r.resolution, r.feature = resolution, feature
 	if p.dsMetadata != nil {
-		r.files = p.dsFiles
-		r.fileSizes = p.dsFileSizes
+		r.timestampsReader, r.timestampsSize = p.dsTimestampsFile, p.dsTimestampsSize
+		r.valuesReader, r.valuesSize = p.dsValuesFile, p.dsValuesSize
+		r.indexReader, r.indexSize = p.dsIndexFile, p.dsIndexSize
 	} else if p.path != "" {
 		r.ownFiles = true
-		for i, name := range []string{timestampsFilename, valuesFilename, indexFilename} {
-			f, err := os.Open(filepath.Join(p.path, name))
-			if err != nil {
-				return errors.Join(err, r.reset())
-			}
-			r.files[i] = f
-			st, err := f.Stat()
-			if err != nil {
-				return errors.Join(err, r.reset())
-			}
-			r.fileSizes[i] = uint64(st.Size())
+		if err := openDownsampleReaderFile(filepath.Join(p.path, timestampsFilename), &r.timestampsReader, &r.timestampsSize); err != nil {
+			return errors.Join(err, r.reset())
+		}
+		if err := openDownsampleReaderFile(filepath.Join(p.path, valuesFilename), &r.valuesReader, &r.valuesSize); err != nil {
+			return errors.Join(err, r.reset())
+		}
+		if err := openDownsampleReaderFile(filepath.Join(p.path, indexFilename), &r.indexReader, &r.indexSize); err != nil {
+			return errors.Join(err, r.reset())
 		}
 	} else {
-		for i, f := range []fs.MustReadAtCloser{p.timestampsFile, p.valuesFile, p.indexFile} {
-			b, ok := f.(*chunkedbuffer.Buffer)
-			if !ok {
-				return errors.Join(fmt.Errorf("不支持的 inmemory 原始缓冲"), r.reset())
-			}
-			r.fileSizes[i] = uint64(b.SizeBytes())
+		var err error
+		if r.timestampsSize, err = downsampleInmemoryReaderSize(p.timestampsFile); err != nil {
+			return errors.Join(err, r.reset())
+		}
+		if r.valuesSize, err = downsampleInmemoryReaderSize(p.valuesFile); err != nil {
+			return errors.Join(err, r.reset())
+		}
+		if r.indexSize, err = downsampleInmemoryReaderSize(p.indexFile); err != nil {
+			return errors.Join(err, r.reset())
 		}
 	}
 	r.SetFilter(nil, minUnixMilli, maxUnixMilli)
 	return r.err
+}
+
+// 文件一经打开即交给调用方持有，即使 Stat 失败也由 reader.reset 统一关闭。
+func openDownsampleReaderFile(path string, dst **os.File, size *uint64) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	*dst = f
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	*size = uint64(st.Size())
+	return nil
+}
+
+func downsampleInmemoryReaderSize(f fs.MustReadAtCloser) (uint64, error) {
+	b, ok := f.(*chunkedbuffer.Buffer)
+	if !ok {
+		return 0, fmt.Errorf("不支持的 inmemory 原始缓冲")
+	}
+	return uint64(b.SizeBytes()), nil
 }
 
 // SetFilter 重置索引游标；筛选相交 block，不提前过滤 block 内的样本贡献。
@@ -257,7 +285,7 @@ func (r *downsampleReader) nextIndex() (bool, error) {
 			return false, fmt.Errorf("index block 大小或条目数无效")
 		}
 		var err error
-		r.compressed, err = r.readAt(r.compressed[:0], 2, off, size)
+		r.compressed, err = r.readAt(r.compressed[:0], r.indexReader, r.p.indexFile, r.indexSize, off, size)
 		if err != nil {
 			return false, err
 		}
@@ -327,14 +355,14 @@ func (r *downsampleReader) validateIndex(m *downsampleMetaindexRow) error {
 		last, previous = h.TSID, h
 		rows += uint64(h.RowsCount)
 		minTime, maxTime = min(minTime, h.MinTimestamp), max(maxTime, h.MaxTimestamp)
-		if err := checkDownsampleExtent(h.TimestampsBlockOffset, h.TimestampsBlockSize, r.fileSizes[0]); err != nil {
+		if err := checkDownsampleExtent(h.TimestampsBlockOffset, h.TimestampsBlockSize, r.timestampsSize); err != nil {
 			return err
 		}
-		if err := checkDownsampleExtent(h.ValuesBlockOffset, h.ValuesBlockSize, r.fileSizes[1]); err != nil {
+		if err := checkDownsampleExtent(h.ValuesBlockOffset, h.ValuesBlockSize, r.valuesSize); err != nil {
 			return err
 		}
 	}
-	if m.IndexBlockOffset+uint64(m.IndexBlockSize) == r.fileSizes[2] && (previous.TimestampsBlockOffset+uint64(previous.TimestampsBlockSize) != r.fileSizes[0] || previous.ValuesBlockOffset+uint64(previous.ValuesBlockSize) != r.fileSizes[1]) {
+	if m.IndexBlockOffset+uint64(m.IndexBlockSize) == r.indexSize && (previous.TimestampsBlockOffset+uint64(previous.TimestampsBlockSize) != r.timestampsSize || previous.ValuesBlockOffset+uint64(previous.ValuesBlockSize) != r.valuesSize) {
 		return fmt.Errorf("降采样负载存在截断或未引用尾部")
 	}
 	if rows != m.RowsCount || first != m.TSID || last != m.LastTSID || minTime != m.MinTimestamp || maxTime != m.MaxTimestamp {
@@ -373,8 +401,8 @@ func (r *downsampleReader) prepareBlockPayload(src []byte, mt encoding.MarshalTy
 	return src, mt, nil
 }
 
-func (r *downsampleReader) readAt(dst []byte, file int, off uint64, size uint32) ([]byte, error) {
-	if err := checkDownsampleExtent(off, size, r.fileSizes[file]); err != nil {
+func (r *downsampleReader) readAt(dst []byte, reader *os.File, inmemorySource fs.MustReadAtCloser, fileSize, off uint64, size uint32) ([]byte, error) {
+	if err := checkDownsampleExtent(off, size, fileSize); err != nil {
 		return dst, err
 	}
 	if cap(dst) < int(size) {
@@ -385,18 +413,17 @@ func (r *downsampleReader) readAt(dst []byte, file int, off uint64, size uint32)
 	if size == 0 {
 		return dst, nil
 	}
-	if r.files[file] != nil {
-		_, err := r.files[file].ReadAt(dst, int64(off))
+	if reader != nil {
+		_, err := reader.ReadAt(dst, int64(off))
 		return dst, err
 	}
 	if r.p == nil || r.p.dsMetadata != nil {
 		return dst, fmt.Errorf("降采样文件句柄不可用")
 	}
-	f := []fs.MustReadAtCloser{r.p.timestampsFile, r.p.valuesFile, r.p.indexFile}[file]
-	if f == nil {
+	if inmemorySource == nil {
 		return dst, fmt.Errorf("原始文件句柄不可用")
 	}
-	f.MustReadAt(dst, int64(off))
+	inmemorySource.MustReadAt(dst, int64(off))
 	return dst, nil
 }
 
@@ -457,11 +484,11 @@ func (r *downsampleReader) readNativeBlock(b *Block, h *blockHeader) error {
 	}
 	b.bh = *h
 	var err error
-	b.timestampsData, err = r.readAt(b.timestampsData[:0], 0, h.TimestampsBlockOffset, h.TimestampsBlockSize)
+	b.timestampsData, err = r.readAt(b.timestampsData[:0], r.timestampsReader, r.p.timestampsFile, r.timestampsSize, h.TimestampsBlockOffset, h.TimestampsBlockSize)
 	if err != nil {
 		return err
 	}
-	b.valuesData, err = r.readAt(b.valuesData[:0], 1, h.ValuesBlockOffset, h.ValuesBlockSize)
+	b.valuesData, err = r.readAt(b.valuesData[:0], r.valuesReader, r.p.valuesFile, r.valuesSize, h.ValuesBlockOffset, h.ValuesBlockSize)
 	if err != nil {
 		return err
 	}
@@ -548,15 +575,15 @@ func (r *downsampleReader) Close() error {
 func (r *downsampleReader) reset() error {
 	var closeErr error
 	if r.ownFiles {
-		for _, f := range r.files {
+		for _, f := range []*os.File{r.timestampsReader, r.valuesReader, r.indexReader} {
 			if f != nil {
 				closeErr = errors.Join(closeErr, f.Close())
 			}
 		}
 	}
 	r.p = nil
-	r.files = [3]*os.File{}
-	r.fileSizes = [3]uint64{}
+	r.timestampsReader, r.valuesReader, r.indexReader = nil, nil, nil
+	r.timestampsSize, r.valuesSize, r.indexSize = 0, 0, 0
 	r.ownFiles = false
 	r.resolution = 0
 	r.SetFilter(nil, 0, 0)

@@ -25,15 +25,20 @@ type downsampleFileWriter interface {
 
 // downsampleWriter 在全部列与索引同步完成后才返回可发布的 partHeader。
 type downsampleWriter struct {
-	path          string
-	files         [4]downsampleFileWriter
-	offsets       [3]uint64
-	compressLevel int
-	ph            partHeader
-	previous      blockHeader
-	resolution    int64
-	spills        [countOfDownsampleFeatures]*filestream.SpillWriter
-	spillData     []byte
+	path             string
+	timestampsWriter downsampleFileWriter // timestamps.bin
+	valuesWriter     downsampleFileWriter // values.bin
+	indexWriter      downsampleFileWriter // index.bin
+	metaindexWriter  downsampleFileWriter // metaindex.bin
+	timestampsOffset uint64
+	valuesOffset     uint64
+	indexOffset      uint64
+	compressLevel    int
+	ph               partHeader
+	previous         blockHeader
+	resolution       int64
+	spills           [countOfDownsampleFeatures]*filestream.SpillWriter
+	spillData        []byte
 	// indexLimit 可在测试中缩小，生产默认 maxBlockSize。
 	indexLimit    int
 	hasPrevious   bool
@@ -59,13 +64,26 @@ func (w *downsampleWriter) Init(path string, compressLevel int) error {
 	w.path = path
 	w.compressLevel = compressLevel
 	w.ph.Reset()
-	for i, name := range []string{timestampsFilename, valuesFilename, indexFilename, metaindexFilename} {
-		f, err := filestream.CreateExclusive(filepath.Join(path, name), false)
-		if err != nil {
-			return w.fail(err)
-		}
-		w.files[i] = f
+	f, err := filestream.CreateExclusive(filepath.Join(path, timestampsFilename), false)
+	if err != nil {
+		return w.fail(err)
 	}
+	w.timestampsWriter = f
+	f, err = filestream.CreateExclusive(filepath.Join(path, valuesFilename), false)
+	if err != nil {
+		return w.fail(err)
+	}
+	w.valuesWriter = f
+	f, err = filestream.CreateExclusive(filepath.Join(path, indexFilename), false)
+	if err != nil {
+		return w.fail(err)
+	}
+	w.indexWriter = f
+	f, err = filestream.CreateExclusive(filepath.Join(path, metaindexFilename), false)
+	if err != nil {
+		return w.fail(err)
+	}
+	w.metaindexWriter = f
 	return nil
 }
 
@@ -115,7 +133,7 @@ func (w *downsampleWriter) WriteBlock(b *downsampleBatch) (err error) {
 		}
 	}
 	w.resolution = b.resolution
-	sharedTimestampOffset := w.offsets[0]
+	sharedTimestampOffset := w.timestampsOffset
 	for i := range b.values {
 		w.normalized = w.normalized[:0]
 		for _, v := range b.values[i] {
@@ -137,7 +155,7 @@ func (w *downsampleWriter) WriteBlock(b *downsampleBatch) (err error) {
 			return err
 		}
 	}
-	if err := w.writePayload(0, w.blocks[0].timestampsData); err != nil {
+	if err := writeDownsamplePayload(w.timestampsWriter, &w.timestampsOffset, w.blocks[0].timestampsData); err != nil {
 		return err
 	}
 	for i := range w.blocks {
@@ -211,7 +229,7 @@ func (w *downsampleWriter) flushResolution() error {
 				if err := validateDownsampleHeader(&h); err != nil {
 					return err
 				}
-				if err := checkDownsampleExtent(h.TimestampsBlockOffset, h.TimestampsBlockSize, w.offsets[0]); err != nil {
+				if err := checkDownsampleExtent(h.TimestampsBlockOffset, h.TimestampsBlockSize, w.timestampsOffset); err != nil {
 					return err
 				}
 				if blocks > 0 && (!downsampleHeadersOrdered(&previous, &h) || h.TimestampsBlockOffset != previous.TimestampsBlockOffset+uint64(previous.TimestampsBlockSize)) {
@@ -235,8 +253,8 @@ func (w *downsampleWriter) flushResolution() error {
 				if _, err := io.ReadFull(r, w.spillData); err != nil {
 					return err
 				}
-				h.ValuesBlockOffset = w.offsets[1]
-				if err := w.writePayload(1, w.spillData); err != nil {
+				h.ValuesBlockOffset = w.valuesOffset
+				if err := writeDownsamplePayload(w.valuesWriter, &w.valuesOffset, w.spillData); err != nil {
 					return err
 				}
 				w.indexData = h.Marshal(w.indexData)
@@ -263,17 +281,17 @@ func (w *downsampleWriter) flushResolution() error {
 	return nil
 }
 
-func (w *downsampleWriter) writePayload(file int, b []byte) error {
+func writeDownsamplePayload(w io.Writer, offset *uint64, b []byte) error {
 	if len(b) > downsampleMaxColumnSize {
 		return fmt.Errorf("降采样编码列超过大小上限")
 	}
-	if w.offsets[file] > uint64(math.MaxInt64) || uint64(len(b)) > uint64(math.MaxInt64)-w.offsets[file] {
+	if *offset > uint64(math.MaxInt64) || uint64(len(b)) > uint64(math.MaxInt64)-*offset {
 		return fmt.Errorf("降采样文件偏移溢出")
 	}
-	if err := writeDownsampleData(w.files[file], b); err != nil {
+	if err := writeDownsampleData(w, b); err != nil {
 		return err
 	}
-	w.offsets[file] += uint64(len(b))
+	*offset += uint64(len(b))
 	return nil
 }
 
@@ -306,9 +324,9 @@ func (w *downsampleWriter) flushIndex() error {
 	if len(w.compressed) > downsampleMaxIndexSize || len(w.compressed) > 2*len(w.indexData)+256+len(downsampleIndexMagic) {
 		return fmt.Errorf("降采样 index block 超过大小上限")
 	}
-	w.mr.IndexBlockOffset = w.offsets[2]
+	w.mr.IndexBlockOffset = w.indexOffset
 	w.mr.IndexBlockSize = uint32(len(w.compressed))
-	if err := w.writePayload(2, w.compressed); err != nil {
+	if err := writeDownsamplePayload(w.indexWriter, &w.indexOffset, w.compressed); err != nil {
 		return err
 	}
 	w.metaindexData = w.mr.marshal(w.metaindexData)
@@ -350,7 +368,7 @@ func (w *downsampleWriter) Finish() (_ partHeader, err error) {
 		if len(w.compressed) > downsampleMaxMetaindexSize || len(w.compressed) > 2*len(w.metaindexData)+256+len(downsampleMetaindexMagic) {
 			return partHeader{}, fmt.Errorf("压缩 metaindex 超过大小上限")
 		}
-		if err := writeDownsampleData(w.files[3], w.compressed); err != nil {
+		if err := writeDownsampleData(w.metaindexWriter, w.compressed); err != nil {
 			return partHeader{}, err
 		}
 		m := newDownsamplePartMetadata(w.ph)
@@ -370,11 +388,21 @@ func (w *downsampleWriter) Finish() (_ partHeader, err error) {
 		}
 	}
 	var errs []error
-	for i, f := range w.files {
-		if f != nil {
-			errs = append(errs, f.Close())
-			w.files[i] = nil
-		}
+	if w.timestampsWriter != nil {
+		errs = append(errs, w.timestampsWriter.Close())
+		w.timestampsWriter = nil
+	}
+	if w.valuesWriter != nil {
+		errs = append(errs, w.valuesWriter.Close())
+		w.valuesWriter = nil
+	}
+	if w.indexWriter != nil {
+		errs = append(errs, w.indexWriter.Close())
+		w.indexWriter = nil
+	}
+	if w.metaindexWriter != nil {
+		errs = append(errs, w.metaindexWriter.Close())
+		w.metaindexWriter = nil
 	}
 	if err := errors.Join(errs...); err != nil {
 		return partHeader{}, err
@@ -410,11 +438,21 @@ func (w *downsampleWriter) Abort() error {
 			errs = append(errs, f.Close())
 		}
 	}
-	for i, f := range w.files {
-		if f != nil {
-			errs = append(errs, f.Abort())
-			w.files[i] = nil
-		}
+	if w.timestampsWriter != nil {
+		errs = append(errs, w.timestampsWriter.Abort())
+		w.timestampsWriter = nil
+	}
+	if w.valuesWriter != nil {
+		errs = append(errs, w.valuesWriter.Abort())
+		w.valuesWriter = nil
+	}
+	if w.indexWriter != nil {
+		errs = append(errs, w.indexWriter.Abort())
+		w.indexWriter = nil
+	}
+	if w.metaindexWriter != nil {
+		errs = append(errs, w.metaindexWriter.Abort())
+		w.metaindexWriter = nil
 	}
 	if w.path != "" {
 		if err := os.RemoveAll(w.path); err != nil {
@@ -437,7 +475,9 @@ func (w *downsampleWriter) reset() {
 	} else {
 		w.path = ""
 	}
-	w.offsets = [3]uint64{}
+	w.timestampsOffset = 0
+	w.valuesOffset = 0
+	w.indexOffset = 0
 	w.compressLevel = 0
 	w.ph.Reset()
 	w.previous = blockHeader{}

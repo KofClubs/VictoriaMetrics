@@ -628,7 +628,7 @@ func TestDownsampleReaderRawSeekEqualBoundaryAndReuse(t *testing.T) {
 	if err := r.Init(p, 300000); err != nil {
 		t.Fatal(err)
 	}
-	files := r.files
+	timestampsReader, valuesReader, indexReader := r.timestampsReader, r.valuesReader, r.indexReader
 	tsid := TSID{MetricID: 10}
 	r.SetFilter(&tsid, minUnixMilli+50, minUnixMilli+55)
 	if r.metaPos != 0 {
@@ -644,7 +644,7 @@ func TestDownsampleReaderRawSeekEqualBoundaryAndReuse(t *testing.T) {
 	if err := r.Init(p, 3600000); err != nil {
 		t.Fatal(err)
 	}
-	if r.files != files {
+	if r.timestampsReader != timestampsReader || r.valuesReader != valuesReader || r.indexReader != indexReader {
 		t.Fatal("同一原始源重复 Init 重开了文件")
 	}
 	tsid.MetricID = 20
