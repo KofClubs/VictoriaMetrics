@@ -228,7 +228,7 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 `Init` 绑定源 part、分辨率及可选特征，未指定特征时使用 last。`SetFilter` 设置目标 TSID 和时间范围；对于降采样 part，先在 metaindex 中二分定位分辨率和特征区段，再利用 `LastTSID` 定位可能包含目标 TSID 的首个 index。迭代时继续筛选时间范围相交的 index 和 Block。
 
-首列通过原生 `Block.UnmarshalData` 完整解码时间戳和值；后四列验证共享时间戳描述后，仅读取、解码各自 values，复用该原生 Block 中的时间戳。原生完整解码和此路径共用 `Block.unmarshalValues`。时间戳在本次多特征批次内只读取、解码一次，下一批次重新读取；查询单列读取也独立解码。
+首列通过原生 `Block.UnmarshalData` 完整解码时间戳和值；后四列验证共享时间戳描述后，由 `downsampleReader.readNativeValues` 仅读取各自 values，并直接调用原有 `encoding.UnmarshalValues` 解码，复用该原生 Block 中的时间戳。reader 负责清除上一列的值、校验时间戳与数值行数一致，并清理编码缓冲和重置读取位置；共享的 `block.go` 保持原有实现。时间戳在本次多特征批次内只读取、解码一次，下一批次重新读取；查询单列读取也独立解码。
 
 原始输入通过原生 Block 解码，并展开为五个特征的输入值，由 merger 完成分桶。解码结果只保留当前批次，reader 不缓存整个数值文件。
 

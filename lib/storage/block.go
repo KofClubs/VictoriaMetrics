@@ -282,13 +282,6 @@ func (b *Block) UnmarshalData() error {
 	}
 	b.timestampsData = b.timestampsData[:0]
 
-	return b.unmarshalValues()
-}
-
-// unmarshalValues decodes values after timestamps have already been decoded.
-// The caller must clear b.values before decoding a different values column.
-func (b *Block) unmarshalValues() error {
-	var err error
 	b.values, err = encoding.UnmarshalValues(b.values[:0], b.valuesData, b.bh.ValuesMarshalType, b.bh.FirstValue, int(b.bh.RowsCount))
 	if err != nil {
 		return err

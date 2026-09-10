@@ -66,7 +66,7 @@ merger 的清理入口分为两层：`closeResolutionReaders` 只归还当前分
 
 元数据、metaindex 及格式标识同样通过偏移 reader 读取，读取结束后合并关闭错误。part 直接将该组件交给原有查询与生命周期接口，使用兼容的 MustReadAt／MustClose，无需额外的文件适配器。
 
-多特征 `ReadBlock` 的首列通过内部方法 `readFieldBlock` 完整读取并解码原生 `Block`。后续四列先核对同一时间戳描述，再由 `readNativeValues` 只读取、解码 values，复用首列的已解码时间戳。复用范围仅限当前多特征批次；下一次调用从首列重新读取。单列查询通过 `FieldHeader` 定位，再由 `BlockRef` 和原生 `Block` 独立读取、解码 payload。
+多特征 `ReadBlock` 的首列通过内部方法 `readFieldBlock` 完整读取并解码原生 `Block`。后续四列先核对同一时间戳描述，再由 `readNativeValues` 只读取 values，直接调用原有 `encoding.UnmarshalValues` 解码，复用首列的已解码时间戳。`readNativeValues` 负责清除上一列的值、校验时间戳与数值行数一致，并清理编码缓冲和重置读取位置；共享的 `block.go` 保持原有实现。复用范围仅限当前多特征批次；下一次调用从首列重新读取。单列查询通过 `FieldHeader` 定位，再由 `BlockRef` 和原生 `Block` 独立读取、解码 payload。
 
 用于其他特征的 `peers` 持有索引位置，共享降采样 part 的文件。`SetFilter`、切换源或关闭 reader 时归还这些实例。单个 reader 只保留当前 index block 的压缩、解压缓冲，part 的 metaindex 则常驻于 part 对象。
 

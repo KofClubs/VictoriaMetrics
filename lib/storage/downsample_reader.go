@@ -581,8 +581,14 @@ func (r *downsampleReader) readNativeValues(b *Block, h, shared *blockHeader) er
 		return err
 	}
 	b.bh.ValuesBlockSize = uint32(len(b.valuesData))
-	if err := b.unmarshalValues(); err != nil {
+	// 直接复用原生值列解码器，保留已解码的时间戳，不扩展共享 Block 的解码入口。
+	b.values, err = encoding.UnmarshalValues(b.values[:0], b.valuesData, b.bh.ValuesMarshalType, b.bh.FirstValue, int(b.bh.RowsCount))
+	if err != nil {
 		return fmt.Errorf("[downsampling] cannot decode native values: %w", err)
+	}
+	b.valuesData = b.valuesData[:0]
+	if len(b.timestamps) != len(b.values) {
+		return fmt.Errorf("[downsampling] timestamps and values count mismatch; got %d vs %d", len(b.timestamps), len(b.values))
 	}
 	return nil
 }
