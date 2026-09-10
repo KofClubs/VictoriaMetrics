@@ -242,7 +242,7 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 | `metaindex.bin` | 打开 part 时载入 `dsMetaindex` | `metaindexWriter`，整体输出 |
 | `metadata.json` | 打开 part 时解析为 `dsMetadata` | `Finish` 中的局部 writer，整体输出 |
 
-当前 reader 使用 `os.File.ReadAt` 按 header 中的 offset/size 读取，时间列和值列采用串行读取和可复用缓冲。它不使用 `filestream.ReadCloser` 或 `ReadAtCloser`；文件整体读取顺序也不是连续顺序扫描。
+当前 reader 通过 `filestream.ReadAtCloser` 按 header 中的 offset/size 读取。`filestream.ReaderAt` 封装文件打开、普通文件检查、偏移读取和关闭，直接写入调用方缓冲，不持有顺序游标，也不缓存整个文件；原有顺序读取接口 `filestream.ReadCloser` 保持不变。时间列和值列采用串行读取和可复用缓冲，文件整体读取顺序不是连续顺序扫描。
 
 磁盘降采样 part 持有 `dsTimestampsFile`、`dsValuesFile`、`dsIndexFile` 三个长期句柄，reader 借用这些句柄。reader 为磁盘原始源自行打开三个文件，并负责关闭；内存源读取已有缓冲。调用方必须在 reader 使用期间持有源 part 引用。不同查询、打开校验和归并任务分别使用独立 reader 实例。
 
@@ -262,14 +262,16 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 | 接口 | 行为 |
 |---|---|
-| `Write([]byte)` | 追加数据，首次非空写入时创建临时文件 |
+| `Write([]byte)` | 追加到内存；超过阈值时，将满块追加到同一个临时文件 |
 | `ReadAll(func(io.Reader) error)` | 以流方式读出全部已写字节，只允许调用一次 |
 | `Size()` | 返回已接收字节数，包含缓冲中的数据 |
 | `Close()` | 丢弃未消费缓冲，关闭文件并删除临时文件和目录 |
 
-临时文件位于目标目录下独占的 `.spill-*` 子目录。子目录权限为 `0700 & ~umask`，文件权限为 `0666 & ~umask`。SpillWriter 复用 filestream 的缓冲池与 I/O 统计，临时数据不执行 fsync。开始读回或发生错误后，禁止继续写入。
+每个 spill 的内存阈值由常量 `spillMaxMemorySize` 设为 **16 MiB**，缓冲按需增长，容量不超过阈值。累计数据不超过阈值（含恰好达到阈值）时，不创建任何临时文件或目录。满块之后仍有数据写入时，才将该满块落盘；超大的单次写入按同样规则分段处理。后续满块追加到同一个文件，最后一段保留在内存中。`ReadAll` 依次读取文件前缀和内存尾部，不为读回而将尾部落盘。
 
-`ReadAll` 的回调必须消费全部逻辑字节。完成或出错后均关闭并尝试删除临时文件；删除失败返回错误并保留路径，允许通过 `Close` 重试。
+临时文件位于目标目录下独占的 `.spill-*` 子目录。子目录权限为 `0700 & ~umask`，文件权限为 `0666 & ~umask`。满块直接写文件，不再叠加写缓冲；文件读回沿用 filestream 的缓冲大小，使用独立读缓冲池，归还时解除文件引用。内存尾部不入池，在消费完成、关闭或出错时释放引用。读写沿用 filestream 的 I/O 统计，纯内存路径不计入实际文件 I/O；临时数据不执行 fsync。开始读回或发生错误后，禁止继续写入。
+
+`ReadAll` 单独校验文件前缀的长度，不能以内存尾部补齐被截断的文件。回调必须消费全部逻辑字节。完成或出错后均释放内存、关闭并尝试删除临时文件；删除失败返回错误并保留路径，允许通过 `Close` 重试。
 
 分辨率结束或 `Finish` 时，`flushResolution` 按 last、sum、count、min、max 的顺序，逐个完整读回 spill：
 
@@ -309,8 +311,9 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 | 单 index block 的解压数据 | 64 KiB，当前集群版最多 736 条 header |
 | metaindex 文件和解压数据 | 分别限制为 64 MiB |
 | metadata 文件 | 64 KiB |
+| 单个 spill 的内存缓冲容量 | 16 MiB，按需分配，关闭后不保留到池中 |
 
-索引 reader 各自只保留当前 index block，源 part 的 metaindex 整体驻留内存。merger 的聚合状态按当前 TSID 的时间范围分配。writer 保留当前批次及其编码缓冲、临时文件读回缓冲、当前未输出的 index，以及整个目标 part 尚未压缩的 metaindex；压缩时复用压缩缓冲。
+索引 reader 各自只保留当前 index block，源 part 的 metaindex 整体驻留内存。merger 的聚合状态按当前 TSID 的时间范围分配。writer 保留当前批次及其编码缓冲、当前分辨率的五个 spill 缓冲、临时文件读回缓冲、当前未输出的 index，以及整个目标 part 尚未压缩的 metaindex；压缩时复用压缩缓冲。五个 spill 当前持有的缓冲容量合计最多 80 MiB，不含扩容过程中尚待 GC 的旧分配及其他工作缓冲。
 
 这些是单项边界，不是进程内存的统一额度。总占用还受源 part 数量、并发任务、对象池保留容量和系统页缓存影响。`reset` 清除 `currentResolutionReaders`、`currentResolutionReaderHeap` 和 `currentTSIDReaders` 中的全部源引用，将切片长度归零，保留底层数组用于复用；reader 指针切片不设容量丢弃阈值。bucket 切片仍以 `downsampleMaxPooledBuckets = 17856` 控制 `reset` 后保留的池缓存容量，该阈值不限制任务的 bucket 数量。
 
@@ -331,19 +334,21 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 ## 7. 发布、失败处理与启动
 
-最终文件使用 `filestream.CreateExclusive` 创建。具体类型 `*filestream.Writer` 提供可返回错误的 `Close` 和 `Abort`；存储模块的 `downsampleFileWriter` 嵌入 `filestream.WriteCloser` 并声明这两个方法。公共 `filestream.WriteCloser` 接口本身只有 `Path`、`Write` 和 `MustClose`。已有目标目录会导致初始化失败，该目录不归当前 writer 清理。
+最终文件使用原有 `filestream.MustCreate` 创建，字段直接声明为 `filestream.WriteCloser`，权限为 `0666 & ~umask`。文件关闭调用原有 `MustClose`；存储层在调用前移除持有引用，避免后续重复关闭。已有目标目录会导致初始化失败，该目录不归当前 writer 清理。
+
+降采样自身的校验、取消、spill、偏移读取以及接口返回的写入错误由本模块处理。最终文件创建、缓冲刷出、同步和关闭复用原始链路的 `Must` 行为，目录同步复用 `fs.MustSyncPath`；这些共享操作失败时仍采用原有致命错误处理。`lib/filestream` 的既有 Writer、Reader、接口和缓冲池，以及 `lib/fs` 的实现保持不变。新增组件只有纯临时字节流 `SpillWriter` 和独立偏移读取 `ReaderAt`。
 
 `Finish` 完成所有 spill、index、metaindex、metadata 的写入以及文件和目录同步后，返回可发布的 partHeader。没有有效行时不发布空 part。目标在发布前通过 `openDownsamplePart` 再次校验。
 
-分区在活动清单所在目录创建临时 `parts.json`，写入、关闭并同步后，通过原子 rename 替换清单。rename 是提交点：
+分区在活动清单所在目录创建独占临时子目录，在其中通过原有 writer 写入 `parts.json`；文件关闭并同步后，通过原子 rename 替换清单。临时子目录由本次作业清理，既有临时目录及其内容不受影响。rename 是提交点：
 
 | 阶段 | 失败处理 |
 |---|---|
 | 提交前 | 保留源 part、旧清单和活动集合，关闭目标句柄，删除未发布目标、spill 和临时清单 |
-| 提交后目录同步失败 | 目标已经发布，内存活动集合与新清单保持一致，保留旧磁盘源文件，禁止 Abort 已发布目标 |
+| 提交后返回错误 | 目标已经发布，内存活动集合与新清单保持一致，保留旧磁盘源文件，禁止 Abort 已发布目标；实际目录同步仍遵守共享 Must 语义 |
 | 正常提交完成 | 按引用计数回收已替换的源 part |
 
-writer 的验证、写入、读回和关闭错误会阻止发布，并触发 Abort；后续写入继续返回已记录的错误。reader 会尝试关闭所有自有句柄并聚合关闭错误，借用的降采样句柄仍由 part 管理。清理失败同样返回错误；只有实际删除成功，才能认为目标已清理。
+writer 自身验证、spill 读回及接口返回的写入错误会阻止发布，并触发 Abort；后续写入继续返回已记录的错误。Abort 通过原有 MustClose 关闭最终文件，再删除未发布目录；只有 spill 可以直接丢弃尚未写出的缓冲。reader 会尝试关闭所有自有句柄并聚合关闭错误，借用的降采样句柄仍由 part 管理。清理失败同样返回错误；只有实际删除成功，才能认为目标已清理。
 
 `Merge` 返回前归还全部 reader 和多特征解码对象，统计按值返回。对象归还或句柄关闭后清除引用，后续重置不重复释放该资源。writer 的 `reset` 只清理内存状态；`Abort` 负责未发布目标的资源清理，目录删除失败时保留路径及已有错误，后续仅重试尚未完成的删除。降采样专属错误和日志均使用英文，并以 `[downsampling]` 开头。
 

@@ -54,6 +54,90 @@ func TestDownsampleFailureBeforePublication(t *testing.T) {
 	}
 }
 
+func TestDownsampleManifestTemporaryFileCollision(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cancel bool
+	}{
+		{name: "publish"},
+		{name: "cancel", cancel: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pt := &partition{smallPartsPath: t.TempDir()}
+			manifestPath := filepath.Join(pt.smallPartsPath, partsFilename)
+			originalManifest := []byte(`{"Small":["old"],"Big":[]}`)
+			if err := os.WriteFile(manifestPath, originalManifest, 0666); err != nil {
+				t.Fatal(err)
+			}
+			existingTempDir := filepath.Join(pt.smallPartsPath, partsFilename+".tmp.1")
+			if err := os.Mkdir(existingTempDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			existingTempPaths := []string{
+				filepath.Join(existingTempDir, partsFilename),
+				filepath.Join(pt.smallPartsPath, partsFilename+".tmp.2"),
+			}
+			existingTempData := []byte("pre-existing temporary manifest\n")
+			for _, path := range existingTempPaths {
+				if err := os.WriteFile(path, existingTempData, 0666); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var createdTempDir string
+			pt.downsampleTestHook = func(stage, path string) error {
+				if stage != "before-commit" {
+					return nil
+				}
+				createdTempDir = filepath.Dir(path)
+				if filepath.Dir(createdTempDir) != pt.smallPartsPath || createdTempDir == existingTempDir || filepath.Base(path) != partsFilename {
+					t.Fatalf("manifest was not written to its own temporary directory: %q", path)
+				}
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, []byte(`{"Small":["new"],"Big":[]}`)) {
+					t.Fatalf("temporary manifest is incomplete before publication: got=%q err=%v", got, err)
+				}
+				return nil
+			}
+			stopCh := make(chan struct{})
+			if tc.cancel {
+				close(stopCh)
+			}
+			small := []*partWrapper{{p: &part{path: filepath.Join(pt.smallPartsPath, "new")}}}
+			published := false
+			err := pt.writeDownsamplePartNames(small, nil, stopCh, &published)
+			wantManifest := []byte(`{"Small":["new"],"Big":[]}`)
+			if tc.cancel {
+				if !errors.Is(err, errForciblyStopped) || published {
+					t.Fatalf("取消后仍发布清单或丢失取消原因: published=%v err=%v", published, err)
+				}
+				wantManifest = originalManifest
+			} else if err != nil || !published {
+				t.Fatalf("临时文件冲突后未成功发布清单: published=%v err=%v", published, err)
+			}
+			if got, err := os.ReadFile(manifestPath); err != nil || !bytes.Equal(got, wantManifest) {
+				t.Fatalf("清单内容错误: got=%q want=%q err=%v", got, wantManifest, err)
+			}
+			for _, path := range existingTempPaths {
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, existingTempData) {
+					t.Fatalf("pre-existing temporary manifest was changed: path=%q got=%q want=%q err=%v", path, got, existingTempData, err)
+				}
+			}
+			if createdTempDir == "" {
+				t.Fatal("temporary manifest did not reach the publication boundary")
+			}
+			if _, err := os.Stat(createdTempDir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the operation's temporary directory was not removed: %v", err)
+			}
+			entries, err := os.ReadDir(pt.smallPartsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 3 {
+				t.Fatalf("unexpected leftovers beside the manifest and pre-existing paths: %v", entries)
+			}
+		})
+	}
+}
+
 func TestDownsampleFailureSchedulers(t *testing.T) {
 	for _, kind := range []partType{partSmall, partBig, partInmemory} {
 		for _, cause := range []error{syscall.EIO, errForciblyStopped} {
@@ -820,10 +904,18 @@ func TestDownsampleRecoveryDiscardsUnpublishedPart(t *testing.T) {
 	// 模拟目标仅写出部分内容便退出；未知格式的孤立目录不得进入活动格式校验或恢复结果。
 	writeDownsampleOpenTestFile(t, filepath.Join(orphanPath, metadataFilename), []byte(`{"FormatVersion":255}`))
 	writeDownsampleOpenTestFile(t, filepath.Join(orphanPath, metaindexFilename), []byte("incomplete output"))
+	// 同时模拟 rename 前退出，私有暂存目录内只有不完整清单。
+	manifestTempDir, err := os.MkdirTemp(filepath.Dir(manifestPath), partsFilename+".tmp.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDownsampleOpenTestFile(t, filepath.Join(manifestTempDir, partsFilename), []byte(`{"Small":[`))
 	reopened := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true})
 	defer reopened.MustClose()
-	if _, err := os.Stat(orphanPath); !os.IsNotExist(err) {
-		t.Fatalf("restart did not remove the unpublished output: %v", err)
+	for _, unpublishedPath := range []string{orphanPath, manifestTempDir} {
+		if _, err := os.Stat(unpublishedPath); !os.IsNotExist(err) {
+			t.Fatalf("restart did not remove unpublished data at %q: %v", unpublishedPath, err)
+		}
 	}
 	after, err := os.ReadFile(manifestPath)
 	if err != nil || string(after) != string(before) {

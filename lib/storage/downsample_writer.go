@@ -20,20 +20,13 @@ import (
 // downsampleMaxColumnSize 限制每个已编码时间列或值列 block 的负载大小。
 const downsampleMaxColumnSize = 2 * maxBlockSize
 
-// 最终文件沿用 filestream 的写入接口，但可恢复的降采样失败不能调用 MustClose。
-type downsampleFileWriter interface {
-	filestream.WriteCloser
-	Close() error
-	Abort() error
-}
-
 // downsampleWriter 在全部列与索引同步完成后才返回可发布的 partHeader。
 type downsampleWriter struct {
 	path                   string                                             // 本 writer 拥有的目标目录，发布前可由 Abort 删除。
-	timestampsWriter       downsampleFileWriter                               // timestamps.bin
-	valuesWriter           downsampleFileWriter                               // values.bin
-	indexWriter            downsampleFileWriter                               // index.bin
-	metaindexWriter        downsampleFileWriter                               // metaindex.bin
+	timestampsWriter       filestream.WriteCloser                             // timestamps.bin
+	valuesWriter           filestream.WriteCloser                             // values.bin
+	indexWriter            filestream.WriteCloser                             // index.bin
+	metaindexWriter        filestream.WriteCloser                             // metaindex.bin
 	timestampsOffset       uint64                                             // timestamps.bin 的下一写入位置。
 	valuesOffset           uint64                                             // values.bin 的下一写入位置。
 	indexOffset            uint64                                             // index.bin 的下一写入位置。
@@ -71,26 +64,11 @@ func (w *downsampleWriter) Init(path string, compressLevel int) error {
 	w.path = path
 	w.compressLevel = compressLevel
 	w.ph.Reset()
-	f, err := filestream.CreateExclusive(filepath.Join(path, timestampsFilename), false)
-	if err != nil {
-		return w.fail(fmt.Errorf("[downsampling] cannot create timestamps file: %w", err))
-	}
-	w.timestampsWriter = f
-	f, err = filestream.CreateExclusive(filepath.Join(path, valuesFilename), false)
-	if err != nil {
-		return w.fail(fmt.Errorf("[downsampling] cannot create values file: %w", err))
-	}
-	w.valuesWriter = f
-	f, err = filestream.CreateExclusive(filepath.Join(path, indexFilename), false)
-	if err != nil {
-		return w.fail(fmt.Errorf("[downsampling] cannot create index file: %w", err))
-	}
-	w.indexWriter = f
-	f, err = filestream.CreateExclusive(filepath.Join(path, metaindexFilename), false)
-	if err != nil {
-		return w.fail(fmt.Errorf("[downsampling] cannot create metaindex file: %w", err))
-	}
-	w.metaindexWriter = f
+	// 最终文件沿用共享 filestream 的创建、关闭及同步语义。
+	w.timestampsWriter = filestream.MustCreate(filepath.Join(path, timestampsFilename), false)
+	w.valuesWriter = filestream.MustCreate(filepath.Join(path, valuesFilename), false)
+	w.indexWriter = filestream.MustCreate(filepath.Join(path, indexFilename), false)
+	w.metaindexWriter = filestream.MustCreate(filepath.Join(path, metaindexFilename), false)
 	return nil
 }
 
@@ -193,48 +171,23 @@ func (w *downsampleWriter) Finish() (_ partHeader, err error) {
 		if err != nil {
 			return partHeader{}, fmt.Errorf("[downsampling] cannot encode part metadata: %w", err)
 		}
-		f, err := filestream.CreateExclusive(filepath.Join(w.path, metadataFilename), false)
+		f := filestream.MustCreate(filepath.Join(w.path, metadataFilename), false)
+		err = writeDownsampleData(f, b)
+		f.MustClose()
 		if err != nil {
-			return partHeader{}, fmt.Errorf("[downsampling] cannot create metadata file: %w", err)
-		}
-		if err := writeDownsampleData(f, b); err != nil {
-			if abortErr := f.Abort(); abortErr != nil {
-				err = errors.Join(err, fmt.Errorf("[downsampling] cannot abort metadata file: %w", abortErr))
-			}
 			return partHeader{}, err
 		}
-		if err := f.Close(); err != nil {
-			return partHeader{}, fmt.Errorf("[downsampling] cannot close metadata file: %w", err)
-		}
 	}
-	var errs []error
-	for _, file := range []struct {
-		name   string
-		writer *downsampleFileWriter
-	}{
-		{timestampsFilename, &w.timestampsWriter},
-		{valuesFilename, &w.valuesWriter},
-		{indexFilename, &w.indexWriter},
-		{metaindexFilename, &w.metaindexWriter},
-	} {
-		if *file.writer == nil {
+	for _, file := range []*filestream.WriteCloser{&w.timestampsWriter, &w.valuesWriter, &w.indexWriter, &w.metaindexWriter} {
+		if *file == nil {
 			continue
 		}
-		f := *file.writer
-		*file.writer = nil
-		if err := f.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("[downsampling] cannot close %s: %w", file.name, err))
-		}
+		f := *file
+		*file = nil
+		f.MustClose()
 	}
-	if err := errors.Join(errs...); err != nil {
-		return partHeader{}, err
-	}
-	if err := syncDownsampleDir(w.path); err != nil {
-		return partHeader{}, err
-	}
-	if err := syncDownsampleDir(filepath.Dir(w.path)); err != nil {
-		return partHeader{}, err
-	}
+	fs.MustSyncPath(w.path)
+	fs.MustSyncPath(filepath.Dir(w.path))
 	w.finished = true
 	return w.ph, nil
 }
@@ -251,23 +204,13 @@ func (w *downsampleWriter) Abort() error {
 			w.spills[feature] = nil
 		}
 	}
-	for _, file := range []struct {
-		name   string
-		writer *downsampleFileWriter
-	}{
-		{timestampsFilename, &w.timestampsWriter},
-		{valuesFilename, &w.valuesWriter},
-		{indexFilename, &w.indexWriter},
-		{metaindexFilename, &w.metaindexWriter},
-	} {
-		if *file.writer == nil {
+	for _, file := range []*filestream.WriteCloser{&w.timestampsWriter, &w.valuesWriter, &w.indexWriter, &w.metaindexWriter} {
+		if *file == nil {
 			continue
 		}
-		f := *file.writer
-		*file.writer = nil
-		if err := f.Abort(); err != nil {
-			errs = append(errs, fmt.Errorf("[downsampling] cannot abort %s: %w", file.name, err))
-		}
+		f := *file
+		*file = nil
+		f.MustClose()
 	}
 	w.finished = false
 	if w.path != "" {
@@ -683,21 +626,6 @@ func checkDownsampleAvailableSpace(available, held, requested, minimumFree uint6
 		return fmt.Errorf("%w: available=%d, held=%d, requested=%d, minimumFree=%d", errDownsampleNoSpace, available, held, requested, minimumFree)
 	}
 	return nil
-}
-
-func syncDownsampleDir(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("[downsampling] cannot open directory %q for synchronization: %w", path, err)
-	}
-	var syncErr, closeErr error
-	if err := f.Sync(); err != nil {
-		syncErr = fmt.Errorf("[downsampling] cannot synchronize directory %q: %w", path, err)
-	}
-	if err := f.Close(); err != nil {
-		closeErr = fmt.Errorf("[downsampling] cannot close directory %q: %w", path, err)
-	}
-	return errors.Join(syncErr, closeErr)
 }
 
 func getDownsampleWriter() *downsampleWriter {

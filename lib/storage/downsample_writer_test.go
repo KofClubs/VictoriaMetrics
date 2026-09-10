@@ -104,6 +104,15 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 			if err := writeDownsampleTestBlock(w, batch); err != nil {
 				t.Fatal(err)
 			}
+			entries, err := os.ReadDir(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), ".spill-") {
+					t.Fatalf("少量数据写入创建了 spill 临时目录: %q", entry.Name())
+				}
+			}
 			var stored [5]Block
 			for feature := range w.blocks {
 				fb := &w.blocks[feature]
@@ -121,6 +130,18 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 			}
 			if _, err := w.Finish(); err != nil {
 				t.Fatal(err)
+			}
+			entries, err = os.ReadDir(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fileNames []string
+			for _, entry := range entries {
+				fileNames = append(fileNames, entry.Name())
+			}
+			wantFiles := []string{indexFilename, metadataFilename, metaindexFilename, timestampsFilename, valuesFilename}
+			if !reflect.DeepEqual(fileNames, wantFiles) {
+				t.Fatalf("完成写入后的文件集合错误: got=%v want=%v", fileNames, wantFiles)
 			}
 			p, err := openDownsamplePart(path)
 			if err != nil {
@@ -581,7 +602,7 @@ func TestDownsampleAvailableSpaceBoundaries(t *testing.T) {
 
 func TestDownsampleWriterFinalFileFailures(t *testing.T) {
 	for _, name := range []string{timestampsFilename, valuesFilename, indexFilename, metaindexFilename} {
-		for _, operation := range []string{"write", "short_write", "close", "abort"} {
+		for _, operation := range []string{"write", "short_write"} {
 			t.Run(name+"/"+operation, func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "part")
 				var w downsampleWriter
@@ -592,14 +613,14 @@ func TestDownsampleWriterFinalFileFailures(t *testing.T) {
 				files := make(map[string]*failingDownsampleFile)
 				for _, file := range []struct {
 					name   string
-					writer *downsampleFileWriter
+					writer *filestream.WriteCloser
 				}{
 					{timestampsFilename, &w.timestampsWriter},
 					{valuesFilename, &w.valuesWriter},
 					{indexFilename, &w.indexWriter},
 					{metaindexFilename, &w.metaindexWriter},
 				} {
-					f := &failingDownsampleFile{downsampleFileWriter: *file.writer}
+					f := &failingDownsampleFile{WriteCloser: *file.writer}
 					files[file.name] = f
 					*file.writer = f
 				}
@@ -611,11 +632,6 @@ func TestDownsampleWriterFinalFileFailures(t *testing.T) {
 				case "short_write":
 					failingFile.shortWrite = true
 					cause = io.ErrShortWrite
-				case "close":
-					failingFile.closeErr = cause
-				case "abort":
-					failingFile.writeErr = io.ErrUnexpectedEOF
-					failingFile.abortErr = cause
 				}
 				err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, 300000))
 				if err == nil {
@@ -626,11 +642,8 @@ func TestDownsampleWriterFinalFileFailures(t *testing.T) {
 				}
 				assertDownsampleWriterAborted(t, &w, path, cause)
 				for name, f := range files {
-					if f.closes+f.aborts != 1 {
-						t.Fatalf("file %s must be released once even if another fails: close=%d; abort=%d", name, f.closes, f.aborts)
-					}
-					if _, err := f.downsampleFileWriter.Write([]byte("closed")); !errors.Is(err, os.ErrClosed) {
-						t.Fatalf("file %s is still open: %v", name, err)
+					if f.closes != 1 {
+						t.Fatalf("file %s must be released once even if another fails: closes=%d", name, f.closes)
 					}
 				}
 			})
@@ -639,7 +652,7 @@ func TestDownsampleWriterFinalFileFailures(t *testing.T) {
 }
 
 func TestDownsampleWriterSpillAndValidationFailures(t *testing.T) {
-	for _, scenario := range []string{"spill_create", "spill_truncated_header", "metadata_create", "invalid_next_batch"} {
+	for _, scenario := range []string{"spill_truncated_header", "invalid_next_batch"} {
 		t.Run(scenario, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "part")
 			var w downsampleWriter
@@ -647,12 +660,8 @@ func TestDownsampleWriterSpillAndValidationFailures(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer w.Abort()
-			if scenario == "spill_create" {
-				// Earlier columns already have buffered data when the third fails.
-				w.spills[2] = filestream.NewSpillWriter(filepath.Join(path, "missing"))
-			}
 			err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, 300000))
-			if scenario != "spill_create" && err != nil {
+			if err != nil {
 				t.Fatal(err)
 			}
 			switch scenario {
@@ -664,11 +673,6 @@ func TestDownsampleWriterSpillAndValidationFailures(t *testing.T) {
 				if !errors.Is(err, io.ErrUnexpectedEOF) {
 					t.Fatalf("truncated spill header must fail: %v", err)
 				}
-			case "metadata_create":
-				if err := os.Mkdir(filepath.Join(path, metadataFilename), 0755); err != nil {
-					t.Fatal(err)
-				}
-				_, err = w.Finish()
 			case "invalid_next_batch":
 				err = writeDownsampleTestBlock(&w, nil)
 			}
@@ -692,14 +696,11 @@ func TestDownsampleWriterSpillAndValidationFailures(t *testing.T) {
 
 func TestDownsampleWriterFinalFilePermissions(t *testing.T) {
 	dir := t.TempDir()
-	control, err := filestream.Create(filepath.Join(dir, "control"), false)
-	if err != nil {
+	controlPath := filepath.Join(dir, "control")
+	if err := os.WriteFile(controlPath, nil, 0666); err != nil {
 		t.Fatal(err)
 	}
-	if err := control.Close(); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(control.Path())
+	info, err := os.Stat(controlPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -721,7 +722,7 @@ func TestDownsampleWriterFinalFilePermissions(t *testing.T) {
 			t.Fatal(err)
 		}
 		if got.Mode().Perm() != info.Mode().Perm() {
-			t.Fatalf("%s permissions=%o; filestream permissions=%o", name, got.Mode().Perm(), info.Mode().Perm())
+			t.Fatalf("%s permissions=%o; reference permissions=%o", name, got.Mode().Perm(), info.Mode().Perm())
 		}
 	}
 }
@@ -773,8 +774,8 @@ func TestDownsampleWriterAbortRetriesOnlyDirectory(t *testing.T) {
 		}
 	}
 	for _, f := range files {
-		if f.aborts != 1 || f.closes != 0 {
-			t.Fatalf("final file cleanup count: aborts=%d; closes=%d", f.aborts, f.closes)
+		if f.closes != 1 {
+			t.Fatalf("final file cleanup count: closes=%d", f.closes)
 		}
 	}
 	newPath := filepath.Join(t.TempDir(), "new-part")
@@ -802,7 +803,7 @@ func TestDownsampleWriterAbortRetriesOnlyDirectory(t *testing.T) {
 		t.Fatalf("completed cleanup was attempted again: removes=%d; err=%v", removes, err)
 	}
 	for _, f := range files {
-		if f.aborts != 1 || f.closes != 0 {
+		if f.closes != 1 {
 			t.Fatal("directory retry repeated final file cleanup")
 		}
 	}
@@ -860,8 +861,8 @@ func TestDownsampleWriterFinishedTargetOwnership(t *testing.T) {
 			}
 			putDownsampleWriter(&w)
 			for _, f := range append(oldFiles, files...) {
-				if f.closes != 1 || f.aborts != 0 {
-					t.Fatalf("finished file was released again: closes=%d; aborts=%d", f.closes, f.aborts)
+				if f.closes != 1 {
+					t.Fatalf("finished file was released again: closes=%d", f.closes)
 				}
 			}
 			_, err := os.Stat(path)
@@ -893,7 +894,7 @@ func TestDownsampleWriterPoolKeepsPendingCleanup(t *testing.T) {
 		t.Fatal("pool release discarded pending cleanup ownership")
 	}
 	for _, f := range files {
-		if f.aborts != 1 {
+		if f.closes != 1 {
 			t.Fatal("pool release did not close the unfinished writer")
 		}
 	}
@@ -994,7 +995,7 @@ func TestDownsampleWriterSamplesLaterBlockFailure(t *testing.T) {
 			stopCh := make(chan struct{})
 			cause := errors.New("injected later block write failure")
 			writes := 0
-			w.timestampsWriter = &downsampleCloseTestWriter{downsampleFileWriter: w.timestampsWriter, beforeWrite: func() error {
+			w.timestampsWriter = &downsampleCloseTestWriter{WriteCloser: w.timestampsWriter, beforeWrite: func() error {
 				writes++
 				if writes != 2 {
 					return nil

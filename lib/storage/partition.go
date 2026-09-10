@@ -1059,7 +1059,7 @@ func (pt *partition) flushInmemoryPartsToFiles(isFinal bool) {
 				err = pt.downsampleTestHook("sync-final-dir", pt.smallPartsPath)
 			}
 			if err == nil {
-				err = syncDownsampleDir(pt.smallPartsPath)
+				fs.MustSyncPath(pt.smallPartsPath)
 			}
 		}()
 		if err != nil {

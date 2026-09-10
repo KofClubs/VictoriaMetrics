@@ -3,6 +3,7 @@ package storage
 import (
 	"errors"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/uint64set"
 	"math"
 	"os"
@@ -249,7 +250,7 @@ func TestDownsampleMergerDynamicBucketRange(t *testing.T) {
 		}
 		defer w.Abort()
 		var observed []observedRange
-		w.timestampsWriter = &downsampleStateObserverWriter{downsampleFileWriter: w.timestampsWriter, observe: func() {
+		w.timestampsWriter = &downsampleStateObserverWriter{WriteCloser: w.timestampsWriter, observe: func() {
 			observed = append(observed, observedRange{w.blocks[0].bh.TSID.MetricID, w.resolution, len(m.currentTSIDBucketSamples)})
 		}}
 		stats, err := m.Merge(sources, w, nil, nil, 0)
@@ -596,14 +597,12 @@ func TestDownsampleMergerResetClosesAllReaders(t *testing.T) {
 			first := newDownsampleCloseTestReader(t)
 			second := newDownsampleCloseTestReader(t)
 			window := newDownsampleCloseTestReader(t)
-			files := []*os.File{
+			files := []filestream.ReadAtCloser{
 				first.timestampsReader, first.valuesReader, first.indexReader,
 				second.timestampsReader, second.valuesReader, second.indexReader,
 				window.timestampsReader, window.valuesReader, window.indexReader,
 			}
-			if err := first.timestampsReader.Close(); err != nil {
-				t.Fatal(err)
-			}
+			first.timestampsReader.(*downsampleCloseTestFile).closeErr = os.ErrClosed
 			// first 已出堆，但仍由 readers 持有；清理不能只遍历 heap。
 			activeReaders := []*downsampleReader{first, second}
 			m := downsampleMerger{
@@ -619,8 +618,8 @@ func TestDownsampleMergerResetClosesAllReaders(t *testing.T) {
 			case "init_sources":
 				err = m.initSources(nil, downsampleResolution1h)
 				// Switching columns closes source readers; the independent data reader remains usable.
-				if _, statErr := window.timestampsReader.Stat(); statErr != nil {
-					t.Fatalf("initSources closed the independent window currentSourceReader: %v", statErr)
+				if n, readErr := window.timestampsReader.ReadAt(make([]byte, 1), 0); readErr != nil || n != 1 {
+					t.Fatalf("initSources closed the independent window currentSourceReader: n=%d, err=%v", n, readErr)
 				}
 				if closeErr := m.reset(); closeErr != nil {
 					t.Fatal(closeErr)
@@ -640,6 +639,10 @@ func TestDownsampleMergerResetClosesAllReaders(t *testing.T) {
 					t.Fatal("active readers backing array retained a returned reader")
 				}
 			}
+			if err := m.reset(); err != nil {
+				t.Fatalf("reset retried closed readers: %v", err)
+			}
+			assertDownsampleFilesClosed(t, files)
 		})
 	}
 }
@@ -665,15 +668,15 @@ func TestDownsampleMergerClosesBeforeReturning(t *testing.T) {
 			defer w.Abort()
 			stopCh := make(chan struct{})
 			writeErr := errors.New("injected output write failure")
-			var files []*os.File
+			var files []filestream.ReadAtCloser
 			var closeNames []string
 			var activeReaders []*downsampleReader
-			w.timestampsWriter = &downsampleCloseTestWriter{downsampleFileWriter: w.timestampsWriter, beforeWrite: func() error {
+			w.timestampsWriter = &downsampleCloseTestWriter{WriteCloser: w.timestampsWriter, beforeWrite: func() error {
 				if w.resolution != downsampleResolution1h || files != nil {
 					return nil
 				}
-				// The last output batch is already read. Close actual source handles to
-				// make only cleanup fail, without adding production test hooks.
+				// The last output batch is already read. Wrap the actual source files
+				// to inject cleanup errors and count every Close without changing reads.
 				if len(m.currentResolutionReaderHeap) != 0 || len(m.currentResolutionReaders) != 1 || m.currentResolutionReaders[0].p != p {
 					t.Fatal("exhausted source reader must leave the heap but remain owned until cleanup")
 				}
@@ -683,12 +686,14 @@ func TestDownsampleMergerClosesBeforeReturning(t *testing.T) {
 				activeReaders = m.currentTSIDReaders
 				readers := []*downsampleReader{m.currentResolutionReaders[0], m.currentSourceReader}
 				for _, r := range readers {
+					timestamps := &downsampleCloseTestFile{ReadAtCloser: r.timestampsReader}
+					r.timestampsReader = timestamps
+					r.valuesReader = &downsampleCloseTestFile{ReadAtCloser: r.valuesReader}
+					r.indexReader = &downsampleCloseTestFile{ReadAtCloser: r.indexReader}
 					files = append(files, r.timestampsReader, r.valuesReader, r.indexReader)
 					if scenario != "success" {
-						closeNames = append(closeNames, r.timestampsReader.Name())
-						if err := r.timestampsReader.Close(); err != nil {
-							t.Fatal(err)
-						}
+						closeNames = append(closeNames, timestamps.Path())
+						timestamps.closeErr = os.ErrClosed
 					}
 				}
 				if scenario == "write_and_close_error" {

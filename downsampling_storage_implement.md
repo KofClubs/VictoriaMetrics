@@ -15,7 +15,7 @@
 | [downsample_partition.go](lib/storage/downsample_partition.go) | 处理启动预检查、分区及活动清单发现、文件选源、降采样作业与清单发布；管理进程级磁盘预算、预留和缓存有效期内的额度释放。 |
 | [downsample_query.go](lib/storage/downsample_query.go) | 解析查询字段，编解码带字段选择的查询协议，并在 part 搜索中定位目标单列 header。 |
 
-这八个文件按降采样职责组织。共用实现包括原生编解码 [block.go](lib/storage/block.go)、part 引用生命周期 [part.go](lib/storage/part.go)、归并调度及刷盘 [partition.go](lib/storage/partition.go)、查询遍历 [part_search.go](lib/storage/part_search.go)、RPC 分派 [vmselectapi/server.go](lib/vmselectapi/server.go)，以及临时字节流 [spill.go](lib/filestream/spill.go)。
+这八个文件按降采样存储职责组织。底层新增组件包括临时字节流 [spill_writer.go](lib/filestream/spill_writer.go) 和偏移读取 [reader_at.go](lib/filestream/reader_at.go)；最终文件使用原有 `filestream.WriteCloser`。共用实现包括原生编解码 [block.go](lib/storage/block.go)、part 引用生命周期 [part.go](lib/storage/part.go)、归并调度及刷盘 [partition.go](lib/storage/partition.go)、查询遍历 [part_search.go](lib/storage/part_search.go) 和 RPC 分派 [vmselectapi/server.go](lib/vmselectapi/server.go)。
 
 block 中的 `downsampleMaxRawRows` 和 `downsampleMaxPooledRows` 分别限制原始输入 block 的行数和对象池保留的行容量；writer 中的 `downsampleMaxColumnSize` 限制已编码的单列负载。reader 中的 `validateDownsampleRowCodec` 检查行数与编码的组合，`checkDownsampleExtent` 检查负载偏移、大小及文件边界。
 
@@ -62,7 +62,9 @@ merger 的清理入口分为两层：`closeResolutionReaders` 只归还当前分
 
 `Init` 绑定源 part 和分辨率；`SetFilter` 重置索引游标并选择相交的 block。同一 part 再次 `Init` 时复用主文件句柄和工作缓冲；换 part 时先释放旧 reader 自有资源。
 
-磁盘读取使用 `os.File.ReadAt`：原始磁盘数据源由 reader 自行打开 timestamps、values、index 三个文件；降采样源借用 part 已有的三个文件句柄。内存源通过现有内存缓冲接口读取。reader 的生存期由调用方持有的 part 引用覆盖。
+磁盘读取使用 `filestream.ReadAtCloser`：原始磁盘数据源由 reader 自行打开 timestamps、values、index 三个文件；降采样源借用 part 已有的三个偏移 reader。实际打开、普通文件检查和偏移读取封装在 `filestream.ReaderAt` 中，不增加文件缓冲或顺序游标。内存源通过现有内存缓冲接口读取。reader 的生存期由调用方持有的 part 引用覆盖。
+
+元数据、metaindex 及格式标识同样通过偏移 reader 读取，读取结束后合并关闭错误。part 直接将该组件交给原有查询与生命周期接口，使用兼容的 MustReadAt／MustClose，无需额外的文件适配器。
 
 多特征 `ReadBlock` 的首列通过内部方法 `readFieldBlock` 完整读取并解码原生 `Block`。后续四列先核对同一时间戳描述，再由 `readNativeValues` 只读取、解码 values，复用首列的已解码时间戳。复用范围仅限当前多特征批次；下一次调用从首列重新读取。单列查询通过 `FieldHeader` 定位，再由 `BlockRef` 和原生 `Block` 独立读取、解码 payload。
 
@@ -76,9 +78,13 @@ reader 的 `Close` 直接释放自有文件和特征 reader，再清空迭代状
 
 `WriteSamples` 借用输入样本，逐块提取一份有效时间戳和一个特征的浮点值，再交给原生 `Block` 编码。输入切片不会被修改或长期持有。每个输出 block 最多 8192 行；精度变化会开始新 block，五列使用一致的行边界。
 
-最终文件由 `filestream.CreateExclusive` 创建，通过 `filestream.Writer` 写入并关闭。当前分辨率的五个 `SpillWriter` 保存各特征的 header 和 values。时间戳不进入 spill；五个原生 Block 的时间戳编码经一致性检查后只写一份。
+最终文件字段直接使用 `filestream.WriteCloser`，通过原有 `MustCreate` 创建、`Write` 写入、`MustClose` 关闭。临时清单写入本次作业独占的临时子目录，关闭后 rename 到正式清单路径，再清理子目录。最终文件创建、缓冲刷出、同步和关闭保留共享 Must 语义，目录同步调用原有 `fs.MustSyncPath`；降采样不复制或修改这些实现。
 
-`SpillWriter` 在首次非空写入时创建私有临时目录和文件。文件权限使用 `0666` 并受 umask 影响，临时目录由 `os.MkdirTemp` 创建。`ReadAll` 刷新缓冲后在同一文件上回到起点，要求回调完整消费字节流；完成或失败时关闭、删除临时资源，不同步临时文件。删除失败保留路径，后续 `Close` 可再次尝试。
+当前分辨率的五个 `SpillWriter` 保存各特征的 header 和 values。时间戳不进入 spill；五个原生 Block 的时间戳编码经一致性检查后只写一份。
+
+`SpillWriter` 使用常量 `spillMaxMemorySize = 16 MiB`，按需分配内存。数据不超过阈值时不创建临时资源；满块之后还有数据写入时，才创建私有目录和文件并写出该满块。后续满块追加到同一个文件，单次超大输入也分段处理，最后一段保留在内存中。五个 spill 当前持有的缓冲容量合计最多 80 MiB；扩容时待 GC 的旧分配、其他缓冲和并发任务另行占用内存。
+
+文件权限使用 `0666` 并受 umask 影响，临时目录由 `os.MkdirTemp` 以 `0700 & ~umask` 创建。`ReadAll` 核验文件前缀长度后回到起点，依次读取文件和内存尾部，要求回调完整消费字节流。完成或失败时释放内存、关闭并删除临时资源，不同步临时文件。删除失败保留路径，后续 `Close` 可再次尝试。满块直接写文件；只有文件读回缓冲使用独立池，归还时解除文件引用。内存尾部不入池。I/O 统计区分逻辑读写与实际文件读写，纯内存路径没有实际文件 I/O。
 
 切换分辨率或调用 `Finish` 时，writer 按特征依次读回 spill，写入最终 values 和 index。`Finish` 完成剩余索引、metaindex 与 metadata，关闭并同步最终文件，再同步目标目录及其父目录。`Finish` 结束只表示目标文件已完成，活动 part 集合由外层提交清单后更新。
 
@@ -90,13 +96,13 @@ writer 的 `reset` 只清理逻辑状态和工作缓冲，文件清理由 `Finis
 |---|---|
 | reader 或归并校验失败 | 错误终止归并，关闭并归还 reader，由外层调用 `Abort` 清理未发布目标。reader 返回错误不直接设置 `writer.err`。 |
 | writer 自身校验、写入或收尾失败 | writer 在内部失败处理中记录错误，禁止继续调用 `WriteSamples` 或 `Finish`，并尝试 `Abort`；外层仍负责清理未发布目标。 |
-| `parts.json` rename 前 | 使用副本构造候选 part 集合。临时清单写入、关闭、取消检查或 rename 失败时，不替换活动集合；清理临时清单及目标。 |
-| `parts.json` rename 后 | 将目标视为已发布，内存活动集合与清单保持一致。若清单目录同步失败，保留目标及旧源磁盘文件，返回错误，不 Abort 目标。 |
+| `parts.json` rename 前 | 使用副本构造候选 part 集合。临时目录创建、接口返回的写入错误、取消检查或 rename 失败时，不替换活动集合；清理本次临时目录及目标。 |
+| `parts.json` rename 后 | 将目标视为已发布。后续返回错误时，内存活动集合与清单保持一致，保留目标及旧源磁盘文件，不 Abort 目标；实际目录同步使用共享 Must 语义。 |
 | 发布成功 | 标记源可删除并释放引用，后续回收通过原有 part 生命周期完成。 |
 | 后台归并或周期刷盘失败 | 调度识别 `errDownsampleMergeFailed`，结束当前降采样任务。提交前失败的源仍在活动集合中。 |
 | 最终刷盘失败 | 对仍在内存的源单独按原始格式落盘，不修改共享降采样开关；即使已无剩余内存源，也再次同步当前清单目录。 |
 
-降采样作业中的普通错误通过返回值处理，清理错误与原错误合并返回。源 part 回收、原始数据最终持久化、启动打开及程序不变量仍使用各自现有的 `Must`／FATAL 处理；持续文件系统故障也可能使清理或最终持久化失败。具体边界见审查说明。
+降采样作业中的普通错误通过返回值处理，清理错误与原错误合并返回。最终文件创建、关闭及目录同步、源 part 回收、原始数据最终持久化、启动打开及程序不变量仍使用各自现有的 `Must`／FATAL 处理；持续文件系统故障也可能使清理或最终持久化失败。具体边界见审查说明。
 
 降采样专属错误和日志使用英文，消息以 `[downsampling]` 开头。底层错误通过 `%w` 保留原因，多个独立错误通过 `errors.Join` 汇总，取消和空间不足仍可通过 `errors.Is` 识别。
 

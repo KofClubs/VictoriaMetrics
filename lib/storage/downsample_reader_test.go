@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
 )
 
 func TestDownsampleFileRoundtrip(t *testing.T) {
@@ -745,20 +747,18 @@ func TestDownsampleReaderCloseOwnFiles(t *testing.T) {
 	r := newDownsampleCloseTestReader(t)
 	peer := newDownsampleCloseTestReader(t)
 	r.peers[downsampleFeatureSum] = peer
-	files := []*os.File{r.timestampsReader, r.valuesReader, r.indexReader, peer.timestampsReader, peer.valuesReader, peer.indexReader}
-	failedFiles := []*os.File{r.timestampsReader, peer.indexReader}
+	files := []filestream.ReadAtCloser{r.timestampsReader, r.valuesReader, r.indexReader, peer.timestampsReader, peer.valuesReader, peer.indexReader}
+	failedFiles := []filestream.ReadAtCloser{r.timestampsReader, peer.indexReader}
 	for _, f := range failedFiles {
-		if err := f.Close(); err != nil {
-			t.Fatal(err)
-		}
+		f.(*downsampleCloseTestFile).closeErr = os.ErrClosed
 	}
 	err := r.Close()
 	if !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("lost actual file close error: %v", err)
 	}
 	for _, f := range failedFiles {
-		if !strings.Contains(err.Error(), "[downsampling] cannot close reader file \""+f.Name()+"\"") {
-			t.Fatalf("lost prefixed close error for file %q: %v", f.Name(), err)
+		if !strings.Contains(err.Error(), "[downsampling] cannot close reader file \""+f.Path()+"\"") {
+			t.Fatalf("lost prefixed close error for file %q: %v", f.Path(), err)
 		}
 	}
 	assertDownsampleFilesClosed(t, files)
@@ -773,6 +773,7 @@ func TestDownsampleReaderCloseOwnFiles(t *testing.T) {
 	if err := r.Close(); err != nil {
 		t.Fatalf("Close attempted the same files or peers again: %v", err)
 	}
+	assertDownsampleFilesClosed(t, files)
 }
 
 func TestDownsampleReaderCloseBorrowedFiles(t *testing.T) {
@@ -798,9 +799,13 @@ func TestDownsampleReaderCloseBorrowedFiles(t *testing.T) {
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []*os.File{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
-		if _, err := f.Stat(); err != nil {
-			t.Fatalf("reader closed borrowed file %q: %v", f.Name(), err)
+	for _, f := range []filestream.ReadAtCloser{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
+		wantN, wantErr := 1, error(nil)
+		if f.Size() == 0 {
+			wantN, wantErr = 0, io.EOF
+		}
+		if n, err := f.ReadAt(make([]byte, 1), 0); n != wantN || !errors.Is(err, wantErr) {
+			t.Fatalf("reader closed borrowed file %q: n=%d, err=%v", f.Path(), n, err)
 		}
 	}
 	for _, peer := range r.peers {
@@ -815,16 +820,14 @@ func TestDownsampleReaderCloseBorrowedFiles(t *testing.T) {
 func TestDownsampleReaderSetFilterReleasesPeers(t *testing.T) {
 	r := newDownsampleCloseTestReader(t)
 	defer r.Close()
-	parentFiles := []*os.File{r.timestampsReader, r.valuesReader, r.indexReader}
-	var peerFiles []*os.File
+	parentFiles := []filestream.ReadAtCloser{r.timestampsReader, r.valuesReader, r.indexReader}
+	var peerFiles []filestream.ReadAtCloser
 	for feature := uint8(1); feature < countOfDownsampleFeatures; feature++ {
 		peer := newDownsampleCloseTestReader(t)
 		r.peers[feature] = peer
 		peerFiles = append(peerFiles, peer.timestampsReader, peer.valuesReader, peer.indexReader)
 	}
-	if err := peerFiles[0].Close(); err != nil {
-		t.Fatal(err)
-	}
+	peerFiles[0].(*downsampleCloseTestFile).closeErr = os.ErrClosed
 	tsid := TSID{MetricID: 7}
 	r.SetFilter(&tsid, minUnixMilli, maxUnixMilli)
 	if !errors.Is(r.Error(), os.ErrClosed) || r.NextHeader() {
@@ -837,8 +840,8 @@ func TestDownsampleReaderSetFilterReleasesPeers(t *testing.T) {
 		}
 	}
 	for _, f := range parentFiles {
-		if _, err := f.Stat(); err != nil {
-			t.Fatalf("filter change closed parent file %q: %v", f.Name(), err)
+		if n, err := f.ReadAt(make([]byte, 1), 0); err != nil || n != 1 {
+			t.Fatalf("filter change closed parent file %q: n=%d, err=%v", f.Path(), n, err)
 		}
 	}
 	r.SetFilter(nil, minUnixMilli, maxUnixMilli)
@@ -849,6 +852,7 @@ func TestDownsampleReaderSetFilterReleasesPeers(t *testing.T) {
 		t.Fatalf("Close tried to close already returned peers: %v", err)
 	}
 	assertDownsampleFilesClosed(t, parentFiles)
+	assertDownsampleFilesClosed(t, peerFiles)
 }
 
 func TestDownsampleReaderInitFailureReleasesPartialSource(t *testing.T) {
@@ -876,7 +880,7 @@ func TestDownsampleReaderInitFailureReleasesPartialSource(t *testing.T) {
 	if err := r.Init(p, downsampleResolution1h, downsampleFeatureMax); err != nil {
 		t.Fatal(err)
 	}
-	files := []*os.File{r.timestampsReader, r.valuesReader, r.indexReader}
+	files := []filestream.ReadAtCloser{r.timestampsReader, r.valuesReader, r.indexReader}
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -894,10 +898,8 @@ func TestDownsampleReaderInitCloseFailure(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			r := newDownsampleCloseTestReader(t)
-			files := []*os.File{r.timestampsReader, r.valuesReader, r.indexReader}
-			if err := r.timestampsReader.Close(); err != nil {
-				t.Fatal(err)
-			}
+			files := []filestream.ReadAtCloser{r.timestampsReader, r.valuesReader, r.indexReader}
+			r.timestampsReader.(*downsampleCloseTestFile).closeErr = os.ErrClosed
 			next := &part{path: filepath.Join(t.TempDir(), "must-not-open")}
 			if invalid {
 				next = nil
@@ -949,7 +951,7 @@ func TestDownsampleReaderSharedTimestampsValuesOnly(t *testing.T) {
 				}
 			}
 			// 使用独立句柄，关闭后不影响 part 的引用生命周期和其它 reader。
-			f, err := os.Open(filepath.Join(path, timestampsFilename))
+			f, err := filestream.OpenReadAt(filepath.Join(path, timestampsFilename))
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -12,7 +12,7 @@ import (
 	"unsafe"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
 )
 
 const (
@@ -62,13 +62,19 @@ func validateDownsamplePartHeader(ph *partHeader) error {
 	return nil
 }
 
-func readDownsampleLimitedFile(path string, limit int64) ([]byte, error) {
-	f, err := os.Open(path)
+func readDownsampleLimitedFile(path string, limit int64) (_ []byte, err error) {
+	if limit < 0 || limit == math.MaxInt64 {
+		return nil, fmt.Errorf("[downsampling] invalid file size limit %d", limit)
+	}
+	f, err := filestream.OpenReadAt(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, limit+1))
+	defer func() { err = errors.Join(err, f.Close()) }()
+	if f.Size() > uint64(limit) {
+		return nil, fmt.Errorf("[downsampling] file %q exceeds the size limit %d", path, limit)
+	}
+	b, err := io.ReadAll(io.NewSectionReader(f, 0, limit+1))
 	if err != nil {
 		return nil, err
 	}
@@ -127,18 +133,18 @@ func readDownsampleMetadata(path string) (*downsamplePartMetadata, error) {
 }
 
 // detectDownsampleFormat 只读取元数据与标识，供初始化预检查和正式打开共用。
-func detectDownsampleFormat(path string) (bool, error) {
+func detectDownsampleFormat(path string) (_ bool, err error) {
 	m, err := readDownsampleMetadata(path)
 	if err != nil {
 		return false, fmt.Errorf("[downsampling] cannot inspect part %q: %w", path, err)
 	}
-	f, err := os.Open(filepath.Join(path, metaindexFilename))
+	f, err := filestream.OpenReadAt(filepath.Join(path, metaindexFilename))
 	if err != nil {
 		return false, err
 	}
-	defer f.Close()
+	defer func() { err = errors.Join(err, f.Close()) }()
 	var magic [8]byte
-	n, err := io.ReadFull(f, magic[:])
+	n, err := f.ReadAt(magic[:], 0)
 	if err != nil {
 		return false, fmt.Errorf("[downsampling] part %q has a truncated metaindex marker: %w", path, err)
 	}
@@ -164,8 +170,11 @@ func detectDownsampleFormat(path string) (bool, error) {
 // openDownsamplePart 在正常错误路径上关闭已打开文件，不改变原始 inmemory 打开过程。
 func openDownsamplePart(path string) (_ *part, err error) {
 	m, err := readDownsampleMetadata(path)
-	if err != nil || m == nil {
-		return nil, fmt.Errorf("[downsampling] cannot read part metadata %q: %v", path, err)
+	if err != nil {
+		return nil, fmt.Errorf("[downsampling] cannot read part metadata %q: %w", path, err)
+	}
+	if m == nil {
+		return nil, fmt.Errorf("[downsampling] part %q is missing downsampling metadata", path)
 	}
 	b, err := readDownsampleLimitedFile(filepath.Join(path, metaindexFilename), downsampleMaxMetaindexSize)
 	if err != nil {
@@ -184,9 +193,9 @@ func openDownsamplePart(path string) (_ *part, err error) {
 	p := &part{path: path, ph: m.partHeader, dsMetadata: m}
 	defer func() {
 		if err != nil {
-			for _, f := range []*os.File{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
+			for _, f := range []filestream.ReadAtCloser{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
 				if f != nil {
-					_ = f.Close()
+					err = errors.Join(err, f.Close())
 				}
 			}
 		}
@@ -241,27 +250,21 @@ func openDownsamplePart(path string) (_ *part, err error) {
 		return nil, fmt.Errorf("[downsampling] cannot validate part %q: %w", path, err)
 	}
 	p.metaindexSizeBytes = uint64(cap(p.dsMetaindex)) * uint64(unsafe.Sizeof(downsampleMetaindexRow{}))
-	p.timestampsFile = &downsamplePartFile{f: p.dsTimestampsFile}
-	p.valuesFile = &downsamplePartFile{f: p.dsValuesFile}
-	p.indexFile = &downsamplePartFile{f: p.dsIndexFile}
+	p.timestampsFile = p.dsTimestampsFile
+	p.valuesFile = p.dsValuesFile
+	p.indexFile = p.dsIndexFile
 	return p, nil
 }
 
-// 将打开的文件立即交给调用方，即使 Stat 失败也由调用方统一关闭。
-func openDownsamplePartDataFile(path, name string, dst **os.File, size *uint64) error {
-	f, err := os.Open(filepath.Join(path, name))
+// 普通文件校验与打开失败清理由 filestream 负责；成功后交给 part 或 reader 持有。
+func openDownsamplePartDataFile(path, name string, dst *filestream.ReadAtCloser, size *uint64) error {
+	filePath := filepath.Join(path, name)
+	f, err := filestream.OpenReadAt(filePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("[downsampling] cannot open reader file %q: %w", filePath, err)
 	}
 	*dst = f
-	st, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	if !st.Mode().IsRegular() || st.Size() < 0 {
-		return fmt.Errorf("[downsampling] %s is not a regular file", name)
-	}
-	*size = uint64(st.Size())
+	*size = f.Size()
 	return nil
 }
 
@@ -336,21 +339,6 @@ func validateDownsamplePartIndexes(p *part) error {
 		return fmt.Errorf("[downsampling] payload is truncated or contains an unreferenced tail")
 	}
 	return nil
-}
-
-// 此适配器只为原有 part 生命周期提供 Must 接口，新 reader 使用可返回错误的 ReadAt。
-type downsamplePartFile struct{ f *os.File }
-
-func (f *downsamplePartFile) Path() string { return f.f.Name() }
-func (f *downsamplePartFile) MustReadAt(b []byte, off int64) {
-	if _, err := f.f.ReadAt(b, off); err != nil {
-		logger.Panicf("[downsampling] FATAL: cannot read %q: %s", f.f.Name(), err)
-	}
-}
-func (f *downsamplePartFile) MustClose() {
-	if err := f.f.Close(); err != nil {
-		logger.Panicf("[downsampling] FATAL: cannot close %q: %s", f.f.Name(), err)
-	}
 }
 
 // estimateDownsamplePartSize 估算整个目标 part 的编码上界，不假设源 part 已被删除。

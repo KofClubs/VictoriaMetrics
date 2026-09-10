@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/uint64set"
 	"io/fs"
 	"math"
@@ -540,7 +541,7 @@ func openDownsampleLayoutReaderFixture(t *testing.T, path string) *part {
 	}
 	p := &part{path: path, ph: metadata.partHeader, dsMetadata: metadata}
 	t.Cleanup(func() {
-		for _, f := range []*os.File{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
+		for _, f := range []filestream.ReadAtCloser{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
 			if f != nil {
 				if err := f.Close(); err != nil {
 					t.Error(err)
@@ -812,13 +813,13 @@ func assertDownsampleTestHeaderPrecision(t *testing.T, r *downsampleReader, want
 }
 
 type downsampleStateObserverWriter struct {
-	downsampleFileWriter
+	filestream.WriteCloser
 	observe func()
 }
 
 func (w *downsampleStateObserverWriter) Write(b []byte) (int, error) {
 	w.observe()
-	return w.downsampleFileWriter.Write(b)
+	return w.WriteCloser.Write(b)
 }
 
 func roundTripDownsampleTestReferenceBlock(t *testing.T, source *downsampleDecodedResolutionFeaturesBlock) *downsampleDecodedResolutionFeaturesBlock {
@@ -1188,31 +1189,51 @@ func assertDownsampleTestStorageRows(t *testing.T, s *Storage, want map[downsamp
 func newDownsampleCloseTestReader(t *testing.T) *downsampleReader {
 	t.Helper()
 	r := &downsampleReader{p: &part{}, ownFiles: true}
-	newFile := func() *os.File {
-		f, err := os.CreateTemp(t.TempDir(), "reader-")
+	dir := t.TempDir()
+	newFile := func(name string) filestream.ReadAtCloser {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("reader fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := filestream.OpenReadAt(path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = f.Close() })
-		return f
+		return &downsampleCloseTestFile{ReadAtCloser: f}
 	}
-	r.timestampsReader = newFile()
-	r.valuesReader = newFile()
-	r.indexReader = newFile()
+	r.timestampsReader = newFile(timestampsFilename)
+	r.valuesReader = newFile(valuesFilename)
+	r.indexReader = newFile(indexFilename)
 	return r
 }
 
-func assertDownsampleFilesClosed(t *testing.T, files []*os.File) {
+type downsampleCloseTestFile struct {
+	filestream.ReadAtCloser
+	closeErr error
+	closes   int
+}
+
+func (f *downsampleCloseTestFile) Close() error {
+	f.closes++
+	return errors.Join(f.ReadAtCloser.Close(), f.closeErr)
+}
+
+func assertDownsampleFilesClosed(t *testing.T, files []filestream.ReadAtCloser) {
 	t.Helper()
+	buf := make([]byte, 1)
 	for _, f := range files {
-		if _, err := f.Stat(); !errors.Is(err, os.ErrClosed) {
-			t.Fatalf("file %q remains open: %v", f.Name(), err)
+		if _, err := f.ReadAt(buf, 0); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("file %q remains open: %v", f.Path(), err)
+		}
+		if f, ok := f.(*downsampleCloseTestFile); ok && f.closes != 1 {
+			t.Fatalf("file %q closed %d times; want 1", f.Path(), f.closes)
 		}
 	}
 }
 
 type downsampleCloseTestWriter struct {
-	downsampleFileWriter
+	filestream.WriteCloser
 	beforeWrite func() error
 }
 
@@ -1220,7 +1241,7 @@ func (w *downsampleCloseTestWriter) Write(b []byte) (int, error) {
 	if err := w.beforeWrite(); err != nil {
 		return 0, err
 	}
-	return w.downsampleFileWriter.Write(b)
+	return w.WriteCloser.Write(b)
 }
 
 func sharedTimestampsTestBlock(tsid uint64, resolution, base int64, rows int, precision uint8) *downsampleDecodedResolutionFeaturesBlock {
@@ -1467,10 +1488,10 @@ func reportDownsampleBenchmarkRows(b *testing.B, rowsPerOperation uint64) {
 
 // Faults belong to this writer instance; no process-wide I/O hooks are changed.
 type failingDownsampleFile struct {
-	downsampleFileWriter
-	writeErr, closeErr, abortErr error
-	shortWrite                   bool
-	closes, aborts               int
+	filestream.WriteCloser
+	writeErr   error
+	shortWrite bool
+	closes     int
 }
 
 func (f *failingDownsampleFile) Write(b []byte) (int, error) {
@@ -1480,17 +1501,12 @@ func (f *failingDownsampleFile) Write(b []byte) (int, error) {
 	if f.shortWrite && len(b) > 0 {
 		return len(b) - 1, nil
 	}
-	return f.downsampleFileWriter.Write(b)
+	return f.WriteCloser.Write(b)
 }
 
-func (f *failingDownsampleFile) Close() error {
+func (f *failingDownsampleFile) MustClose() {
 	f.closes++
-	return errors.Join(f.downsampleFileWriter.Close(), f.closeErr)
-}
-
-func (f *failingDownsampleFile) Abort() error {
-	f.aborts++
-	return errors.Join(f.downsampleFileWriter.Abort(), f.abortErr)
+	f.WriteCloser.MustClose()
 }
 
 func assertDownsampleWriterAborted(t *testing.T, w *downsampleWriter, path string, cause error) {
@@ -1522,8 +1538,8 @@ func assertDownsampleWriterAborted(t *testing.T, w *downsampleWriter, path strin
 
 func trackDownsampleWriterFiles(w *downsampleWriter) []*failingDownsampleFile {
 	var files []*failingDownsampleFile
-	for _, slot := range []*downsampleFileWriter{&w.timestampsWriter, &w.valuesWriter, &w.indexWriter, &w.metaindexWriter} {
-		f := &failingDownsampleFile{downsampleFileWriter: *slot}
+	for _, slot := range []*filestream.WriteCloser{&w.timestampsWriter, &w.valuesWriter, &w.indexWriter, &w.metaindexWriter} {
+		f := &failingDownsampleFile{WriteCloser: *slot}
 		*slot = f
 		files = append(files, f)
 	}

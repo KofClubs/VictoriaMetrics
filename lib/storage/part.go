@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"os"
 	"path/filepath"
 	"sync"
 	"unsafe"
@@ -50,9 +49,9 @@ type part struct {
 	dsMetadata  *downsamplePartMetadata
 	dsMetaindex []downsampleMetaindexRow
 
-	dsTimestampsFile *os.File // timestamps.bin
-	dsValuesFile     *os.File // values.bin
-	dsIndexFile      *os.File // index.bin
+	dsTimestampsFile filestream.ReadAtCloser // timestamps.bin；part 持有，降采样 reader 借用。
+	dsValuesFile     filestream.ReadAtCloser // values.bin；所有权与 timestamps.bin 一致。
+	dsIndexFile      filestream.ReadAtCloser // index.bin；所有权与 timestamps.bin 一致。
 
 	dsTimestampsSize uint64
 	dsValuesSize     uint64

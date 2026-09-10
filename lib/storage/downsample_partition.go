@@ -361,7 +361,7 @@ func (pt *partition) mergeDownsampleParts(pws []*partWrapper, dstPartType partTy
 		defer func() {
 			if !published {
 				var cleanupErr error
-				for _, f := range []*os.File{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
+				for _, f := range []filestream.ReadAtCloser{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
 					if f != nil {
 						cleanupErr = errors.Join(cleanupErr, f.Close())
 					}
@@ -428,7 +428,7 @@ func (pt *partition) publishDownsampleParts(pws []*partWrapper, pwNew *partWrapp
 		return err
 	}
 	if err != nil {
-		err = fmt.Errorf("[downsampling] manifest for %q was published, but directory sync failed; keeping old source files: %w", pt.name, err)
+		err = fmt.Errorf("[downsampling] manifest for %q was published, but final synchronization or cleanup failed; keeping old source files: %w", pt.name, err)
 	}
 	for _, pw := range pws {
 		// rename 后目录同步失败时保留旧磁盘文件；内存源已由 fsync 完成的目标承载。
@@ -448,35 +448,26 @@ func (pt *partition) writeDownsamplePartNames(small, big []*partWrapper, stopCh 
 	if err != nil {
 		logger.Panicf("[downsampling] BUG: cannot marshal downsampling part names: %s", err)
 	}
-	// 与 parts.json 位于同一目录，支持 small/big 挂载于不同文件系统。
-	var f *filestream.Writer
-	var tmpPath string
-	for {
-		tmpPath = filepath.Join(pt.smallPartsPath, fmt.Sprintf("%s.tmp.%d", partsFilename, pt.nextMergeIdx()))
-		f, err = filestream.CreateExclusive(tmpPath, false)
-		if !os.IsExist(err) {
-			break
-		}
-	}
+	// 私有临时目录与 parts.json 位于同一文件系统，既支持 small/big 分别挂载，
+	// 也避免共享 MustCreate 覆盖其他作业或启动前遗留的暂存文件。
+	tmpDir, err := os.MkdirTemp(pt.smallPartsPath, partsFilename+".tmp.")
 	if err != nil {
-		return fmt.Errorf("[downsampling] cannot create temporary manifest %q: %w", tmpPath, err)
+		return fmt.Errorf("[downsampling] cannot create temporary manifest directory: %w", err)
 	}
 	defer func() {
-		if f != nil {
-			if closeErr := f.Abort(); closeErr != nil {
-				err = errors.Join(err, fmt.Errorf("[downsampling] cannot close temporary manifest %q: %w", tmpPath, closeErr))
-			}
-			f = nil
-		}
-		if tmpPath == "" {
-			return
-		}
-		if e := os.Remove(tmpPath); e != nil && !os.IsNotExist(e) {
-			err = errors.Join(err, fmt.Errorf("[downsampling] cannot remove unpublished manifest %q: %w", tmpPath, e))
+		if e := os.RemoveAll(tmpDir); e != nil {
+			err = errors.Join(err, fmt.Errorf("[downsampling] cannot remove temporary manifest directory %q: %w", tmpDir, e))
 			// 保留首次清理错误，并为短暂文件系统失败再尝试一次。
-			if retryErr := os.Remove(tmpPath); retryErr != nil && !os.IsNotExist(retryErr) {
-				err = errors.Join(err, fmt.Errorf("[downsampling] cannot remove unpublished manifest %q on retry: %w", tmpPath, retryErr))
+			if retryErr := os.RemoveAll(tmpDir); retryErr != nil {
+				err = errors.Join(err, fmt.Errorf("[downsampling] cannot remove temporary manifest directory %q on retry: %w", tmpDir, retryErr))
 			}
+		}
+	}()
+	tmpPath := filepath.Join(tmpDir, partsFilename)
+	var f filestream.WriteCloser = filestream.MustCreate(tmpPath, false)
+	defer func() {
+		if f != nil {
+			f.MustClose()
 		}
 	}()
 	if n, err := f.Write(data); err != nil {
@@ -484,11 +475,9 @@ func (pt *partition) writeDownsamplePartNames(small, big []*partWrapper, stopCh 
 	} else if n != len(data) {
 		return fmt.Errorf("[downsampling] cannot write temporary manifest %q: %w", tmpPath, io.ErrShortWrite)
 	}
-	closeErr := f.Close()
+	closedFile := f
 	f = nil
-	if closeErr != nil {
-		return fmt.Errorf("[downsampling] cannot close temporary manifest %q: %w", tmpPath, closeErr)
-	}
+	closedFile.MustClose()
 	if pt.downsampleTestHook != nil {
 		if err := pt.downsampleTestHook("before-commit", tmpPath); err != nil {
 			return err
@@ -502,15 +491,15 @@ func (pt *partition) writeDownsamplePartNames(small, big []*partWrapper, stopCh 
 	if err := os.Rename(tmpPath, filepath.Join(pt.smallPartsPath, partsFilename)); err != nil {
 		return fmt.Errorf("[downsampling] cannot commit temporary manifest %q: %w", tmpPath, err)
 	}
-	// rename 已消费临时路径，后续只同步已发布清单，不再清理该路径。
-	tmpPath = ""
+	// rename 是提交点；后续清理只涉及本次私有临时目录。
 	*published = true
 	if pt.downsampleTestHook != nil {
 		if err := pt.downsampleTestHook("sync-commit-dir", pt.smallPartsPath); err != nil {
 			return err
 		}
 	}
-	return syncDownsampleDir(pt.smallPartsPath)
+	fs.MustSyncPath(pt.smallPartsPath)
+	return nil
 }
 
 // filePartExpired 按两种目标区间保守清理磁盘源，原始 inmemory 使用原有判断。

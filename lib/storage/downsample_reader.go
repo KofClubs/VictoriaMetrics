@@ -3,43 +3,42 @@ package storage
 import (
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/chunkedbuffer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 )
 
 // downsampleReader 每次只解码一个 index block，按索引定位窗口而不载入全部 header。
 // 调用方必须在 reader 存活期间持有 part 引用；返回的 header 在下次迭代时失效。
 type downsampleReader struct {
-	p                *part       // 当前源，由调用方持有引用；切换源或 Close 时清除。
-	resolution       int64       // Init 指定的分辨率，同一源切换分辨率时重新定位索引。
-	timestampsReader *os.File    // timestamps.bin；raw 磁盘源自有，摘要源借用 part，inmemory 为 nil。
-	valuesReader     *os.File    // values.bin；所有权及生命周期与 timestampsReader 一致。
-	indexReader      *os.File    // index.bin；所有权及生命周期与 timestampsReader 一致。
-	timestampsSize   uint64      // 当前源时间戳文件或内存缓冲大小，用于每次读取的范围校验。
-	valuesSize       uint64      // 当前源值文件或内存缓冲大小，用于每次读取的范围校验。
-	indexSize        uint64      // 当前源索引文件或内存缓冲大小，用于每次读取的范围校验。
-	ownFiles         bool        // 仅 raw 磁盘源为 true；Close 只关闭自有文件。
-	filterTSID       TSID        // SetFilter 指定的 TSID，hasFilter 为 false 时不启用。
-	hasFilter        bool        // 当前是否按一个 TSID 筛选；SetFilter 重设。
-	minTimestamp     int64       // 当前过滤范围下界，只筛选相交 block，不裁剪其中样本。
-	maxTimestamp     int64       // 当前过滤范围上界，与 minTimestamp 一同由 SetFilter 重设。
-	metaPos          int         // 下一条待读取的 metaindex 位置，SetFilter 重新定位。
-	metaEnd          int         // 当前分辨率、特征的 metaindex 结束位置，不包含此位置。
-	indexPos         int         // indexData 中下一条 header 的字节偏移。
-	indexData        []byte      // 当前已解压的单个 index block，跨索引读取复用容量。
-	compressed       []byte      // 单个 index block 的压缩读取缓冲，Close 保留正常容量。
-	decompressed     []byte      // 单个时间戳或值 payload 的限长解压缓冲，不缓存整个文件。
-	block            Block       // 当前列的原生解码工作区；一次 ReadBlock 的五列共用其时间戳。
-	current          blockHeader // NextHeader 定位的 header，下次迭代或 SetFilter 时失效。
-	previous         blockHeader // 当前索引扫描中上一条 header，用于验证顺序。
-	feature          uint8       // 当前索引扫描的特征，由 Init 指定。
+	p                *part                   // 当前源，由调用方持有引用；切换源或 Close 时清除。
+	resolution       int64                   // Init 指定的分辨率，同一源切换分辨率时重新定位索引。
+	timestampsReader filestream.ReadAtCloser // timestamps.bin；raw 磁盘源自有，降采样源借用 part，inmemory 为 nil。
+	valuesReader     filestream.ReadAtCloser // values.bin；所有权及生命周期与 timestampsReader 一致。
+	indexReader      filestream.ReadAtCloser // index.bin；所有权及生命周期与 timestampsReader 一致。
+	timestampsSize   uint64                  // 当前源时间戳文件或内存缓冲大小，用于每次读取的范围校验。
+	valuesSize       uint64                  // 当前源值文件或内存缓冲大小，用于每次读取的范围校验。
+	indexSize        uint64                  // 当前源索引文件或内存缓冲大小，用于每次读取的范围校验。
+	ownFiles         bool                    // 仅 raw 磁盘源为 true；Close 只关闭自有文件。
+	filterTSID       TSID                    // SetFilter 指定的 TSID，hasFilter 为 false 时不启用。
+	hasFilter        bool                    // 当前是否按一个 TSID 筛选；SetFilter 重设。
+	minTimestamp     int64                   // 当前过滤范围下界，只筛选相交 block，不裁剪其中样本。
+	maxTimestamp     int64                   // 当前过滤范围上界，与 minTimestamp 一同由 SetFilter 重设。
+	metaPos          int                     // 下一条待读取的 metaindex 位置，SetFilter 重新定位。
+	metaEnd          int                     // 当前分辨率、特征的 metaindex 结束位置，不包含此位置。
+	indexPos         int                     // indexData 中下一条 header 的字节偏移。
+	indexData        []byte                  // 当前已解压的单个 index block，跨索引读取复用容量。
+	compressed       []byte                  // 单个 index block 的压缩读取缓冲，Close 保留正常容量。
+	decompressed     []byte                  // 单个时间戳或值 payload 的限长解压缓冲，不缓存整个文件。
+	block            Block                   // 当前列的原生解码工作区；一次 ReadBlock 的五列共用其时间戳。
+	current          blockHeader             // NextHeader 定位的 header，下次迭代或 SetFilter 时失效。
+	previous         blockHeader             // 当前索引扫描中上一条 header，用于验证顺序。
+	feature          uint8                   // 当前索引扫描的特征，由 Init 指定。
 
 	peers [countOfDownsampleFeatures]*downsampleReader // 其它特征的索引游标；按需借用，SetFilter/Close 归还。
 
@@ -84,13 +83,13 @@ func (r *downsampleReader) Init(p *part, resolution int64, features ...uint8) (e
 		r.indexReader, r.indexSize = p.dsIndexFile, p.dsIndexSize
 	} else if p.path != "" {
 		r.ownFiles = true
-		if err := openDownsampleReaderFile(filepath.Join(p.path, timestampsFilename), &r.timestampsReader, &r.timestampsSize); err != nil {
+		if err := openDownsamplePartDataFile(p.path, timestampsFilename, &r.timestampsReader, &r.timestampsSize); err != nil {
 			return err
 		}
-		if err := openDownsampleReaderFile(filepath.Join(p.path, valuesFilename), &r.valuesReader, &r.valuesSize); err != nil {
+		if err := openDownsamplePartDataFile(p.path, valuesFilename, &r.valuesReader, &r.valuesSize); err != nil {
 			return err
 		}
-		if err := openDownsampleReaderFile(filepath.Join(p.path, indexFilename), &r.indexReader, &r.indexSize); err != nil {
+		if err := openDownsamplePartDataFile(p.path, indexFilename, &r.indexReader, &r.indexSize); err != nil {
 			return err
 		}
 	} else {
@@ -114,10 +113,10 @@ func (r *downsampleReader) Init(p *part, resolution int64, features ...uint8) (e
 func (r *downsampleReader) Close() error {
 	closeErr := r.closePeers()
 	if r.ownFiles {
-		for _, f := range []*os.File{r.timestampsReader, r.valuesReader, r.indexReader} {
+		for _, f := range []filestream.ReadAtCloser{r.timestampsReader, r.valuesReader, r.indexReader} {
 			if f != nil {
 				if err := f.Close(); err != nil {
-					closeErr = errors.Join(closeErr, fmt.Errorf("[downsampling] cannot close reader file %q: %w", f.Name(), err))
+					closeErr = errors.Join(closeErr, fmt.Errorf("[downsampling] cannot close reader file %q: %w", f.Path(), err))
 				}
 			}
 		}
@@ -323,21 +322,6 @@ func (r *downsampleReader) ReadBlock(b *downsampleDecodedResolutionFeaturesBlock
 
 func (r *downsampleReader) Error() error {
 	return r.err
-}
-
-// 文件一经打开即交给调用方持有，即使 Stat 失败也由 reader.Close 统一关闭。
-func openDownsampleReaderFile(path string, dst **os.File, size *uint64) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("[downsampling] cannot open reader file %q: %w", path, err)
-	}
-	*dst = f
-	st, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("[downsampling] cannot stat reader file %q: %w", path, err)
-	}
-	*size = uint64(st.Size())
-	return nil
 }
 
 func downsampleInmemoryReaderSize(f fs.MustReadAtCloser) (uint64, error) {
@@ -610,7 +594,7 @@ func checkDownsampleExtent(offset uint64, size uint32, fileSize uint64) error {
 	return nil
 }
 
-func (r *downsampleReader) readAt(dst []byte, reader *os.File, inmemorySource fs.MustReadAtCloser, fileSize, off uint64, size uint32) ([]byte, error) {
+func (r *downsampleReader) readAt(dst []byte, reader filestream.ReadAtCloser, inmemorySource fs.MustReadAtCloser, fileSize, off uint64, size uint32) ([]byte, error) {
 	if err := checkDownsampleExtent(off, size, fileSize); err != nil {
 		return dst, err
 	}
@@ -624,7 +608,7 @@ func (r *downsampleReader) readAt(dst []byte, reader *os.File, inmemorySource fs
 	}
 	if reader != nil {
 		if _, err := reader.ReadAt(dst, int64(off)); err != nil {
-			return dst, fmt.Errorf("[downsampling] cannot read %d bytes at offset %d from %q: %w", size, off, reader.Name(), err)
+			return dst, fmt.Errorf("[downsampling] cannot read %d bytes at offset %d from %q: %w", size, off, reader.Path(), err)
 		}
 		return dst, nil
 	}

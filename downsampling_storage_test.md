@@ -19,7 +19,7 @@ go test -p 4 ./lib/vmselectapi ./app/vmstorage ./app/vmselect/netstorage ./app/v
 python3 -B -E -W error::ResourceWarning -m unittest discover -s lib/storage/testdata -p 'test_downsampling_*.py' -v
 
 # 降采样及相关 I/O 的并发与静态检查
-DISABLE_FSYNC_FOR_TESTING=false go test -race ./lib/filestream ./lib/storage -run '^Test(Spill|Writer|Downsample|Downsampling|CheckDownsampling|MustOpenStorageDownsampling|EstimateDownsample|ReserveDownsample|Block)' -count=1 -timeout=5m
+DISABLE_FSYNC_FOR_TESTING=false go test -race ./lib/filestream ./lib/storage -run '^Test(Spill|ReaderAt|Downsample|Downsampling|CheckDownsampling|MustOpenStorageDownsampling|EstimateDownsample|ReserveDownsample|Block)' -count=1 -timeout=5m
 go vet ./lib/filestream ./lib/storage
 ```
 
@@ -33,7 +33,7 @@ Go 单元测试、race 和 vet 均以退出码 0 为通过条件；Python 单元
 
 ## storage 单元测试
 
-降采样生产代码分为 8 个文件；测试文件均位于 `lib/storage`，使用 `package storage`，按生产文件归类为 8 个同名 `_test.go`，另有 `downsample_supplement_test.go`。这 9 个文件共包含 95 个顶层测试和 4 个基准测试。测试使用独立的原始输入参考值或原生编码器校验结果；实际文件布局另有按固定字节偏移解析的检查。
+降采样生产代码分为 8 个文件；测试文件均位于 `lib/storage`，使用 `package storage`，按生产文件归类为 8 个同名 `_test.go`，另有 `downsample_supplement_test.go`。这 9 个文件共包含 96 个顶层测试和 4 个基准测试。测试使用独立的原始输入参考值或原生编码器校验结果；实际文件布局另有按固定字节偏移解析的检查。
 
 ### 样本与解码 block
 
@@ -93,7 +93,7 @@ Go 单元测试、race 和 vet 均以退出码 0 为通过条件；Python 单元
 | `TestDownsampleLayoutIndexTenantCorruption` | 打开 part 及逐 header 读取均拒绝 index 内混入其他租户。 |
 | `TestDownsampleReaderDuplicateBatchKey` | 拒绝降采样 block 的重复键，包括跨 index 边界的重复。 |
 | `TestDownsampleReaderRawDuplicateBoundaryAllowed` | 允许原始 block 具有相同时间边界，并完整读取各自的样本。 |
-| `TestDownsampleReaderCloseOwnFiles` | 释放 reader 及特征 reader 自行打开的全部文件，合并返回真实关闭错误；重复 Close 不再关闭文件。 |
+| `TestDownsampleReaderCloseOwnFiles` | 通过测试 reader 注入关闭错误，验证释放 reader 及特征 reader 自行打开的全部文件并保留错误；重复 Close 不再关闭文件。 |
 | `TestDownsampleReaderCloseBorrowedFiles` | 归还特征 reader 并清除引用，但不关闭借用的降采样 part 文件。 |
 | `TestDownsampleReaderSetFilterReleasesPeers` | 切换过滤条件时归还全部特征 reader，保留父 reader 文件；关闭失败可见，后续过滤和关闭不重复归还。 |
 | `TestDownsampleReaderInitFailureReleasesPartialSource` | 新源初始化中途失败时释放已打开的文件，清除状态后可重新初始化。 |
@@ -111,15 +111,15 @@ Go 单元测试、race 和 vet 均以退出码 0 为通过条件；Python 单元
 | `TestDownsampleWriterOrderAbort` | 拒绝分辨率逆序写入；Abort 删除目标目录。 |
 | `TestDownsampleWriterExistingDirectory` | 拒绝已有目录，随后 Abort 不删除该目录中原有文件。 |
 | `TestDownsampleWriterBufferCapacity` | writer 的整数、单列浮点值和时间戳缓冲在 reset 后清空内容、保留正常容量，并释放异常容量。 |
-| `TestDownsampleNativeBlockReuse` | 各特征使用原生 Block 编解码；8/64 精度、共享时间戳、查询 BlockRef 读取和编码状态一致。 |
+| `TestDownsampleNativeBlockReuse` | 各特征使用原生 Block 编解码；8/64 精度、共享时间戳、查询 BlockRef 读取和编码状态一致。小数据不创建 spill 临时文件，完成后只留下五个最终文件。 |
 | `TestDownsampleFilePhysicalLayout` | 独立按 89 字节 header、113 字节 metaindex 解析真实文件；四个子场景为多 block/分辨率、738 批次跨 index、租户切 row、零负载列。检查列顺序、共享时间戳、连续偏移、文件完整覆盖及统计。 |
 | `TestEstimateDownsampleOutputSize` | 用独立布局公式核验共享时间列、五特征、索引、spill 和 metadata 的空间预算，以及每行和每批次的增量。 |
 | `TestDownsampleSpaceEstimateOverflow` | 用大整数参考检查空间估算、加法和乘法的饱和边界，避免回绕或提前饱和。 |
 | `TestDownsampleSpaceBoundCoversEncodedParts` | 实测最终文件与 spill 的保守峰值包络不超过预算；覆盖满 block、单行多 TSID 和频繁 index 切换。 |
 | `TestDownsampleAvailableSpaceBoundaries` | 检查安全余量、已预留空间和请求量的边界与溢出；拒绝非法写入行数，并保留空间不足错误标记。 |
-| `TestDownsampleWriterFinalFileFailures` | 四个最终二进制文件分别注入写错误、短写、关闭及 Abort 错误；原错误不丢失、每个句柄只释放一次、整个未发布目录删除。 |
-| `TestDownsampleWriterSpillAndValidationFailures` | spill 创建失败、截断 header、metadata 创建失败、后续输入无效；失败后禁止发布，清理后同一 writer 可重新初始化。 |
-| `TestDownsampleWriterFinalFilePermissions` | 最终文件权限与同进程 filestream 创建的文件一致。 |
+| `TestDownsampleWriterFinalFileFailures` | 四个最终二进制文件分别注入接口返回的写错误及短写；原错误不丢失、每个句柄只释放一次、整个未发布目录删除。 |
+| `TestDownsampleWriterSpillAndValidationFailures` | 截断 header、后续输入无效；失败后禁止发布，清理后同一 writer 可重新初始化。 |
+| `TestDownsampleWriterFinalFilePermissions` | 最终文件权限与同进程使用 `os.WriteFile(..., 0666)` 创建的参考文件一致。 |
 | `TestDownsampleWriterAbortRetriesOnlyDirectory` | 目录连续删除失败后只重试目录，已释放文件和 spill 不再关闭；保留首次写入错误及各次清理错误，清理完成后可复用 writer。 |
 | `TestDownsampleWriterFinishedTargetOwnership` | Finish 完成后保留目标，重新初始化及归还对象池不重复关闭或删除已完成文件；显式 Abort 可删除当前未发布目标。 |
 | `TestDownsampleWriterPoolKeepsPendingCleanup` | 归还 writer 时若目录仍无法删除，保留路径和错误，不将对象放回池中。 |
@@ -153,10 +153,11 @@ Go 单元测试、race 和 vet 均以退出码 0 为通过条件；Python 单元
 | 测试 | 验证内容 |
 |---|---|
 | `TestDownsampleFailureBeforePublication` | 取消、提交前取消、打开目标前注入错误、目标无效、提交前注入错误均保留源和原清单，清除未发布目标。 |
+| `TestDownsampleManifestTemporaryFileCollision` | 临时清单使用独占子目录，保留已有暂存内容；成功发布或取消后均清理本次子目录，取消时原清单保持不变。 |
 | `TestDownsampleFailureSchedulers`、`TestDownsampleFailureStopsRemainingBatches` | 各调度入口收到 I/O 错误或取消后退出，停止继续调度剩余批次。 |
 | `TestDownsampleFailureFinalFlushPreservesRaw`、`TestDownsampleFailureFinalLifecycle` | 最终刷盘失败时，改以原始格式持久化数据；关闭存储和创建快照的过程中不丢数据。 |
-| `TestDownsampleFailureAfterPublication` | 提交后目录同步失败时，新目标与活动清单保持一致，旧磁盘源仍保留；不把已提交目标当作未发布结果删除。 |
-| `TestDownsampleFailureFinalSyncAfterPublication` | 提交同步失败后，最终刷盘仍再次同步目录；已发布的降采样目标不会被回退流程生成的原始文件覆盖。 |
+| `TestDownsampleFailureAfterPublication` | 在提交后的同步测试钩子注入错误，新目标与活动清单保持一致，旧磁盘源仍保留；不把已提交目标当作未发布结果删除。 |
+| `TestDownsampleFailureFinalSyncAfterPublication` | 在提交同步测试钩子注入错误后，最终刷盘仍再次同步目录；已发布的降采样目标不会被回退流程生成的原始文件覆盖。 |
 | `TestCheckDownsamplingOpen` | 活动清单与格式检查；覆盖空目录、原始与降采样 part 混合、快照与临时目录、部分删除、缺失 part 和损坏 metadata。 |
 | `TestCheckDownsamplingOpenInvalidManifests` | 拒绝非法 JSON、未知或重复字段、重复 part、非法名称、路径和尾部数据。 |
 | `TestMustOpenStorageDownsamplingRejectsDedup`、`TestMustOpenStorageDownsamplingRejectsDisabledModeBeforeBackgroundWork` | 拒绝降采样与非零 dedup 同时启用；未启用降采样却存在活动降采样 part 时，在后台任务启动前失败。 |
@@ -166,7 +167,7 @@ Go 单元测试、race 和 vet 均以退出码 0 为通过条件；Python 单元
 | `TestDownsamplePartitionFilePartExpired` | 启用降采样时，原始 part 与降采样 part 均按最粗分辨率区间的右端点判定过期；关闭降采样后保留原始格式的过期边界。 |
 | `TestDownsamplePartitionFileOutput` | 单个内存 part 首次落盘及多个内存 part 合并落盘，均通过正常分区入口生成单个降采样 part，结果与原始输入参考一致。 |
 | `TestDownsampleRecoveryKeepsCommittedTargetAfterPanic` | 清单提交后在旧源回收处注入 panic；已提交目标仍可独立打开，存储重新打开后数据不变。 |
-| `TestDownsampleRecoveryDiscardsUnpublishedPart` | 再打开时丢弃未被活动清单引用的残缺 part。 |
+| `TestDownsampleRecoveryDiscardsUnpublishedPart` | 再打开时清理未被活动清单引用的残缺 part 和临时清单目录，保留原活动清单与数据。 |
 | `TestReserveDownsampleSpaceConcurrentAndCachedFreeSpace` | 同一文件系统并发预留不超额；释放幂等，已释放预算须等空闲空间缓存更新后才能重用。 |
 
 ### 字段查询与集群协议
@@ -208,23 +209,24 @@ storage 全量回归还会运行原始存储链路的已有测试，包括 `bloc
 
 ## filestream 单元测试
 
-`go-io-ut` 实际运行 `go test -p 4 ./lib/filestream -count=1`，包含该包全部测试。返回错误的读写与关闭行为由以下用例验证，不依赖 `lib/fs` 的测试筛选。
+`go-io-ut` 实际运行 `go test -p 4 ./lib/filestream -count=1`，包含该包全部测试。新增组件的错误处理由 spill 和偏移 reader 用例验证；最终文件创建、关闭及目录同步继续采用共享 Must 语义，不属于降采样可恢复错误测试。
 
 | 文件及测试 | 验证内容 |
 |---|---|
-| [spill_test.go](lib/filestream/spill_test.go)：`TestSpillWriterRoundTrip`、`TestSpillWriterLazyCreationAndDiscard` | 完整读写、延迟创建文件，以及未消费内容的丢弃。 |
+| [spill_writer_test.go](lib/filestream/spill_writer_test.go)：`TestSpillWriterRoundTrip`、`TestSpillWriterLazyCreationAndDiscard` | 纯内存和混合存储的完整读写；恰好达到阈值时不创建文件，多次落盘只用同一个文件，尾部保持内存；小数据不依赖临时目录存在。 |
+| 同文件：`TestSpillWriterMetrics` | 缓冲与实际 I/O 分别计数，读写实例计数在资源释放后恢复。 |
 | 同文件：`TestSpillWriterPermissions`、`TestSpillWriterCreateFailure` | 权限与同进程创建的文件一致，创建失败返回原错误。 |
-| 同文件：`TestSpillWriterWriteFailures`、`TestSpillWriterFlushAndSeekFailures` | 写错误、短写、缓冲刷出及定位失败的错误传播与清理。 |
+| 同文件：`TestSpillWriterWriteFailures`、`TestSpillWriterLaterDumpFailure`、`TestSpillWriterSeekFailures` | 满块写出时的错误、短写及后续满块失败，返回的已接收字节数与实际落盘字节数分别核验；文件长度查询及回到起点失败的错误传播与清理。 |
 | 同文件：`TestSpillWriterReadFailures`、`TestSpillWriterConsumerFailures` | 读错误、截断、无进展、回调错误、消费不完整均不能当作成功。 |
 | 同文件：`TestSpillWriterExactReadAndSealedCallback` | 精确消费全部字节可通过；消费回调期间拒绝再次写入或嵌套调用 ReadAll。 |
 | 同文件：`TestSpillWriterCleanupRetry`、`TestSpillWriterCloseErrorStillRemoves`、`TestSpillWriterWriteErrorCleanupRetry` | 删除失败可重试；关闭失败仍尝试删除；写失败后的清理重试保留原错误。 |
-| 同文件：`TestSpillWriterBoundedBuffers`、`TestSpillWriterIndependentInstances` | 读写缓冲大小有界，多个实例的文件和状态彼此独立。 |
-| [writer_error_test.go](lib/filestream/writer_error_test.go)：`TestWriterCreateAndCreateExclusive` | 普通创建可截断已有文件，独占创建拒绝覆盖；创建失败时返回错误，权限与同进程 `os.Create` 一致。 |
-| 同文件：`TestWriterCloseReleasesAfterFailures`、`TestWriterClosePreservesFailedWrite` | 缓冲刷出、短写、同步或关闭失败后仍释放句柄；首次写错误持续返回，禁止重试写入。 |
-| 同文件：`TestWriterAbortDiscardsBufferedData` | Abort 不刷出或同步缓冲，但仍关闭句柄并保留关闭错误；文件路径及已有文件由调用方管理。 |
-| 同文件：`TestWriterCloseRealReadOnlyFileFailure` | 真实只读句柄的缓冲刷出失败，原文件内容保持不变，句柄仍关闭。 |
-| 同文件：`TestWriterSyncFailureWithFsyncEnabled` | 开启 fsync 的关闭路径传播注入的同步错误并释放句柄；当前进程禁用 fsync 时，另起子进程验证。 |
-| 同文件：`TestWriterMustFlushAndMustCloseSuccess` | MustFlush、MustClose 正常刷出内容，重复关闭可完成。 |
+| 同文件：`TestSpillWriterBoundedBuffers`、`TestSpillWriterIndependentInstances` | 内存缓冲按需增长，容量不超过生产阈值；单次超大输入按块处理；多个实例的文件和状态彼此独立。 |
+| 同文件：`TestSpillWriterInputDoesNotAlias`、`TestSpillWriterCloseDiscardsMemoryTail` | 写入后修改输入不影响已接收数据；关闭时丢弃内存尾部并删除已落盘前缀，不为销毁而追加写文件。 |
+| 同文件：`TestSpillWriterFileExtentValidation`、`TestSpillWriterTruncatedPrefixCannotUseMemoryTail` | 拒绝文件前缀截断或多余字节；即使读取途中发生截断，也不能用内存尾部补齐缺失的文件数据。 |
+| [reader_at_test.go](lib/filestream/reader_at_test.go)：`TestReaderAtOffsetsAndCursor`、`TestReaderAtConcurrentReads` | 乱序偏移读取互不影响，不改变顺序游标；多个 goroutine 读取同一文件的不同区域。 |
+| 同文件：`TestReaderAtTruncatedFile`、`TestReaderAtReadFailuresAndCounts` | 截断、EOF、读取错误、短读及非法计数；实际 I/O 计数准确，错误后可再次读取其他偏移。 |
+| 同文件：`TestReaderAtOpenFailures`、`TestReaderAtRejectedFileCleanup` | 不存在的文件、目录、Stat 失败及无效大小；初始化失败关闭句柄，保留原始错误和清理错误。 |
+| 同文件：`TestReaderAtInvalidOffsets`、`TestReaderAtCloseOnce` | 拒绝负偏移和范围溢出；关闭只执行一次，保留关闭错误，关闭后读取返回 ErrClosed。 |
 | [filestream_test.go](lib/filestream/filestream_test.go)：`TestWriteRead` | 完整文件写入、顺序读取和内容往返。 |
 
 ## 性能测试
@@ -241,6 +243,16 @@ go test ./lib/storage -run '^$' -bench '^BenchmarkDownsample' -benchmem -count=1
 | [downsample_merger_test.go](lib/storage/downsample_merger_test.go)：`BenchmarkDownsampleMerge` | `Dense`、`Sparse`、`HighCardinality` 三种负载；分别测量原始源合并、多个降采样源合并，以及已合并降采样 part 的重写成本。子模式名为 `Raw`、`Summary`、`SummaryRewrite`。 |
 | [downsample_reader_test.go](lib/storage/downsample_reader_test.go)：`BenchmarkDownsampleFileRead` | 三种负载下遍历两个分辨率并解码全部特征的成本。 |
 | [downsample_writer_test.go](lib/storage/downsample_writer_test.go)：`BenchmarkDownsampleFileWrite` | 样本直接进入 writer 后的编码、写文件和同步关闭成本；测试数据转置、目录统计和删除不计时。 |
+
+SpillWriter 单独测量纯内存和超阈值落盘两条路径：
+
+```sh
+go test ./lib/filestream -run '^$' -bench '^BenchmarkSpillWriter' -benchmem -count=1
+```
+
+| 文件及 Benchmark | 衡量内容 |
+|---|---|
+| [spill_writer_test.go](lib/filestream/spill_writer_test.go)：`BenchmarkSpillWriter/Memory`、`/Spilled` | 分别写入并完整读回 1 MiB 和 17 MiB；测量内存复制、按需落盘、流式读取及资源清理的耗时和分配。输入在计时前准备，消费端直接丢弃读出数据。 |
 
 结果包含 Go 的耗时、分配数和内存指标，以及测试自行报告的行吞吐、行数或文件字节指标。Benchmark 没有固定性能通过阈值；比较改动时应使用同一机器、Go 版本和参数，功能正确性仍由单元测试判定。
 
