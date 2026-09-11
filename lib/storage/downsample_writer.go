@@ -373,7 +373,7 @@ func (w *downsampleWriter) writeSamplesBlock(tsid *TSID, resolution int64, sampl
 			return err
 		}
 		if w.spills[i] == nil {
-			w.spills[i] = filestream.NewSpillWriter(w.path)
+			w.spills[i] = filestream.NewSpillWriter(w.path, downsampleFeatureNames[i])
 		}
 		fb := &w.blocks[i]
 		if err := writeDownsampleData(w.spills[i], fb.headerData); err != nil {
@@ -424,7 +424,7 @@ func (w *downsampleWriter) flushResolution() error {
 	header := make([]byte, marshaledBlockHeaderSize)
 	var expectedBlocks, expectedRows uint64
 	for feature, f := range w.spills {
-		err := f.ReadAll(func(r io.Reader) error {
+		err := f.Read(func(r io.Reader) error {
 			var previous blockHeader
 			var blocks, rows uint64
 			for {
@@ -486,11 +486,21 @@ func (w *downsampleWriter) flushResolution() error {
 			}
 			return w.flushIndex()
 		})
-		// ReadAll 已释放文件句柄。残留临时文件仍由目标目录的 Abort 清理，不能再次消费此 spill。
-		w.spills[feature] = nil
 		if err != nil {
+			// Read 是只读操作；失败后仍须显式 Close 释放本 spill，其余未消费的
+			// spill 由后续 Abort 兜底清理。
+			if closeErr := f.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("[downsampling] cannot close feature %d spill: %w", feature, closeErr))
+			}
+			w.spills[feature] = nil
 			return fmt.Errorf("[downsampling] cannot consume feature %d spill: %w", feature, err)
 		}
+		// Read 是只读操作，不关闭句柄也不删除文件；Close 是最后显式调用，负责
+		// 释放内存、关闭文件并删除临时文件。残留文件仍由目标目录的 Abort 兜底。
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("[downsampling] cannot close feature %d spill: %w", feature, err)
+		}
+		w.spills[feature] = nil
 	}
 	return nil
 }

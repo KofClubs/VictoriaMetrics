@@ -11,30 +11,42 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 )
 
 // spillMaxMemorySize bounds each spill's in-memory tail. A downsampling writer
-// can hold five spills at once, so their buffers can occupy up to 80 MiB per job.
-// Buffers grow on demand and are released on Close, without a large-buffer pool.
-const spillMaxMemorySize = 16 * 1024 * 1024
+// can hold five spills at once, so their buffers can occupy up to 5× this value
+// per job. Buffers grow on demand and are released on Close, without a
+// large-buffer pool. It is tunable at runtime via -downsampling.spillMaxMemorySize;
+// raising it reduces write syscalls but multiplies peak memory by the merge
+// concurrency, which reaches up to max(4, CPU cores).
+var spillMaxMemorySize = flagutil.NewBytes("downsampling.spillMaxMemorySize", 16*1024*1024,
+	"The maximum number of bytes to buffer in memory per downsampling spill before overflowing to a temporary file. "+
+		"A downsampling merge holds five spills (last, sum, count, min, max) at once and up to max(4, CPU cores) merges run concurrently, "+
+		"so peak memory scales as concurrency × 5 × this value. Larger values reduce write syscalls but increase memory usage")
 
 // SpillWriter keeps a byte stream in memory until it exceeds spillMaxMemorySize.
 // Each full buffer is then appended to one lazily created temporary file; the
-// final tail remains in memory. It owns and removes the file and private directory.
+// final tail remains in memory. It owns and removes that file.
 //
-// Write may be called repeatedly, followed by a single ReadAll. Close discards
-// any unread data. Errors and ReadAll seal the writer against further writes.
-// SpillWriter is not safe for concurrent use.
+// Write appends data, transparently spilling full buffers to disk. Read drains
+// the whole stream (file prefix followed by the memory tail) as a read-only
+// view; it neither seals the writer nor closes or removes the file. Close
+// releases memory, closes the file, and removes the temporary file, and must be
+// called explicitly after Read. A failed Write seals the writer and attempts
+// cleanup immediately. SpillWriter is not safe for concurrent use.
 type SpillWriter struct {
-	dir      string
-	tempDir  string
-	path     string
-	f        spillFile
-	memory   []byte // Pending tail; capacity never exceeds the memory threshold.
-	fileSize uint64 // Bytes appended to the temporary file, preceding memory.
-	size     uint64 // All accepted bytes, including memory; preserved after Close.
-	state    spillState
-	err      error
+	path          string
+	f             spillFile
+	memory        []byte // Pending tail; capacity never exceeds the memory threshold.
+	fileSize      uint64 // Bytes appended to the temporary file, preceding memory.
+	size          uint64 // All accepted bytes, including memory; preserved after Close.
+	state         spillState
+	closed        bool // Sealed by Close (or a failed Write); further operations fail.
+	created       bool // The temporary file exists and still needs removal.
+	writerCounted bool // The open file currently accounts for an active writer.
+	err           error
 
 	// A positive value lets instance-level tests exercise spilling with small data.
 	// Production leaves this zero and always uses spillMaxMemorySize.
@@ -44,6 +56,14 @@ type SpillWriter struct {
 	remove func(string) error
 }
 
+// spillFile 是 SpillWriter 持有文件的抽象，组合读、写、定位、关闭四个标准接口：
+//   - io.Writer：dump 溢出数据时写入磁盘；
+//   - io.Reader：Read 时读回文件前缀；
+//   - io.Seeker：Read 时校验文件大小并回卷；
+//   - io.Closer：Close 时关闭文件描述符。
+//
+// 用接口而非 *os.File，是为了让生产环境的真实文件与测试注入的
+// spillFaultFile（可模拟写/读/seek/close 失败）互相替换，从而覆盖磁盘 I/O 故障路径。
 type spillFile interface {
 	io.Reader
 	io.Writer
@@ -54,18 +74,18 @@ type spillFile interface {
 type spillState uint8
 
 const (
-	spillWriting spillState = iota
-	spillReading
-	spillClosed
+	spillMemory spillState = iota // All accepted bytes are still in memory; no file yet.
+	spillDisk                     // Part of the stream has been written to the temporary file.
 )
 
-// NewSpillWriter returns a writer which only creates a temporary file under dir
-// when its in-memory data exceeds spillMaxMemorySize. An empty dir uses the OS
-// temporary directory. ReadAll consumes an in-memory tail without writing it out.
-// The caller must eventually call ReadAll or Close, including on failure.
-func NewSpillWriter(dir string) *SpillWriter {
+// NewSpillWriter returns a writer which creates its temporary file directly
+// under dir when its in-memory data exceeds spillMaxMemorySize. dir must already
+// exist. name identifies this spill within dir, so each spill in a directory
+// must use a distinct name; it also documents the spill's purpose in the filename.
+// The caller must eventually call Close, including on failure.
+func NewSpillWriter(dir, name string) *SpillWriter {
 	return &SpillWriter{
-		dir:    dir,
+		path:   filepath.Join(dir, ".spill-"+name),
 		remove: os.Remove,
 	}
 }
@@ -73,7 +93,7 @@ func NewSpillWriter(dir string) *SpillWriter {
 // Write appends p to the spill. Size includes bytes accepted into its buffer.
 // A failed Write seals the writer and immediately attempts to delete its files.
 func (w *SpillWriter) Write(p []byte) (n int, err error) {
-	if w.state != spillWriting {
+	if w.closed {
 		return 0, w.stateError()
 	}
 	if len(p) == 0 {
@@ -86,7 +106,7 @@ func (w *SpillWriter) Write(p []byte) (n int, err error) {
 	defer func() { writtenBytesBuffered.Add(n) }()
 	limit := w.memoryLimit
 	if limit <= 0 {
-		limit = spillMaxMemorySize
+		limit = spillMaxMemorySize.IntN()
 	}
 	for len(p) > 0 {
 		// Keep exactly one threshold in memory until another byte arrives.
@@ -128,23 +148,22 @@ func (w *SpillWriter) dump() error {
 		return fmt.Errorf("cannot write spill file: %w", err)
 	}
 	w.memory = w.memory[:0]
+	w.state = spillDisk
 	return nil
 }
 
 func (w *SpillWriter) create() error {
-	dir, err := os.MkdirTemp(w.dir, ".spill-")
-	if err != nil {
-		return fmt.Errorf("cannot create spill directory in %q: %w", w.dir, err)
-	}
-	w.tempDir = dir
-	w.path = filepath.Join(dir, "data")
+	// The filename is derived from the caller-supplied name and is fixed at
+	// construction time.
 	// Unlike os.CreateTemp's 0600, these permissions match os.Create used by
-	// filestream.MustCreate. The private 0700 directory prevents external access.
+	// filestream.MustCreate.
 	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
 	if err != nil {
-		return fmt.Errorf("cannot create spill file: %w", err)
+		return fmt.Errorf("cannot create spill file %q: %w", w.path, err)
 	}
 	w.f = f
+	w.created = true
+	w.writerCounted = true
 	writersCount.Inc()
 	return nil
 }
@@ -155,36 +174,25 @@ func (w *SpillWriter) Size() uint64 {
 	return w.size
 }
 
-// ReadAll streams the file prefix followed by the in-memory tail, without
-// dumping the tail. The reader must consume exactly Size bytes and is only valid
-// during consume. Reading to EOF is allowed; consuming fewer bytes is an error.
+// Read streams the file prefix followed by the in-memory tail, without dumping
+// the tail. The reader must consume exactly Size bytes and is only valid during
+// consume. Reading to EOF is allowed; consuming fewer bytes is an error.
 //
-// ReadAll may be called only once. It always closes and removes the spill,
-// including if seeking, reading, or consume fails. Cleanup errors are returned;
-// Close can be called again to retry failed removal. Temporary files are never
-// synced to storage.
-func (w *SpillWriter) ReadAll(consume func(io.Reader) error) (err error) {
-	if w.state != spillWriting {
+// Read is a read-only operation: it never mutates memory or files, never closes
+// or removes the spill, and never seals the writer. The caller must call Close
+// afterward as the final step; Close releases memory, closes the file, and
+// removes the temporary file. Temporary files are never synced to storage.
+func (w *SpillWriter) Read(consume func(io.Reader) error) (err error) {
+	if w.closed {
 		return w.stateError()
 	}
-	w.state = spillReading
-	if w.f != nil {
-		writersCount.Dec()
-	}
-	defer func() {
-		err = w.finish(err)
-	}()
 	if consume == nil {
 		return fmt.Errorf("nil spill consumer")
 	}
 
-	var source *spillReadSource
-	r := &spillReader{
-		owner:  w,
-		r:      bytes.NewReader(w.memory),
-		active: true,
-	}
-	if w.f != nil {
+	var source *spillFileReader
+	cr := &countingReader{r: bytes.NewReader(w.memory)}
+	if w.state == spillDisk {
 		// Check the complete file prefix independently of the memory tail.
 		// A truncated prefix must not be silently filled by bytes from the tail.
 		fileSize, err := w.f.Seek(0, io.SeekEnd)
@@ -204,45 +212,41 @@ func (w *SpillWriter) ReadAll(consume func(io.Reader) error) (err error) {
 		if offset != 0 {
 			return fmt.Errorf("invalid rewind offset for spill file: got %d; want 0", offset)
 		}
-		source = &spillReadSource{r: w.f, remaining: w.fileSize}
+		source = &spillFileReader{r: w.f, remaining: w.fileSize}
 		br := getSpillBufioReader(source)
 		readersCount.Inc()
-		r.r = io.MultiReader(br, r.r)
+		cr.r = io.MultiReader(br, cr.r)
 		defer func() {
 			putSpillBufioReader(br)
 			readersCount.Dec()
 		}()
 	}
 	defer func() {
-		r.active = false
-		r.r = nil
-		r.owner = nil
+		cr.r = nil
 	}()
-	err = consume(r)
+	err = consume(cr)
 	if source != nil && source.err != nil && !errors.Is(err, source.err) {
 		err = errors.Join(err, fmt.Errorf("cannot read spill file: %w", source.err))
 	}
-	if r.err != nil && !errors.Is(err, r.err) {
-		err = errors.Join(err, r.err)
-	}
-	if r.n < w.size {
-		err = errors.Join(err, fmt.Errorf("spill consumer read %d bytes; want %d: %w", r.n, w.size, io.ErrUnexpectedEOF))
-	} else if r.n > w.size {
-		err = errors.Join(err, fmt.Errorf("spill consumer read %d bytes, exceeding the written size %d", r.n, w.size))
+	if cr.n < w.size {
+		err = errors.Join(err, fmt.Errorf("spill consumer read %d bytes; want %d: %w", cr.n, w.size, io.ErrUnexpectedEOF))
+	} else if cr.n > w.size {
+		err = errors.Join(err, fmt.Errorf("spill consumer read %d bytes, exceeding the written size %d", cr.n, w.size))
 	}
 	return err
 }
 
-// Close releases memory, closes the file, and removes its temporary file
-// and directory. It is safe to call repeatedly. It returns earlier I/O errors as
-// well as cleanup errors. Failed removal retains the path for the next Close.
+// Close releases memory, closes the file, and removes its temporary file.
+// It is safe to call repeatedly. It must be called explicitly after Read as the
+// final step. It returns earlier I/O errors as well as cleanup errors. Failed
+// removal retains the created file for the next Close.
 func (w *SpillWriter) Close() error {
-	wasWriting := w.state == spillWriting
-	w.state = spillClosed
+	w.closed = true
 	w.memory = nil
 	if w.f != nil {
-		if wasWriting {
+		if w.writerCounted {
 			writersCount.Dec()
+			w.writerCounted = false
 		}
 		if err := w.f.Close(); err != nil {
 			w.err = errors.Join(w.err, fmt.Errorf("cannot close spill file: %w", err))
@@ -252,18 +256,11 @@ func (w *SpillWriter) Close() error {
 		w.f = nil
 	}
 	var cleanupErr error
-	if w.path != "" {
+	if w.created {
 		if err := w.removePath(w.path); err != nil {
 			cleanupErr = fmt.Errorf("cannot remove spill file %q: %w", w.path, err)
 		} else {
-			w.path = ""
-		}
-	}
-	if w.tempDir != "" {
-		if err := w.removePath(w.tempDir); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("cannot remove spill directory %q: %w", w.tempDir, err))
-		} else {
-			w.tempDir = ""
+			w.created = false
 		}
 	}
 	return errors.Join(w.err, cleanupErr)
@@ -317,16 +314,18 @@ func (w spillFileWriter) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
-// Keep underlying read errors even if bufio.Reader or the consumer returns
-// before surfacing an error that accompanied the last successful bytes.
-type spillReadSource struct {
+// spillFileReader 读取 spill 文件前缀，与 spillFileWriter 对称。
+// 它被限制在已记录的 fileSize 字节内，即使 bufio.Reader 或 consumer 在
+// 最后一个成功字节携带的错误浮出之前就返回，也会保留底层读取错误，
+// 并防护无进展的死循环读取。
+type spillFileReader struct {
 	r          io.Reader
 	err        error
 	emptyReads int
-	remaining  uint64 // Only the recorded file prefix may precede the memory tail.
+	remaining  uint64 // 只允许读取已记录的文件前缀，防止截断的前缀被内存尾巴掩盖。
 }
 
-func (r *spillReadSource) Read(p []byte) (n int, err error) {
+func (r *spillFileReader) Read(p []byte) (n int, err error) {
 	if r.err != nil {
 		return 0, r.err
 	}
@@ -369,35 +368,28 @@ func (r *spillReadSource) Read(p []byte) (n int, err error) {
 	return n, err
 }
 
-type spillReader struct {
-	owner  *SpillWriter
-	r      io.Reader
-	active bool
-	n      uint64
-	err    error
+// countingReader 统计 consumer 实际读取的字节数，用于校验恰好消费 Size 字节。
+// Read 返回后其输入被置空，逃逸的 reader 再次读取会得到 ErrClosed。
+type countingReader struct {
+	r io.Reader
+	n uint64
 }
 
-func (r *spillReader) Read(p []byte) (int, error) {
-	if !r.active || r.owner.state != spillReading {
+func (r *countingReader) Read(p []byte) (int, error) {
+	if r.r == nil {
 		return 0, fmt.Errorf("spill reader is closed: %w", os.ErrClosed)
-	}
-	if r.err != nil {
-		return 0, r.err
 	}
 	readCallsBuffered.Inc()
 	n, err := r.r.Read(p)
 	readBytesBuffered.Add(n)
 	r.n += uint64(n)
-	if err != nil && !errors.Is(err, io.EOF) && r.err == nil {
-		r.err = err
-	}
 	return n, err
 }
 
 // Spill buffers have their own pools so their adapters and file references are
 // released without changing the buffer ownership rules of regular filestreams.
-func getSpillBufioReader(source *spillReadSource) *bufio.Reader {
-	v := spillReaderPool.Get()
+func getSpillBufioReader(source *spillFileReader) *bufio.Reader {
+	v := spillBufioPool.Get()
 	if v == nil {
 		return bufio.NewReaderSize(source, getReadBufferSize())
 	}
@@ -408,7 +400,7 @@ func getSpillBufioReader(source *spillReadSource) *bufio.Reader {
 
 func putSpillBufioReader(br *bufio.Reader) {
 	br.Reset(nil)
-	spillReaderPool.Put(br)
+	spillBufioPool.Put(br)
 }
 
-var spillReaderPool sync.Pool
+var spillBufioPool sync.Pool

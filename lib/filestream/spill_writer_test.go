@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,7 +19,7 @@ func TestSpillWriterRoundTrip(t *testing.T) {
 		for _, chunkSize := range []int{1, 373, 32 * limit} {
 			t.Run(strconv.Itoa(size)+"/chunk_"+strconv.Itoa(chunkSize), func(t *testing.T) {
 				dir := t.TempDir()
-				w := NewSpillWriter(dir)
+			w := NewSpillWriter(dir, "spill")
 				w.memoryLimit = limit
 				defer w.Close()
 				data := bytes.Repeat([]byte("aBc012"), size/6+1)[:size]
@@ -41,7 +40,7 @@ func TestSpillWriterRoundTrip(t *testing.T) {
 						t.Fatalf("prefix/tail boundary: file=%d memory=%d cap=%d; total=%d", w.fileSize, len(w.memory), cap(w.memory), pos)
 					}
 					if wantFileSize == 0 {
-						if w.f != nil || w.path != "" || w.tempDir != "" {
+						if w.f != nil {
 							t.Fatal("a stream within the memory limit created a file")
 						}
 					} else {
@@ -58,7 +57,7 @@ func TestSpillWriterRoundTrip(t *testing.T) {
 					}
 				}
 				var saved io.Reader
-				if err := w.ReadAll(func(r io.Reader) error {
+				if err := w.Read(func(r io.Reader) error {
 					saved = r
 					got, err := io.ReadAll(r)
 					if !bytes.Equal(got, data) {
@@ -74,21 +73,25 @@ func TestSpillWriterRoundTrip(t *testing.T) {
 				if _, err := saved.Read(make([]byte, 1)); !errors.Is(err, os.ErrClosed) {
 					t.Fatalf("escaped reader: got %v; want ErrClosed", err)
 				}
-				if r := saved.(*spillReader); r.r != nil || r.owner != nil {
-					t.Fatal("escaped reader retained its input or owner after ReadAll")
+				if r := saved.(*countingReader); r.r != nil {
+					t.Fatal("escaped reader retained its input after ReadAll")
+				}
+				// Read 是只读的：不释放资源也不删除文件，Close 是最后的显式调用。
+				if err := w.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
 				}
 				assertSpillRemoved(t, w, dir)
 				if err := w.Close(); err != nil {
 					t.Fatalf("repeated Close: %v", err)
 				}
 				if _, err := w.Write(nil); !errors.Is(err, os.ErrClosed) {
-					t.Fatalf("Write after ReadAll: got %v; want ErrClosed", err)
+					t.Fatalf("Write after Close: got %v; want ErrClosed", err)
 				}
-				if err := w.ReadAll(func(io.Reader) error {
-					t.Fatal("ReadAll called consumer twice")
+				if err := w.Read(func(io.Reader) error {
+					t.Fatal("ReadAll called consumer after Close")
 					return nil
 				}); !errors.Is(err, os.ErrClosed) {
-					t.Fatalf("repeated ReadAll: got %v; want ErrClosed", err)
+					t.Fatalf("Read after Close: got %v; want ErrClosed", err)
 				}
 			})
 		}
@@ -96,11 +99,12 @@ func TestSpillWriterRoundTrip(t *testing.T) {
 }
 
 func TestSpillWriterLazyCreationAndDiscard(t *testing.T) {
-	for _, size := range []int{0, 1, spillMaxMemorySize - 1, spillMaxMemorySize} {
+	limit := spillMaxMemorySize.IntN()
+	for _, size := range []int{0, 1, limit - 1, limit} {
 		t.Run(strconv.Itoa(size), func(t *testing.T) {
 			dir := t.TempDir()
 			missing := filepath.Join(dir, "missing", "directory")
-			w := NewSpillWriter(missing)
+			w := NewSpillWriter(missing, "spill")
 			w.remove = func(string) error {
 				t.Fatal("memory-only cleanup must not attempt filesystem removal")
 				return nil
@@ -115,10 +119,10 @@ func TestSpillWriterLazyCreationAndDiscard(t *testing.T) {
 			if n, err := w.Write(data); n != size || err != nil {
 				t.Fatalf("memory-only Write with missing directory: (%d, %v)", n, err)
 			}
-			if w.f != nil || w.path != "" || w.tempDir != "" || w.fileSize != 0 || cap(w.memory) > spillMaxMemorySize {
+			if w.f != nil || w.fileSize != 0 || cap(w.memory) > limit {
 				t.Fatal("memory-only write created a file or exceeded the capacity limit")
 			}
-			if size == 1 && cap(w.memory) >= spillMaxMemorySize {
+			if size == 1 && cap(w.memory) >= limit {
 				t.Fatal("a small write eagerly allocated the full production limit")
 			}
 			if err := w.Close(); err != nil {
@@ -134,13 +138,13 @@ func TestSpillWriterLazyCreationAndDiscard(t *testing.T) {
 		})
 	}
 	dir := t.TempDir()
-	w := NewSpillWriter(filepath.Join(dir, "missing"))
+	w := NewSpillWriter(filepath.Join(dir, "missing"), "spill")
 	w.memoryLimit = 32
 	data := bytes.Repeat([]byte("x"), w.memoryLimit)
 	if _, err := w.Write(data); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.ReadAll(func(r io.Reader) error {
+	if err := w.Read(func(r io.Reader) error {
 		got, err := io.ReadAll(r)
 		if !bytes.Equal(got, data) {
 			t.Fatal("memory-only ReadAll changed data")
@@ -148,6 +152,9 @@ func TestSpillWriterLazyCreationAndDiscard(t *testing.T) {
 		return err
 	}); err != nil {
 		t.Fatalf("memory-only ReadAll with missing directory: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("memory-only Close with missing directory: %v", err)
 	}
 	assertSpillRemoved(t, w, dir)
 }
@@ -164,7 +171,7 @@ func TestSpillWriterMetrics(t *testing.T) {
 			bufferedWrites, bufferedWrittenBytes := writeCallsBuffered.Get(), writtenBytesBuffered.Get()
 			realReads, realReadBytes := readCallsReal.Get(), readBytesReal.Get()
 			realWrites, realWrittenBytes := writeCallsReal.Get(), writtenBytesReal.Get()
-			w := NewSpillWriter(t.TempDir())
+			w := NewSpillWriter(t.TempDir(), "spill")
 			w.memoryLimit = 64
 			defer w.Close()
 			size := 13
@@ -203,9 +210,9 @@ func TestSpillWriterMetrics(t *testing.T) {
 				w.f = f
 			}
 			logicalReads := uint64(0)
-			if err := w.ReadAll(func(r io.Reader) error {
-				if readersCount.Get() != readers+wantFiles || writersCount.Get() != writers {
-					t.Fatal("ReadAll did not transfer only the physical file from writer to reader accounting")
+			if err := w.Read(func(r io.Reader) error {
+				if readersCount.Get() != readers+wantFiles || writersCount.Get() != writers+wantFiles {
+					t.Fatal("ReadAll must keep the spill writer while temporarily adding a file reader")
 				}
 				got := make([]byte, len(data))
 				for pos := 0; pos < len(got); {
@@ -226,8 +233,8 @@ func TestSpillWriterMetrics(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if readersCount.Get() != readers || writersCount.Get() != writers {
-				t.Fatal("ReadAll retained an active file reader or writer")
+			if readersCount.Get() != readers || writersCount.Get() != writers+wantFiles {
+				t.Fatal("ReadAll released the file reader but must keep the spill writer for the pending Close")
 			}
 			if readCallsBuffered.Get() != bufferedReads+logicalReads || readBytesBuffered.Get() != bufferedReadBytes+uint64(len(data)) {
 				t.Fatal("logical read statistics do not match consumer reads")
@@ -240,6 +247,12 @@ func TestSpillWriterMetrics(t *testing.T) {
 			}
 			if writeCallsReal.Get() != realWrites+wantFiles || writtenBytesReal.Get() != realWrittenBytes+wantFileBytes {
 				t.Fatal("ReadAll flushed the memory tail")
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if readersCount.Get() != readers || writersCount.Get() != writers {
+				t.Fatal("Close did not release the spill writer after Read")
 			}
 		})
 	}
@@ -256,7 +269,7 @@ func TestSpillWriterPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := NewSpillWriter(dir)
+	w := NewSpillWriter(dir, "spill")
 	w.memoryLimit = 2
 	defer w.Close()
 	if _, err := w.Write([]byte("data")); err != nil {
@@ -269,18 +282,11 @@ func TestSpillWriterPermissions(t *testing.T) {
 	if spillStat.Mode().Perm() != controlStat.Mode().Perm() {
 		t.Fatalf("spill permissions=%o; os.Create permissions=%o", spillStat.Mode().Perm(), controlStat.Mode().Perm())
 	}
-	dirStat, err := os.Stat(w.tempDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if runtime.GOOS != "windows" && dirStat.Mode().Perm()&0077 != 0 {
-		t.Fatalf("spill directory is accessible to others: %o", dirStat.Mode().Perm())
-	}
 }
 
 func TestSpillWriterCreateFailure(t *testing.T) {
 	dir := t.TempDir()
-	w := NewSpillWriter(filepath.Join(dir, "missing", "directory"))
+	w := NewSpillWriter(filepath.Join(dir, "missing", "directory"), "spill")
 	w.memoryLimit = 4
 	if n, err := w.Write([]byte("data")); n != 4 || err != nil {
 		t.Fatalf("Write at limit must not touch missing directory: (%d, %v)", n, err)
@@ -351,7 +357,7 @@ func TestSpillWriterWriteFailures(t *testing.T) {
 				if n, err := w.Write([]byte("retry")); n != 0 || err == nil {
 					t.Fatalf("Write after failure: (%d,%v)", n, err)
 				}
-				if err := w.ReadAll(func(io.Reader) error { t.Fatal("consumer called after failure"); return nil }); err == nil {
+				if err := w.Read(func(io.Reader) error { t.Fatal("consumer called after failure"); return nil }); err == nil {
 					t.Fatal("ReadAll succeeded after failed dump")
 				}
 				if f.closeCalls != 1 {
@@ -388,12 +394,18 @@ func TestSpillWriterSeekFailures(t *testing.T) {
 				n, err := f.File.Seek(off, whence)
 				return n + 1, err
 			}
-			err := w.ReadAll(func(io.Reader) error { t.Fatal("consumer called after seek validation failure"); return nil })
+			err := w.Read(func(io.Reader) error { t.Fatal("consumer called after seek validation failure"); return nil })
 			if err == nil || !tc.wrongOffset && !errors.Is(err, injected) {
 				t.Fatalf("ReadAll seek error: %v", err)
 			}
+			if f.closeCalls != 0 {
+				t.Fatalf("read-only seek failure must not close the file: closes=%d", f.closeCalls)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close after seek failure: %v", err)
+			}
 			if f.closeCalls != 1 {
-				t.Fatalf("seek failure closed file %d times", f.closeCalls)
+				t.Fatalf("Close after seek failure closed file %d times", f.closeCalls)
 			}
 			assertSpillRemoved(t, w, dir)
 		})
@@ -420,7 +432,7 @@ func TestSpillWriterReadFailures(t *testing.T) {
 				t.Fatal(err)
 			}
 			f.read = func(p []byte) (int, error) { return tc.read(f.File, p) }
-			err := w.ReadAll(func(r io.Reader) error {
+			err := w.Read(func(r io.Reader) error {
 				// Deliberately ignore the reader's error. ReadAll must still fail,
 				// including when bufio hides an error delivered with the last bytes.
 				_, _ = io.ReadFull(r, make([]byte, len(data)))
@@ -428,6 +440,15 @@ func TestSpillWriterReadFailures(t *testing.T) {
 			})
 			if err == nil || tc.want != nil && !errors.Is(err, tc.want) {
 				t.Fatalf("ReadAll: got %v; want %v", err, tc.want)
+			}
+			if f.closeCalls != 0 {
+				t.Fatalf("read-only Read closed the file after a read failure: closes=%d", f.closeCalls)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close after read failure: %v", err)
+			}
+			if f.closeCalls != 1 {
+				t.Fatalf("Close after read failure closed file %d times", f.closeCalls)
 			}
 			assertSpillRemoved(t, w, dir)
 		})
@@ -450,17 +471,21 @@ func TestSpillWriterConsumerFailures(t *testing.T) {
 		for _, limit := range []int{2, 8} {
 			t.Run(tc.name+"/limit_"+strconv.Itoa(limit), func(t *testing.T) {
 				dir := t.TempDir()
-				w := NewSpillWriter(dir)
+				w := NewSpillWriter(dir, "spill")
 				w.memoryLimit = limit
 				if _, err := w.Write([]byte("data")); err != nil {
 					t.Fatal(err)
 				}
-				err := w.ReadAll(tc.consume)
+				err := w.Read(tc.consume)
 				if err == nil || tc.want != nil && !errors.Is(err, tc.want) {
 					t.Fatalf("ReadAll: got %v; want %v", err, tc.want)
 				}
-				if _, err := w.Write([]byte("retry")); err == nil {
-					t.Fatal("Write succeeded after consumer failure")
+				// Read 是只读的，失败不会 seal writer；后续仍可写入，但须显式 Close。
+				if _, err := w.Write([]byte("retry")); err != nil {
+					t.Fatalf("Write after consumer failure: %v", err)
+				}
+				if err := w.Close(); err != nil {
+					t.Fatalf("Close after consumer failure: %v", err)
 				}
 				assertSpillRemoved(t, w, dir)
 			})
@@ -468,76 +493,91 @@ func TestSpillWriterConsumerFailures(t *testing.T) {
 	}
 }
 
-func TestSpillWriterExactReadAndSealedCallback(t *testing.T) {
-	w, _, dir := newFaultSpill(t)
+func TestSpillWriterReadIsReadOnlyAndRepeatable(t *testing.T) {
+	w, f, dir := newFaultSpill(t)
 	data := bytes.Repeat([]byte("e"), w.memoryLimit+9)
 	if _, err := w.Write(data); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.ReadAll(func(r io.Reader) error {
-		if _, err := w.Write([]byte("late")); !errors.Is(err, os.ErrClosed) {
-			t.Fatalf("Write during ReadAll: %v", err)
-		}
-		if err := w.ReadAll(func(io.Reader) error { return nil }); !errors.Is(err, os.ErrClosed) {
-			t.Fatalf("nested ReadAll: %v", err)
-		}
+	// First read: exact consumption without an extra EOF read.
+	if err := w.Read(func(r io.Reader) error {
 		got := make([]byte, len(data))
-		_, err := io.ReadFull(r, got)
+		if _, err := io.ReadFull(r, got); err != nil {
+			return err
+		}
 		if !bytes.Equal(got, data) {
 			t.Fatal("data mismatch")
 		}
-		return err
+		return nil
 	}); err != nil {
 		t.Fatalf("exact read without extra EOF read: %v", err)
+	}
+	// Read 是只读的：不 seal、不关闭文件、不删除文件。
+	if f.closeCalls != 0 {
+		t.Fatalf("read-only Read closed the file: closes=%d", f.closeCalls)
+	}
+	if _, err := os.Stat(w.path); err != nil {
+		t.Fatalf("read-only Read removed or lost the file: %v", err)
+	}
+	// Read 可重复调用，每次都重新输出完整流。
+	if err := w.Read(func(r io.Reader) error {
+		got, err := io.ReadAll(r)
+		if !bytes.Equal(got, data) {
+			t.Fatal("repeated Read data mismatch")
+		}
+		return err
+	}); err != nil {
+		t.Fatalf("repeated Read: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if f.closeCalls != 1 {
+		t.Fatalf("file closed %d times; want 1", f.closeCalls)
 	}
 	assertSpillRemoved(t, w, dir)
 }
 
 func TestSpillWriterCleanupRetry(t *testing.T) {
 	removeErr := errors.New("injected remove failure")
-	for _, failDirectory := range []bool{false, true} {
-		name := "file"
-		if failDirectory {
-			name = "directory"
-		}
-		t.Run(name, func(t *testing.T) {
-			w, f, dir := newFaultSpill(t)
-			if _, err := w.Write(make([]byte, w.memoryLimit+1)); err != nil {
-				t.Fatal(err)
-			}
-			failPath := w.path
-			if failDirectory {
-				failPath = w.tempDir
-			}
-			w.remove = func(path string) error {
-				if path == failPath {
-					return removeErr
-				}
-				return os.Remove(path)
-			}
-			err := w.ReadAll(func(r io.Reader) error { _, err := io.Copy(io.Discard, r); return err })
-			if !errors.Is(err, removeErr) {
-				t.Fatalf("ReadAll removal: got %v; want injected error", err)
-			}
-			if _, err := os.Stat(failPath); err != nil {
-				t.Fatalf("failed removal lost its path: %v", err)
-			}
-			if w.tempDir == "" || !failDirectory && w.path == "" {
-				t.Fatal("failed cleanup discarded retry state")
-			}
-			if err := w.Close(); !errors.Is(err, removeErr) {
-				t.Fatalf("retry while removal is failing: %v", err)
-			}
-			w.remove = os.Remove
-			if err := w.Close(); err != nil {
-				t.Fatalf("retry after removal becomes available: %v", err)
-			}
-			if f.closeCalls != 1 {
-				t.Fatalf("file closed %d times; want 1", f.closeCalls)
-			}
-			assertSpillRemoved(t, w, dir)
-		})
+	w, f, dir := newFaultSpill(t)
+	if _, err := w.Write(make([]byte, w.memoryLimit+1)); err != nil {
+		t.Fatal(err)
 	}
+	failPath := w.path
+	w.remove = func(path string) error {
+		if path == failPath {
+			return removeErr
+		}
+		return os.Remove(path)
+	}
+	// Read 是只读的，不删除文件。
+	if err := w.Read(func(r io.Reader) error { _, err := io.Copy(io.Discard, r); return err }); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if _, err := os.Stat(failPath); err != nil {
+		t.Fatalf("read-only Read lost its path: %v", err)
+	}
+	if !w.created {
+		t.Fatal("read-only Read discarded cleanup state")
+	}
+	if err := w.Close(); !errors.Is(err, removeErr) {
+		t.Fatalf("Close with failing removal: got %v; want injected error", err)
+	}
+	if _, err := os.Stat(failPath); err != nil {
+		t.Fatalf("failed removal lost its path: %v", err)
+	}
+	if !w.created {
+		t.Fatal("failed cleanup discarded retry state")
+	}
+	w.remove = os.Remove
+	if err := w.Close(); err != nil {
+		t.Fatalf("retry after removal becomes available: %v", err)
+	}
+	if f.closeCalls != 1 {
+		t.Fatalf("file closed %d times; want 1", f.closeCalls)
+	}
+	assertSpillRemoved(t, w, dir)
 }
 
 func TestSpillWriterCloseErrorStillRemoves(t *testing.T) {
@@ -563,7 +603,7 @@ func TestSpillWriterWriteErrorCleanupRetry(t *testing.T) {
 	if !errors.Is(err, writeErr) || !errors.Is(err, removeErr) {
 		t.Fatalf("Write lost a write or cleanup error: %v", err)
 	}
-	if w.path == "" || w.tempDir == "" {
+	if !w.created {
 		t.Fatal("failed cleanup discarded retry state")
 	}
 	w.remove = os.Remove
@@ -578,7 +618,7 @@ func TestSpillWriterWriteErrorCleanupRetry(t *testing.T) {
 
 func TestSpillWriterBoundedBuffers(t *testing.T) {
 	dir := t.TempDir()
-	w := NewSpillWriter(dir)
+	w := NewSpillWriter(dir, "spill")
 	w.memoryLimit = 64 * 1024
 	defer w.Close()
 	chunk := bytes.Repeat([]byte("abcdefgh"), 8*1024)
@@ -600,7 +640,7 @@ func TestSpillWriterBoundedBuffers(t *testing.T) {
 		t.Fatalf("Size: %d", w.Size())
 	}
 	got := sha256.New()
-	if err := w.ReadAll(func(r io.Reader) error {
+	if err := w.Read(func(r io.Reader) error {
 		n, err := io.CopyBuffer(got, r, make([]byte, 8192))
 		if uint64(n) != w.Size() {
 			t.Fatalf("read %d bytes; want %d", n, w.Size())
@@ -612,6 +652,9 @@ func TestSpillWriterBoundedBuffers(t *testing.T) {
 	if !bytes.Equal(got.Sum(nil), want.Sum(nil)) {
 		t.Fatal("stream checksum mismatch")
 	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
 	assertSpillRemoved(t, w, dir)
 }
 
@@ -619,7 +662,7 @@ func TestSpillWriterInputDoesNotAlias(t *testing.T) {
 	for _, size := range []int{17, 3*32 + 7} {
 		t.Run(strconv.Itoa(size), func(t *testing.T) {
 			dir := t.TempDir()
-			w := NewSpillWriter(dir)
+			w := NewSpillWriter(dir, "spill")
 			w.memoryLimit = 32
 			defer w.Close()
 			input := bytes.Repeat([]byte("mutable-input"), size/13+1)[:size]
@@ -628,13 +671,16 @@ func TestSpillWriterInputDoesNotAlias(t *testing.T) {
 				t.Fatal(err)
 			}
 			clear(input)
-			if err := w.ReadAll(func(r io.Reader) error {
+			if err := w.Read(func(r io.Reader) error {
 				got, err := io.ReadAll(r)
 				if !bytes.Equal(got, want) {
 					t.Fatal("spill retained the caller's mutable buffer")
 				}
 				return err
 			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
 				t.Fatal(err)
 			}
 			assertSpillRemoved(t, w, dir)
@@ -683,12 +729,15 @@ func TestSpillWriterFileExtentValidation(t *testing.T) {
 			if err := f.File.Truncate(int64(w.fileSize) + delta); err != nil {
 				t.Fatal(err)
 			}
-			err := w.ReadAll(func(io.Reader) error {
+			err := w.Read(func(io.Reader) error {
 				t.Fatal("consumer ran with a truncated or extended file prefix")
 				return nil
 			})
 			if err == nil || delta < 0 && !errors.Is(err, io.ErrUnexpectedEOF) {
 				t.Fatalf("invalid prefix size was accepted: %v", err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close after extent validation failure: %v", err)
 			}
 			assertSpillRemoved(t, w, dir)
 		})
@@ -712,7 +761,7 @@ func TestSpillWriterTruncatedPrefixCannotUseMemoryTail(t *testing.T) {
 		}
 		return f.File.Seek(offset, whence)
 	}
-	err := w.ReadAll(func(r io.Reader) error {
+	err := w.Read(func(r io.Reader) error {
 		got, err := io.ReadAll(r)
 		if !bytes.Equal(got, prefix[:len(prefix)-3]) {
 			t.Fatalf("memory tail was used after an incomplete prefix: %q", got)
@@ -724,6 +773,9 @@ func TestSpillWriterTruncatedPrefixCannotUseMemoryTail(t *testing.T) {
 	})
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("ReadAll ignored a truncated prefix: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close after truncated prefix: %v", err)
 	}
 	assertSpillRemoved(t, w, dir)
 }
@@ -752,7 +804,7 @@ func BenchmarkSpillWriter(b *testing.B) {
 		size int
 	}{
 		{"Memory", 1024 * 1024},
-		{"Spilled", spillMaxMemorySize + 1024*1024},
+		{"Spilled", spillMaxMemorySize.IntN() + 1024*1024},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			dir := b.TempDir()
@@ -761,15 +813,19 @@ func BenchmarkSpillWriter(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				w := NewSpillWriter(dir)
+				w := NewSpillWriter(dir, "spill")
 				if _, err := w.Write(data); err != nil {
 					_ = w.Close()
 					b.Fatal(err)
 				}
-				if err := w.ReadAll(func(r io.Reader) error {
+				if err := w.Read(func(r io.Reader) error {
 					_, err := io.Copy(io.Discard, r)
 					return err
 				}); err != nil {
+					_ = w.Close()
+					b.Fatal(err)
+				}
+				if err := w.Close(); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -785,7 +841,7 @@ func TestSpillWriterIndependentInstances(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			w := NewSpillWriter(dir)
+			w := NewSpillWriter(dir, strconv.Itoa(i))
 			w.memoryLimit = 1024
 			if i%2 == 0 {
 				w.memoryLimit = 20_000
@@ -796,7 +852,7 @@ func TestSpillWriterIndependentInstances(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			if err := w.ReadAll(func(r io.Reader) error {
+			if err := w.Read(func(r io.Reader) error {
 				got, err := io.ReadAll(r)
 				if string(got) != data {
 					t.Error("independent spill data mismatch")
@@ -808,13 +864,13 @@ func TestSpillWriterIndependentInstances(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	assertSpillRemoved(t, NewSpillWriter(dir), dir)
+	assertSpillRemoved(t, NewSpillWriter(dir, "final"), dir)
 }
 
 func newFaultSpill(t *testing.T) (*SpillWriter, *spillFaultFile, string) {
 	t.Helper()
 	dir := t.TempDir()
-	w := NewSpillWriter(dir)
+	w := NewSpillWriter(dir, "spill")
 	w.memoryLimit = 32
 	if err := w.create(); err != nil {
 		t.Fatal(err)
@@ -862,8 +918,8 @@ func (f *spillFaultFile) Close() error {
 
 func assertSpillRemoved(t *testing.T, w *SpillWriter, dir string) {
 	t.Helper()
-	if w.f != nil || w.memory != nil || w.path != "" || w.tempDir != "" {
-		t.Fatalf("spill retained resources: file=%v, buffer=%v, path=%q, directory=%q", w.f, w.memory, w.path, w.tempDir)
+	if w.f != nil || w.memory != nil || w.created {
+		t.Fatalf("spill retained resources: file=%v, buffer=%v, created=%v", w.f, w.memory, w.created)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil || len(entries) != 0 {

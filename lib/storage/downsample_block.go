@@ -25,6 +25,9 @@ const (
 	countOfDownsampleFeatures
 )
 
+// downsampleFeatureNames 与上面的 downsampleFeature* iota 逐项对齐，用于 spill 文件命名与诊断输出。
+var downsampleFeatureNames = [countOfDownsampleFeatures]string{"last", "sum", "count", "min", "max"}
+
 const (
 	// 原始输入沿用已有双倍行数上限。
 	downsampleMaxRawRows = 2 * maxRowsPerBlock
