@@ -1501,6 +1501,7 @@ type failingDownsampleFile struct {
 	writeErr   error
 	shortWrite bool
 	closes     int
+	afterClose func() // 观察真实文件关闭后的状态，或模拟该时刻进程中断。
 }
 
 func (f *failingDownsampleFile) Write(b []byte) (int, error) {
@@ -1516,6 +1517,9 @@ func (f *failingDownsampleFile) Write(b []byte) (int, error) {
 func (f *failingDownsampleFile) MustClose() {
 	f.closes++
 	f.WriteCloser.MustClose()
+	if f.afterClose != nil {
+		f.afterClose()
+	}
 }
 
 func assertDownsampleWriterAborted(t *testing.T, w *downsampleWriter, path string, cause error) {

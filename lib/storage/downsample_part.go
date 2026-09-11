@@ -132,37 +132,11 @@ func readDownsampleMetadata(path string) (*downsamplePartMetadata, error) {
 	return &m, nil
 }
 
-// detectDownsampleFormat 只读取元数据与标识，供初始化预检查和正式打开共用。
-func detectDownsampleFormat(path string) (_ bool, err error) {
+// detectDownsampleFormat 仅根据完整元数据识别格式；数据文件由正式打开过程校验。
+func detectDownsampleFormat(path string) (bool, error) {
 	m, err := readDownsampleMetadata(path)
 	if err != nil {
 		return false, fmt.Errorf("[downsampling] cannot inspect part %q: %w", path, err)
-	}
-	f, err := filestream.OpenReadAt(filepath.Join(path, metaindexFilename))
-	if err != nil {
-		return false, err
-	}
-	defer func() { err = errors.Join(err, f.Close()) }()
-	var magic [8]byte
-	n, err := f.ReadAt(magic[:], 0)
-	if err != nil {
-		return false, fmt.Errorf("[downsampling] part %q has a truncated metaindex marker: %w", path, err)
-	}
-	if m != nil {
-		if string(magic[:n]) != downsampleMetaindexMagic {
-			return false, fmt.Errorf("[downsampling] part %q metadata does not match its metaindex marker", path)
-		}
-	} else if !bytes.Equal(magic[:4], []byte{0x28, 0xb5, 0x2f, 0xfd}) {
-		return false, fmt.Errorf("[downsampling] part %q has no valid raw format or has an unknown metaindex marker", path)
-	}
-	for _, name := range []string{timestampsFilename, valuesFilename, indexFilename} {
-		st, err := os.Stat(filepath.Join(path, name))
-		if err != nil {
-			return false, err
-		}
-		if !st.Mode().IsRegular() {
-			return false, fmt.Errorf("[downsampling] part %q file %s is not a regular file", path, name)
-		}
 	}
 	return m != nil, nil
 }

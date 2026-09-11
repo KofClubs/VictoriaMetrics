@@ -33,7 +33,7 @@ Go 单元测试、race 和 vet 均以退出码 0 为通过条件；Python 单元
 
 ## storage 单元测试
 
-降采样生产代码分为 8 个文件；测试文件均位于 `lib/storage`，使用 `package storage`，按生产文件归类为 8 个同名 `_test.go`，另有 `downsample_supplement_test.go`。这 9 个文件共包含 100 个顶层测试和 4 个基准测试。测试使用独立的原始输入参考值或原生编码器校验结果；实际文件布局另有按固定字节偏移解析的检查。
+降采样生产代码分为 8 个文件；测试文件均位于 `lib/storage`，使用 `package storage`，按生产文件归类为 8 个同名 `_test.go`，另有 `downsample_supplement_test.go`。这 9 个文件共包含 102 个顶层测试和 4 个基准测试。测试使用独立的原始输入参考值或原生编码器校验结果；实际文件布局另有按固定字节偏移解析的检查。
 
 ### 样本与解码 block
 
@@ -65,9 +65,10 @@ Go 单元测试、race 和 vet 均以退出码 0 为通过条件；Python 单元
 
 | 测试 | 验证内容 |
 |---|---|
+| `TestDownsampleFormatDetection` | 仅有 metadata 时即可识别合法降采样或原始格式；缺少 metadata 的旧原始格式仍按目录名识别。拒绝新目录缺失 metadata、空文件、截断或非法 JSON、null 和空对象；降采样实际打开仍拒绝缺失数据文件。 |
 | `TestDownsampleMetadataValidation` | 拒绝缺少必需字段的降采样 metadata，以及超出支持时间域的 part 统计。 |
 | `TestUnmarshalDownsampleIndexBlock` | 解码结果可追加到既有 header 缓冲；截断、非法 header 及统计不一致时保留原前缀，不暴露部分解码结果。 |
-| `TestDownsampleRejectsUnknownVersionAndMarker` | 预检查及打开 part 时拒绝未知格式版本、语义版本和 metaindex/index 标记。 |
+| `TestDownsampleRejectsUnknownVersionAndMarker` | 格式检测拒绝未知 metadata 格式版本和语义版本；损坏的 metaindex/index 标记不影响 metadata 检测结果，实际打开 part 时必须拒绝。 |
 | `TestDownsampleLayoutMetaindexIdentityCorruption` | 拒绝 metaindex 中非法特征、分辨率或不一致的租户身份。 |
 | `TestEstimateDownsamplePartSize` | 分别估算原始源、降采样源及混合源的输出空间，检查空输入、非法输入和溢出边界。 |
 | `TestDownsamplePartIndependentFeatureIndexes` | 单独改变 sum 列的 index 分块边界，保持其他四列不变；part 打开校验按逻辑 Block 对齐五列，接受分块边界不同的合法文件。 |
@@ -120,6 +121,7 @@ Go 单元测试、race 和 vet 均以退出码 0 为通过条件；Python 单元
 | `TestDownsampleSpaceBoundCoversEncodedParts` | 实测最终文件与 spill 的保守峰值包络不超过预算；覆盖满 block、单行多 TSID 和频繁 index 切换。 |
 | `TestDownsampleAvailableSpaceBoundaries` | 检查安全余量、已预留空间和请求量的边界与溢出；拒绝非法写入行数，并保留空间不足错误标记。 |
 | `TestDownsampleWriterFinalFileFailures` | 四个最终二进制文件分别注入接口返回的写错误及短写；原错误不丢失、每个句柄只释放一次、整个未发布目录删除。 |
+| `TestDownsampleWriterMetadataCompletion` | 四个 bin 逐一关闭时，metadata 不得提前出现；任一关闭后的模拟中断不产生完成标志，Abort 清理目录且各句柄只关闭一次。成功输出的 metadata 统计正确、part 可打开；空输出无完成标志。 |
 | `TestDownsampleWriterSpillAndValidationFailures` | 截断 header、后续输入无效；失败后禁止发布，清理后同一 writer 可重新初始化。 |
 | `TestDownsampleWriterFinalFilePermissions` | 最终文件权限与同进程使用 `os.WriteFile(..., 0666)` 创建的参考文件一致。 |
 | `TestDownsampleWriterAbortRetriesOnlyDirectory` | 目录连续删除失败后只重试目录，已释放文件和 spill 不再关闭；保留首次写入错误及各次清理错误，清理完成后可复用 writer。 |

@@ -20,7 +20,7 @@ import (
 // downsampleMaxColumnSize 限制每个已编码时间列或值列 block 的负载大小。
 const downsampleMaxColumnSize = 2 * maxBlockSize
 
-// downsampleWriter 在全部列与索引同步完成后才返回可发布的 partHeader。
+// downsampleWriter 先同步全部列与索引，最后写入 metadata.json，以完整内容标记 part 写入完成。
 type downsampleWriter struct {
 	path                   string                                             // 本 writer 拥有的目标目录，发布前可由 Abort 删除。
 	timestampsWriter       filestream.WriteCloser                             // timestamps.bin
@@ -166,17 +166,6 @@ func (w *downsampleWriter) Finish() (_ partHeader, err error) {
 		if err := writeDownsampleData(w.metaindexWriter, w.compressed); err != nil {
 			return partHeader{}, err
 		}
-		m := newDownsamplePartMetadata(w.ph)
-		b, err := json.Marshal(&m)
-		if err != nil {
-			return partHeader{}, fmt.Errorf("[downsampling] cannot encode part metadata: %w", err)
-		}
-		f := filestream.MustCreate(filepath.Join(w.path, metadataFilename), false)
-		err = writeDownsampleData(f, b)
-		f.MustClose()
-		if err != nil {
-			return partHeader{}, err
-		}
 	}
 	for _, file := range []*filestream.WriteCloser{&w.timestampsWriter, &w.valuesWriter, &w.indexWriter, &w.metaindexWriter} {
 		if *file == nil {
@@ -186,7 +175,24 @@ func (w *downsampleWriter) Finish() (_ partHeader, err error) {
 		*file = nil
 		f.MustClose()
 	}
+	// 先完成所有数据文件的缓冲刷出、fsync 和目录项同步，再创建完成标志。
 	fs.MustSyncPath(w.path)
+	if w.ph.RowsCount > 0 {
+		m := newDownsamplePartMetadata(w.ph)
+		b, err := json.Marshal(&m)
+		if err != nil {
+			return partHeader{}, fmt.Errorf("[downsampling] cannot encode part metadata: %w", err)
+		}
+		metadataPath := filepath.Join(w.path, metadataFilename)
+		// 直接写入最终路径；格式检测校验 JSON 完整性，不能仅凭文件存在判断完成。
+		var f filestream.WriteCloser = filestream.MustCreate(metadataPath, false)
+		err = writeDownsampleData(f, b)
+		f.MustClose()
+		if err != nil {
+			return partHeader{}, err
+		}
+		fs.MustSyncPath(w.path)
+	}
 	fs.MustSyncPath(filepath.Dir(w.path))
 	w.finished = true
 	return w.ph, nil

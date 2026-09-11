@@ -4,13 +4,74 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"math"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 )
+
+func TestDownsampleFormatDetection(t *testing.T) {
+	ph := partHeader{RowsCount: 5, BlocksCount: 5, MinTimestamp: 1735689600000, MaxTimestamp: 1735689600000}
+	downsampleMetadata, err := json.Marshal(newDownsamplePartMetadata(ph))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawMetadata, err := json.Marshal(ph)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const legacyPartName = "1_1_20250101000000.000_20250101000000.000_1"
+	for _, tc := range []struct {
+		name           string
+		partName       string
+		metadata       []byte
+		wantDownsample bool
+		wantErr        bool
+	}{
+		{name: "downsample_metadata_only", metadata: downsampleMetadata, wantDownsample: true},
+		{name: "raw_metadata_only", metadata: rawMetadata},
+		{name: "legacy_raw_without_metadata", partName: legacyPartName},
+		{name: "missing_metadata", wantErr: true},
+		{name: "empty_metadata", metadata: []byte{}, wantErr: true},
+		{name: "truncated_json", metadata: downsampleMetadata[:len(downsampleMetadata)-1], wantErr: true},
+		{name: "invalid_json", metadata: []byte("not json"), wantErr: true},
+		{name: "null_metadata", metadata: []byte("null"), wantErr: true},
+		{name: "empty_object", metadata: []byte("{}"), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			partName := tc.partName
+			if partName == "" {
+				partName = "part"
+			}
+			path := filepath.Join(t.TempDir(), partName)
+			if err := os.Mkdir(path, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if tc.metadata != nil {
+				if err := os.WriteFile(filepath.Join(path, metadataFilename), tc.metadata, 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			isDownsample, err := detectDownsampleFormat(path)
+			if isDownsample != tc.wantDownsample || (err != nil) != tc.wantErr {
+				t.Fatalf("unexpected format detection: got (%t, %v); want (%t, error=%t)", isDownsample, err, tc.wantDownsample, tc.wantErr)
+			}
+			if err != nil && !strings.HasPrefix(err.Error(), "[downsampling] ") {
+				t.Fatalf("missing downsampling error prefix: %v", err)
+			}
+			if isDownsample {
+				if p, err := openDownsamplePart(path); err == nil {
+					p.MustClose()
+					t.Fatal("opening a downsample part accepted missing data files")
+				}
+			}
+		})
+	}
+}
 
 func TestDownsampleMetadataValidation(t *testing.T) {
 	t.Run("time_bounds", func(t *testing.T) {
@@ -78,19 +139,17 @@ func TestDownsampleRejectsUnknownVersionAndMarker(t *testing.T) {
 				if err := os.WriteFile(filePath, data, 0644); err != nil {
 					t.Fatal(err)
 				}
-				if name != indexFilename {
-					if _, err := detectDownsampleFormat(path); err == nil {
-						t.Fatal("预检查未拒绝未知版本或格式标识")
+				isDownsample, err := detectDownsampleFormat(path)
+				if name == metadataFilename {
+					if err == nil {
+						t.Fatal("format detection accepted an unknown metadata version")
 					}
-					if p, err := openDownsamplePart(path); err == nil {
-						p.MustClose()
-						t.Fatal("打开 part 时未拒绝未知版本或格式标识")
-					}
-					return
+				} else if err != nil || !isDownsample {
+					t.Fatalf("format detection inspected the data files: got (%t, %v)", isDownsample, err)
 				}
 				if p, err := openDownsamplePart(path); err == nil {
 					p.MustClose()
-					t.Fatal("打开 part 时未拒绝未知 index 格式标识")
+					t.Fatal("opening a downsample part accepted an unknown version or format marker")
 				}
 			})
 		}

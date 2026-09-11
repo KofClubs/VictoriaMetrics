@@ -70,7 +70,7 @@
 | `values.bin` | 五个特征各自的编码数值负载 |
 | `index.bin` | 分块压缩的原生 `blockHeader` |
 | `metaindex.bin` | 压缩的降采样 metaindex 行，用于定位 index block |
-| `metadata.json` | part 统计、版本、分辨率和计算语义 |
+| `metadata.json` | part 统计、版本、分辨率和计算语义；完整降采样文件的写入完成标志 |
 
 `parts.json` 是分区的活动 part 清单，位于 `smallPartsPath`，不属于单个 part 目录。
 
@@ -196,6 +196,8 @@ metaindex 行的时间范围覆盖其全部 header，`RowsCount` 为该 index bl
 
 非空 part 要求行数和 Block 数均大于零，且 Block 数不大于行数。物理 `RowsCount` 与浮点特征 `count` 含义不同。
 
+`metadata.json` 在四个 `.bin` 文件完成写入、关闭和同步，且全部 spill 清理完毕、part 目录同步后最后生成。writer 直接创建并写入该文件，关闭并同步后，再同步 part 目录和父目录。识别完成标志必须成功解析 JSON，并校验 `FormatVersion` 及完整必需字段，不能只检查文件是否存在；原始 part 的 metadata 没有 `FormatVersion`。活动集合仍由分区的 `parts.json` 决定。
+
 ## 4. 归并与读取
 
 ### 4.1 调度与动态分桶
@@ -240,7 +242,7 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 | `values.bin` | `valuesReader`、`valuesSize` | `valuesWriter`、`valuesOffset` |
 | `index.bin` | `indexReader`、`indexSize` | `indexWriter`、`indexOffset` |
 | `metaindex.bin` | 打开 part 时载入 `dsMetaindex` | `metaindexWriter`，整体输出 |
-| `metadata.json` | 打开 part 时解析为 `dsMetadata` | `Finish` 中的局部 writer，整体输出 |
+| `metadata.json` | 格式检测及打开 part 时解析为 `dsMetadata` | `Finish` 最后直接创建、写入、同步并关闭 |
 
 当前 reader 通过 `filestream.ReadAtCloser` 按 header 中的 offset/size 读取。`filestream.ReaderAt` 封装文件打开、普通文件检查、偏移读取和关闭，直接写入调用方缓冲，不持有顺序游标，也不缓存整个文件；原有顺序读取接口 `filestream.ReadCloser` 保持不变。时间列和值列采用串行读取和可复用缓冲，文件整体读取顺序不是连续顺序扫描。
 
@@ -338,9 +340,16 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 降采样自身的校验、取消、spill、偏移读取以及接口返回的写入错误由本模块处理。最终文件创建、缓冲刷出、同步和关闭复用原始链路的 `Must` 行为，目录同步复用 `fs.MustSyncPath`；这些共享操作失败时仍采用原有致命错误处理。`lib/filestream` 的既有 Writer、Reader、接口和缓冲池，以及 `lib/fs` 的实现保持不变。新增组件只有纯临时字节流 `SpillWriter` 和独立偏移读取 `ReaderAt`。
 
-`Finish` 完成所有 spill、index、metaindex、metadata 的写入以及文件和目录同步后，返回可发布的 partHeader。没有有效行时不发布空 part。目标在发布前通过 `openDownsamplePart` 再次校验。
+非空目标的 `Finish` 按以下顺序完成：
 
-分区在活动清单所在目录创建独占临时子目录，在其中通过原有 writer 写入 `parts.json`；文件关闭并同步后，通过原子 rename 替换清单。临时子目录由本次作业清理，既有临时目录及其内容不受影响。rename 是提交点：
+1. 读回并清理全部 spill，完成 `timestamps.bin`、`values.bin`、`index.bin` 和 `metaindex.bin` 的写入。
+2. 通过原有 `MustClose` 刷出缓冲、同步并关闭四个 `.bin` 文件，再同步 part 目录。
+3. 通过原有 `MustCreate` 直接创建 `metadata.json`，写入完整 JSON，再通过 `MustClose` 刷出缓冲、同步并关闭文件。
+4. 同步 part 目录及其父目录，返回可发布的 partHeader。
+
+内容合法且完整的 metadata 是降采样 part 的写入完成标志；仅存在 metadata 文件或数据文件不足以判断完成。没有有效行时不发布空 part。目标在活动集合发布前仍须通过 `openDownsamplePart` 再次校验；metadata 写入完成不替代活动清单提交。
+
+分区在活动清单所在目录创建独占临时子目录，在其中通过原有 writer 写入 `parts.json`；文件关闭并同步后，通过原子 rename 替换清单。临时子目录由本次作业清理，既有临时目录及其内容不受影响。`parts.json` 的 rename 是活动集合的提交点：
 
 | 阶段 | 失败处理 |
 |---|---|
@@ -360,7 +369,7 @@ writer 自身验证、spill 读回及接口返回的写入错误会阻止发布�
 
 分区发现排除快照目录、空目录和带有 `.delete-this-dir` 删除标记的目录。清单中的非法 part 名称、未知字段、重复字段、重复 part 名称，以及活动 part 目录缺失，均返回错误。存在活动降采样 part 时必须启用降采样，快照中的非活动文件不构成此开关冲突。
 
-合法原始文件可以与降采样文件共存，并在后续归并时转换。格式检测结合 metadata 和文件标识；带有降采样语义但版本缺失、标识矛盾或内容损坏的文件会报错，不按原始格式打开。降采样 reader 只接受本文规定的布局；版本值相同并不代表其他二进制布局兼容。当前不提供布局迁移。
+合法原始文件可以与降采样文件共存，并在后续归并时转换。`detectDownsampleFormat` 只读取 metadata，校验 JSON、格式版本及必需字段；不读取 metaindex 标识，也不检查 `.bin` 文件的大小或类型。缺少 metadata 的旧原始格式继续按目录名解析。带有降采样语义但版本缺失，或降采样 metadata 不完整、版本不支持时返回错误。实际数据文件的标识、类型、长度和索引一致性由 `openDownsamplePart` 校验；格式检测成功不等于数据文件已通过完整检查。降采样只接受本文规定的布局；版本值相同并不代表其他二进制布局兼容。当前不提供布局迁移。
 
 ## 8. 降采样查询
 

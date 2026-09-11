@@ -651,6 +651,96 @@ func TestDownsampleWriterFinalFileFailures(t *testing.T) {
 	}
 }
 
+func TestDownsampleWriterMetadataCompletion(t *testing.T) {
+	dataFiles := []string{timestampsFilename, valuesFilename, indexFilename, metaindexFilename}
+	for _, scenario := range append([]string{"success", "empty"}, dataFiles...) {
+		t.Run(scenario, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "part")
+			var w downsampleWriter
+			if err := w.Init(path, 1); err != nil {
+				t.Fatal(err)
+			}
+			defer w.Abort()
+			if scenario != "empty" {
+				for _, resolution := range downsampleResolutions {
+					if err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, resolution)); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			metadataPath := filepath.Join(path, metadataFilename)
+			stopped := errors.New("injected interruption after data file close")
+			files := trackDownsampleWriterFiles(&w)
+			for i, f := range files {
+				name := dataFiles[i]
+				f.afterClose = func() {
+					// 包括最后一个 bin：每次真实关闭后，metadata 都尚未创建。
+					if _, err := os.Stat(metadataPath); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("metadata appeared before all data files were closed: file=%s err=%v", name, err)
+					}
+					if scenario == name {
+						panic(stopped)
+					}
+				}
+			}
+			var ph partHeader
+			var finishErr error
+			var interrupted bool
+			func() {
+				defer func() {
+					if p := recover(); p != nil {
+						if p != stopped {
+							panic(p)
+						}
+						interrupted = true
+					}
+				}()
+				ph, finishErr = w.Finish()
+			}()
+			switch scenario {
+			case "success":
+				if finishErr != nil || interrupted || !w.finished {
+					t.Fatalf("Finish did not complete: err=%v interrupted=%v finished=%v", finishErr, interrupted, w.finished)
+				}
+				m, err := readDownsampleMetadata(path)
+				if err != nil || m == nil || m.partHeader != ph {
+					t.Fatalf("final metadata is incomplete or has wrong statistics: metadata=%+v err=%v", m, err)
+				}
+				p, err := openDownsamplePart(path)
+				if err != nil {
+					t.Fatalf("completion metadata refers to invalid data: %v", err)
+				}
+				p.MustClose()
+			case "empty":
+				if finishErr != nil || interrupted || ph.RowsCount != 0 {
+					t.Fatalf("unexpected empty Finish result: header=%+v err=%v interrupted=%v", ph, finishErr, interrupted)
+				}
+				if _, err := os.Stat(metadataPath); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("empty output must not publish completion metadata: %v", err)
+				}
+			default:
+				if !interrupted || w.finished {
+					t.Fatalf("interrupted Finish published its output: interrupted=%v finished=%v", interrupted, w.finished)
+				}
+				if m, err := readDownsampleMetadata(path); err == nil || m != nil {
+					t.Fatalf("interrupted data write has completion metadata: %+v / %v", m, err)
+				}
+				if err := w.Abort(); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("interrupted output was not removed: %v", err)
+				}
+			}
+			for i, f := range files {
+				if f.closes != 1 {
+					t.Fatalf("data file was not closed exactly once: file=%s closes=%d", dataFiles[i], f.closes)
+				}
+			}
+		})
+	}
+}
+
 func TestDownsampleWriterSpillAndValidationFailures(t *testing.T) {
 	for _, scenario := range []string{"spill_truncated_header", "invalid_next_batch"} {
 		t.Run(scenario, func(t *testing.T) {
