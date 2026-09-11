@@ -954,7 +954,7 @@ func TestDownsamplePartitionConcurrentQueryMerge(t *testing.T) {
 						t.Fatal(err)
 					}
 					// 每个 index 最多两个 header；同一 TSID 必须跨 index 继续读取。
-					w.indexLimit = 2 * marshaledBlockHeaderSize
+					w.maxIndexBlockSize = 2 * marshaledBlockHeaderSize
 					for _, resolution := range downsampleResolutions {
 						for _, tsid := range tsids {
 							for timestamp := base; timestamp < base+6*60*60*1000; timestamp += resolution {

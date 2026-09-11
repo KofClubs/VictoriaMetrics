@@ -200,16 +200,12 @@ func (s *Server) run() {
 			defer func() {
 				_ = bc.Close()
 			}()
-			ctx := &vmselectRequestCtx{
-				bc:      bc,
-				sizeBuf: make([]byte, 8),
-			}
-			if err := s.processConn(ctx); err != nil {
+			if err := s.processConn(bc); err != nil {
 				if s.isStopping() {
 					return
 				}
 				s.vmselectConnErrors.Inc()
-				logger.Errorf(ctx.errorPrefix+"cannot process vmselect conn %s: %s", c.RemoteAddr(), err)
+				logger.Errorf("cannot process vmselect conn %s: %s", c.RemoteAddr(), err)
 			}
 		})
 	}
@@ -241,19 +237,23 @@ func (s *Server) isStopping() bool {
 	return s.stopFlag.Load()
 }
 
-func (s *Server) processConn(ctx *vmselectRequestCtx) error {
+func (s *Server) processConn(bc *handshake.BufferedConn) error {
+	ctx := &vmselectRequestCtx{
+		bc:      bc,
+		sizeBuf: make([]byte, 8),
+	}
 	for {
 		if err := s.processRequest(ctx); err != nil {
 			if isExpectedError(err) {
 				return nil
 			}
 			if errors.Is(err, storage.ErrDeadlineExceeded) {
-				return fmt.Errorf(ctx.errorPrefix+"cannot process vmselect request in %d seconds: %w", ctx.timeout, err)
+				return fmt.Errorf("cannot process vmselect request in %d seconds: %w", ctx.timeout, err)
 			}
-			return fmt.Errorf(ctx.errorPrefix+"cannot process vmselect request: %w", err)
+			return fmt.Errorf("cannot process vmselect request: %w", err)
 		}
-		if err := ctx.bc.Flush(); err != nil {
-			return fmt.Errorf(ctx.errorPrefix+"cannot flush compressed buffers: %w", err)
+		if err := bc.Flush(); err != nil {
+			return fmt.Errorf("cannot flush compressed buffers: %w", err)
 		}
 	}
 }
@@ -284,9 +284,6 @@ type vmselectRequestCtx struct {
 
 	qt *querytracer.Tracer
 	sq storage.SearchQuery
-
-	// errorPrefix identifies diagnostics for the currently recognized RPC.
-	errorPrefix string
 
 	// timeout in seconds for the current request
 	timeout uint64
@@ -374,13 +371,8 @@ func (ctx *vmselectRequestCtx) readAccountIDProjectID() (uint32, uint32, error) 
 const maxSearchQuerySize = 5 * 1024 * 1024
 
 func (ctx *vmselectRequestCtx) readSearchQuery(downsample bool) error {
-	ctx.errorPrefix = ""
-	if downsample {
-		ctx.errorPrefix = "[downsampling] "
-	}
-
 	if err := ctx.readDataBufBytes(maxSearchQuerySize); err != nil {
-		return fmt.Errorf(ctx.errorPrefix+"cannot read searchQuery: %w", err)
+		return fmt.Errorf("cannot read searchQuery: %w", err)
 	}
 	var tail []byte
 	var err error
@@ -390,10 +382,10 @@ func (ctx *vmselectRequestCtx) readSearchQuery(downsample bool) error {
 		tail, err = ctx.sq.Unmarshal(ctx.dataBuf)
 	}
 	if err != nil {
-		return fmt.Errorf(ctx.errorPrefix+"cannot unmarshal SearchQuery: %w", err)
+		return fmt.Errorf("cannot unmarshal SearchQuery: %w", err)
 	}
 	if len(tail) > 0 {
-		return fmt.Errorf(ctx.errorPrefix+"unexpected non-zero tail left after unmarshaling SearchQuery: (len=%d) %q", len(tail), tail)
+		return fmt.Errorf("unexpected non-zero tail left after unmarshaling SearchQuery: (len=%d) %q", len(tail), tail)
 	}
 	return nil
 }
@@ -465,15 +457,12 @@ func (ctx *vmselectRequestCtx) writeErrorMessage(err error) error {
 		err = fmt.Errorf("cannot execute request in %d seconds: %w", ctx.timeout, err)
 	}
 	errMsg := err.Error()
-	if ctx.errorPrefix != "" && !strings.HasPrefix(errMsg, ctx.errorPrefix) {
-		errMsg = ctx.errorPrefix + errMsg
-	}
 	if len(errMsg) > maxErrorMessageSize {
 		// Trim too long error message.
 		errMsg = errMsg[:maxErrorMessageSize]
 	}
 	if err := ctx.writeString(errMsg); err != nil {
-		return fmt.Errorf(ctx.errorPrefix+"cannot send error message %q to client: %w", errMsg, err)
+		return fmt.Errorf("cannot send error message %q to client: %w", errMsg, err)
 	}
 	return nil
 }
@@ -494,7 +483,6 @@ func (ctx *vmselectRequestCtx) writeUint64(n uint64) error {
 const maxRPCNameSize = 128
 
 func (s *Server) processRequest(ctx *vmselectRequestCtx) error {
-	ctx.errorPrefix = ""
 	// Read rpcName
 	// Do not set deadline on reading rpcName, since it may take a
 	// lot of time for idle connection.
@@ -506,13 +494,10 @@ func (s *Server) processRequest(ctx *vmselectRequestCtx) error {
 		return fmt.Errorf("cannot read rpcName: %w", err)
 	}
 	rpcName := string(ctx.dataBuf)
-	if rpcName == "search_downsampling_v2" {
-		ctx.errorPrefix = "[downsampling] "
-	}
 
 	// Limit the time required for reading request args.
 	if err := ctx.bc.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return fmt.Errorf(ctx.errorPrefix+"cannot set read deadline for reading request args: %w", err)
+		return fmt.Errorf("cannot set read deadline for reading request args: %w", err)
 	}
 	defer func() {
 		_ = ctx.bc.SetReadDeadline(time.Time{})
@@ -521,28 +506,28 @@ func (s *Server) processRequest(ctx *vmselectRequestCtx) error {
 	// Initialize query tracing.
 	traceEnabled, err := ctx.readBool()
 	if err != nil {
-		return fmt.Errorf(ctx.errorPrefix+"cannot read traceEnabled: %w", err)
+		return fmt.Errorf("cannot read traceEnabled: %w", err)
 	}
 	ctx.qt = querytracer.New(traceEnabled, "rpc call %s() at vmstorage", rpcName)
 
 	// Read the timeout for request execution.
 	timeout, err := ctx.readUint32()
 	if err != nil {
-		return fmt.Errorf(ctx.errorPrefix+"cannot read timeout for the request %q: %w", rpcName, err)
+		return fmt.Errorf("cannot read timeout for the request %q: %w", rpcName, err)
 	}
 	ctx.timeout = uint64(timeout)
 	ctx.deadline = fasttime.UnixTimestamp() + uint64(timeout)
 
 	// Process the rpcName call.
 	if err := s.processRPC(ctx, rpcName); err != nil {
-		return fmt.Errorf(ctx.errorPrefix+"cannot execute %q: %w", rpcName, err)
+		return fmt.Errorf("cannot execute %q: %w", rpcName, err)
 	}
 
 	// Finish query trace.
 	ctx.qt.Done()
 	traceJSON := ctx.qt.ToJSON()
 	if err := ctx.writeString(traceJSON); err != nil {
-		return fmt.Errorf(ctx.errorPrefix+"cannot send trace with length %d bytes to vmselect: %w", len(traceJSON), err)
+		return fmt.Errorf("cannot send trace with length %d bytes to vmselect: %w", len(traceJSON), err)
 	}
 	return nil
 }
@@ -1051,7 +1036,7 @@ func (s *Server) processSearch(ctx *vmselectRequestCtx, downsample bool) error {
 
 	// Send empty error message to vmselect.
 	if err := ctx.writeString(""); err != nil {
-		return fmt.Errorf(ctx.errorPrefix+"cannot send empty error message: %w", err)
+		return fmt.Errorf("cannot send empty error message: %w", err)
 	}
 
 	// Send found blocks to vmselect.
@@ -1065,20 +1050,17 @@ func (s *Server) processSearch(ctx *vmselectRequestCtx, downsample bool) error {
 		blocksRead++
 		s.metricBlocksRead.Inc()
 		if err := ctx.writeDataBufBytes(); err != nil {
-			return fmt.Errorf(ctx.errorPrefix+"cannot send MetricBlock: %w", err)
+			return fmt.Errorf("cannot send MetricBlock: %w", err)
 		}
 	}
 
 	if err := bi.Error(); err != nil {
-		return fmt.Errorf(ctx.errorPrefix+"search error: %w", err)
+		return fmt.Errorf("search error: %w", err)
 	}
 	ctx.qt.Printf("sent %d blocks to vmselect", blocksRead)
 
 	// Send 'end of response' marker
 	if err := ctx.writeString(""); err != nil {
-		if downsample {
-			return fmt.Errorf("[downsampling] cannot send 'end of response' marker: %w", err)
-		}
 		return fmt.Errorf("cannot send 'end of response' marker")
 	}
 	return nil

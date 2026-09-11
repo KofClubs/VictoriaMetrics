@@ -268,7 +268,7 @@ func TestDownsampleSearchProtocolValidation(t *testing.T) {
 	}
 	for size := 0; size < len(wire); size++ {
 		received.DownsampleQuery = downsampleQuery
-		if _, err := received.UnmarshalDownsample(wire[:size]); err == nil || !strings.HasPrefix(err.Error(), "[downsampling] ") || received.DownsampleQuery != nil {
+		if _, err := received.UnmarshalDownsample(wire[:size]); err == nil || received.DownsampleQuery != nil {
 			t.Fatalf("截断长度 %d 未拒绝或特征未清除: %v", size, err)
 		}
 	}

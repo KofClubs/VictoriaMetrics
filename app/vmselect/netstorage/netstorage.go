@@ -1836,14 +1836,10 @@ func (e *tmpBlocksFileErr) Unwrap() error {
 //
 // Results.RunParallel or Results.Cancel must be called on the returned Results.
 func ProcessSearchQuery(qt *querytracer.Tracer, denyPartialResponse bool, sq *storage.SearchQuery, deadline searchutil.Deadline) (*Results, bool, error) {
-	errorPrefix := ""
-	if sq.DownsampleQuery != nil {
-		errorPrefix = "[downsampling] "
-	}
 	qt = qt.NewChild("fetch matching series: %s", sq)
 	defer qt.Done()
 	if deadline.Exceeded() {
-		return nil, false, fmt.Errorf(errorPrefix+"timeout exceeded before starting the query processing: %s", deadline.String())
+		return nil, false, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
 
 	// Setup search.
@@ -1866,7 +1862,7 @@ func ProcessSearchQuery(qt *querytracer.Tracer, denyPartialResponse bool, sq *st
 		n := samples.Add(workerID, uint64(mb.Block.RowsCount()))
 		if *maxSamplesPerQuery > 0 && n > maxSamplesPerWorker && samples.GetTotal() > uint64(*maxSamplesPerQuery) {
 			return &limitExceededErr{
-				err: fmt.Errorf(errorPrefix+"cannot select more than -search.maxSamplesPerQuery=%d samples; possible solutions: "+
+				err: fmt.Errorf("cannot select more than -search.maxSamplesPerQuery=%d samples; possible solutions: "+
 					"increase the -search.maxSamplesPerQuery; reduce time range for the query; "+
 					"use more specific label filters in order to select fewer series", *maxSamplesPerQuery),
 			}
@@ -1874,7 +1870,7 @@ func ProcessSearchQuery(qt *querytracer.Tracer, denyPartialResponse bool, sq *st
 
 		if err := tbfw.RegisterAndWriteBlock(mb, workerID); err != nil {
 			return &tmpBlocksFileErr{
-				err: fmt.Errorf(errorPrefix+"cannot write MetricBlock to temporary blocks file: %w", err),
+				err: fmt.Errorf("cannot write MetricBlock to temporary blocks file: %w", err),
 			}
 		}
 		return nil
@@ -1882,11 +1878,11 @@ func ProcessSearchQuery(qt *querytracer.Tracer, denyPartialResponse bool, sq *st
 	isPartial, err := processBlocks(qt, sns, denyPartialResponse, sq, processBlock, deadline)
 	if err != nil {
 		tbfw.closeTmpBlockFiles()
-		return nil, false, fmt.Errorf(errorPrefix+"error occured during search: %w", err)
+		return nil, false, fmt.Errorf("error occured during search: %w", err)
 	}
 	orderedMetricNames, addrssPool, m, bytesTotal, err := tbfw.Finalize()
 	if err != nil {
-		return nil, false, fmt.Errorf(errorPrefix+"cannot finalize temporary blocks files: %w", err)
+		return nil, false, fmt.Errorf("cannot finalize temporary blocks files: %w", err)
 	}
 	qt.Printf("fetch unique series=%d, blocks=%d, samples=%d, bytes=%d", len(m), blocksRead.GetTotal(), samples.GetTotal(), bytesTotal)
 
@@ -1986,13 +1982,12 @@ func processBlocksInternal(qt *querytracer.Tracer, sns []*storageNode, denyParti
 	})
 
 	// Collect results.
-	consumeResult := func(result any) error {
+	isPartial, err := snr.collectResults(partialSearchResults, func(result any) error {
 		if result != nil {
 			return result.(error)
 		}
 		return nil
-	}
-	isPartial, err := snr.collectDataSearchResults(sq.DownsampleQuery, consumeResult)
+	})
 	// Make sure that processBlock is no longer called after the exit from processBlocks() function.
 	for i := range wgs {
 		muwg := &wgs[i]
@@ -2004,9 +1999,6 @@ func processBlocksInternal(qt *querytracer.Tracer, sns []*storageNode, denyParti
 		wgs[i].wg.Wait()
 	}
 	if err != nil {
-		if sq.DownsampleQuery != nil {
-			return isPartial, fmt.Errorf("[downsampling] cannot fetch query results from vmstorage nodes: %w", err)
-		}
 		return isPartial, fmt.Errorf("cannot fetch query results from vmstorage nodes: %w", err)
 	}
 	return isPartial, nil
@@ -3393,11 +3385,17 @@ func execSearchQueryRequest(qt *querytracer.Tracer, sq *storage.SearchQuery, wor
 	var requestData []byte
 
 	for i := range sq.TenantTokens {
-		var rpcName string
-		var err error
-		requestData, rpcName, err = marshalDataSearchQuery(requestData, sq, sq.TenantTokens[i])
-		if err != nil {
-			return err
+		requestData = sq.TenantTokens[i].Marshal(requestData)
+		rpcName := "search_v7"
+		if sq.DownsampleQuery == nil {
+			requestData = sq.MarshalWithoutTenant(requestData)
+		} else {
+			rpcName = "search_downsampling_v2"
+			var err error
+			requestData, err = sq.MarshalDownsampleWithoutTenant(requestData)
+			if err != nil {
+				return err
+			}
 		}
 		qtL := qt
 		if sq.IsMultiTenant && qt.Enabled() {

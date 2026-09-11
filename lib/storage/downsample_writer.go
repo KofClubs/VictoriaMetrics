@@ -22,48 +22,74 @@ const downsampleMaxColumnSize = 2 * maxBlockSize
 
 // downsampleWriter 先同步全部列与索引，最后写入 metadata.json，以完整内容标记 part 写入完成。
 type downsampleWriter struct {
-	path                   string                                             // 本 writer 拥有的目标目录，发布前可由 Abort 删除。
-	timestampsWriter       filestream.WriteCloser                             // timestamps.bin
-	valuesWriter           filestream.WriteCloser                             // values.bin
-	indexWriter            filestream.WriteCloser                             // index.bin
-	metaindexWriter        filestream.WriteCloser                             // metaindex.bin
-	timestampsOffset       uint64                                             // timestamps.bin 的下一写入位置。
-	valuesOffset           uint64                                             // values.bin 的下一写入位置。
-	indexOffset            uint64                                             // index.bin 的下一写入位置。
-	compressLevel          int                                                // index 与 metaindex 的 ZSTD 压缩级别。
-	ph                     partHeader                                         // 已成功编码批次的 part 统计。
-	previous               blockHeader                                        // 上一批次编码前的时间范围，用于跨批次排序检查。
-	resolution             int64                                              // 当前 spill 中的数据分辨率。
-	spills                 [countOfDownsampleFeatures]*filestream.SpillWriter // 当前分辨率的五个特征 spill。
-	spillData              []byte                                             // 从 spill 读取一个已编码 value block 的临时缓冲。
-	indexLimit             int                                                // 测试可缩小的 index 上限；生产默认 maxBlockSize。
-	hasPrevious            bool                                               // 是否已经成功写入至少一个批次。
-	mr                     downsampleMetaindexRow                             // 当前 index block 对应的 metaindex 行。
-	indexData              []byte                                             // 当前 index block 的未压缩 header 数据。
-	metaindexData          []byte                                             // 当前 part 的全部未压缩 metaindex 行。
-	compressed             []byte                                             // index/metaindex 共用的压缩缓冲。
-	blocks                 [countOfDownsampleFeatures]Block                   // 当前批次的五个原生单特征 Block。
-	currentBlockTimestamps []int64                                            // 当前输出 block 的有效时间戳，不含空槽。
-	integers               []int64                                            // 当前特征转换成 decimal 后的整数缓冲。
-	currentFeatureValues   []float64                                          // 当前输出特征列的浮点缓冲，直接提取 Merge 已规范化的样本值。
-	finished               bool                                               // 最终文件已关闭并同步，等待调用方发布。
-	err                    error                                              // 首次失败后禁止重试或发布，只能 Abort/reset。
-	removeAll              func(string) error                                 // 仅供实例级故障测试替换目录删除；nil 时使用 os.RemoveAll。
+	// 本 writer 拥有的目标目录，发布前可由 Abort 删除。
+	partPath string
+	// timestampsWriter 写入 timestamps.bin；Finish 或 Abort 关闭并清除句柄。
+	timestampsWriter filestream.WriteCloser
+	// valuesWriter 写入 values.bin；Finish 或 Abort 关闭并清除句柄。
+	valuesWriter filestream.WriteCloser
+	// indexWriter 写入 index.bin；Finish 或 Abort 关闭并清除句柄。
+	indexWriter filestream.WriteCloser
+	// metaindexWriter 写入 metaindex.bin；Finish 或 Abort 关闭并清除句柄。
+	metaindexWriter filestream.WriteCloser
+	// timestamps.bin 中下一个时间戳 block 的写入位置。
+	timestampsBlockOffset uint64
+	// values.bin 中下一个特征值 block 的写入位置。
+	valuesBlockOffset uint64
+	// index.bin 中下一个索引 block 的写入位置。
+	indexBlockOffset uint64
+	// index 与 metaindex 的 ZSTD 压缩级别。
+	compressLevel int
+	// 已成功写入批次的 part 统计，BlocksCount 同时标识是否已有上一批次。
+	partHeader partHeader
+	// 上一批次编码前的时间范围，用于跨批次排序检查。
+	previousBlockHeader blockHeader
+	// 当前五个特征 spill 所属的分辨率，切换前须全部输出。
+	currentResolution int64
+	// 当前分辨率各特征的 header 与值列，按特征顺序输出到最终文件。
+	currentResolutionFeatureSpills [countOfDownsampleFeatures]*filestream.SpillWriter
+	// 当前 spill 中已编码值列的读取缓冲，只保留一个 block。
+	currentFeatureValuesData []byte
+	// 测试可缩小的 index block 上限；生产默认 maxBlockSize。
+	maxIndexBlockSize int
+	// 当前 index block 对应的 metaindex 行，写出后清空。
+	currentIndexMetaindexRow downsampleMetaindexRow
+	// 当前 index block 的未压缩 header 数据，按 TSID 和时间排列。
+	currentIndexBlockData []byte
+	// 当前 part 的全部未压缩 metaindex 行，Finish 时集中写出。
+	partMetaindexData []byte
+	// index 与 metaindex 共用的压缩缓冲，二者不会同时写出。
+	compressedIndexData []byte
+	// 当前分辨率、当前特征的原生 Block，写入 spill 后供下一个特征复用。
+	currentFeatureBlock Block
+	// 当前输出 block 的有效时间戳，不含空槽。
+	currentBlockTimestamps []int64
+	// 当前输出 block 的共享编码时间戳副本，用于核对后续特征的编码结果。
+	currentBlockTimestampsData []byte
+	// 当前特征转换成 decimal 后的整数缓冲，交由原生 Block 复制和编码。
+	currentFeatureDecimalValues []int64
+	// 当前输出特征列的浮点缓冲，直接提取 Merge 已规范化的样本值。
+	currentFeatureValues []float64
+	// 最终文件已关闭并同步，等待调用方发布。
+	isFinished bool
+	// 首次失败后禁止重试或发布，只能 Abort/reset。
+	writeErr error
+	// 仅供实例级故障测试替换目录删除；nil 时使用 os.RemoveAll。
+	removeAll func(string) error
 }
 
 var errDownsampleNoSpace = errors.New("[downsampling] insufficient free space for downsampling")
 
 func (w *downsampleWriter) Init(path string, compressLevel int) error {
-	if !w.finished && w.path != "" {
-		return errors.Join(fmt.Errorf("[downsampling] writer still owns target %q; abort or release it before reinitializing", w.path), w.err)
+	if !w.isFinished && w.partPath != "" {
+		return errors.Join(fmt.Errorf("[downsampling] writer still owns target %q; abort or release it before reinitializing", w.partPath), w.writeErr)
 	}
 	w.reset()
 	if err := os.Mkdir(path, 0755); err != nil {
 		return fmt.Errorf("[downsampling] cannot create target directory %q: %w", path, err)
 	}
-	w.path = path
+	w.partPath = path
 	w.compressLevel = compressLevel
-	w.ph.Reset()
 	// 最终文件沿用共享 filestream 的创建、关闭及同步语义。
 	w.timestampsWriter = filestream.MustCreate(filepath.Join(path, timestampsFilename), false)
 	w.valuesWriter = filestream.MustCreate(filepath.Join(path, valuesFilename), false)
@@ -76,10 +102,10 @@ func (w *downsampleWriter) Init(path string, compressLevel int) error {
 // 空槽不输出；输入只读，写入结束后不保留其引用。
 // 有效样本须经 downsampleSample.Merge 生成；数值规范化由该方法统一完成。
 func (w *downsampleWriter) WriteSamples(tsid *TSID, resolution int64, bucketSamples []downsampleSample, stopCh <-chan struct{}) (err error) {
-	if w.err != nil {
-		return w.err
+	if w.writeErr != nil {
+		return w.writeErr
 	}
-	if w.path == "" || w.finished {
+	if w.partPath == "" || w.isFinished {
 		return fmt.Errorf("[downsampling] writer is not initialized or is already finished")
 	}
 	// 验证失败也取消整个未发布目标，不能把先前成功写入的批次单独发布。
@@ -131,10 +157,10 @@ func (w *downsampleWriter) WriteSamples(tsid *TSID, resolution int64, bucketSamp
 }
 
 func (w *downsampleWriter) Finish() (_ partHeader, err error) {
-	if w.err != nil {
-		return partHeader{}, w.err
+	if w.writeErr != nil {
+		return partHeader{}, w.writeErr
 	}
-	if w.path == "" || w.finished {
+	if w.partPath == "" || w.isFinished {
 		return partHeader{}, fmt.Errorf("[downsampling] writer is not initialized or is already finished")
 	}
 	defer func() {
@@ -142,8 +168,8 @@ func (w *downsampleWriter) Finish() (_ partHeader, err error) {
 			err = w.fail(err)
 		}
 	}()
-	if w.ph.RowsCount > 0 {
-		m := newDownsamplePartMetadata(w.ph)
+	if w.partHeader.RowsCount > 0 {
+		m := newDownsamplePartMetadata(w.partHeader)
 		if err := m.validate(); err != nil {
 			return partHeader{}, err
 		}
@@ -151,19 +177,16 @@ func (w *downsampleWriter) Finish() (_ partHeader, err error) {
 	if err := w.flushResolution(); err != nil {
 		return partHeader{}, err
 	}
-	if err := checkDownsampleFinishSpace(filepath.Dir(w.path), len(w.indexData), len(w.metaindexData)); err != nil {
+	if err := checkDownsampleFinishSpace(filepath.Dir(w.partPath), len(w.currentIndexBlockData), len(w.partMetaindexData)); err != nil {
 		return partHeader{}, err
 	}
-	if err := w.flushIndex(); err != nil {
-		return partHeader{}, err
-	}
-	if w.ph.RowsCount > 0 {
-		w.compressed = append(w.compressed[:0], downsampleMetaindexMagic...)
-		w.compressed = encoding.CompressZSTDLevel(w.compressed, w.metaindexData, w.compressLevel)
-		if len(w.compressed) > downsampleMaxMetaindexSize || len(w.compressed) > 2*len(w.metaindexData)+256+len(downsampleMetaindexMagic) {
+	if w.partHeader.RowsCount > 0 {
+		w.compressedIndexData = append(w.compressedIndexData[:0], downsampleMetaindexMagic...)
+		w.compressedIndexData = encoding.CompressZSTDLevel(w.compressedIndexData, w.partMetaindexData, w.compressLevel)
+		if len(w.compressedIndexData) > downsampleMaxMetaindexSize || len(w.compressedIndexData) > 2*len(w.partMetaindexData)+256+len(downsampleMetaindexMagic) {
 			return partHeader{}, fmt.Errorf("[downsampling] compressed metaindex exceeds the size limit")
 		}
-		if err := writeDownsampleData(w.metaindexWriter, w.compressed); err != nil {
+		if err := writeDownsampleData(w.metaindexWriter, w.compressedIndexData); err != nil {
 			return partHeader{}, err
 		}
 	}
@@ -176,14 +199,14 @@ func (w *downsampleWriter) Finish() (_ partHeader, err error) {
 		f.MustClose()
 	}
 	// 先完成所有数据文件的缓冲刷出、fsync 和目录项同步，再创建完成标志。
-	fs.MustSyncPath(w.path)
-	if w.ph.RowsCount > 0 {
-		m := newDownsamplePartMetadata(w.ph)
+	fs.MustSyncPath(w.partPath)
+	if w.partHeader.RowsCount > 0 {
+		m := newDownsamplePartMetadata(w.partHeader)
 		b, err := json.Marshal(&m)
 		if err != nil {
 			return partHeader{}, fmt.Errorf("[downsampling] cannot encode part metadata: %w", err)
 		}
-		metadataPath := filepath.Join(w.path, metadataFilename)
+		metadataPath := filepath.Join(w.partPath, metadataFilename)
 		// 直接写入最终路径；格式检测校验 JSON 完整性，不能仅凭文件存在判断完成。
 		var f filestream.WriteCloser = filestream.MustCreate(metadataPath, false)
 		err = writeDownsampleData(f, b)
@@ -191,23 +214,23 @@ func (w *downsampleWriter) Finish() (_ partHeader, err error) {
 		if err != nil {
 			return partHeader{}, err
 		}
-		fs.MustSyncPath(w.path)
+		fs.MustSyncPath(w.partPath)
 	}
-	fs.MustSyncPath(filepath.Dir(w.path))
-	w.finished = true
-	return w.ph, nil
+	fs.MustSyncPath(filepath.Dir(w.partPath))
+	w.isFinished = true
+	return w.partHeader, nil
 }
 
 // Abort 删除由本 writer 创建的未发布目标，包括 Finish 已完成但尚未发布的目标。
 func (w *downsampleWriter) Abort() error {
 	var errs []error
-	for feature, f := range w.spills {
+	for feature, f := range w.currentResolutionFeatureSpills {
 		if f != nil {
 			if err := f.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("[downsampling] cannot close feature %d spill: %w", feature, err))
 			}
-			// Close 已释放句柄；所有 spill 都在 w.path 下，剩余删除责任由目录路径持有。
-			w.spills[feature] = nil
+			// Close 已释放句柄；所有 spill 都在 w.partPath 下，剩余删除责任由目录路径持有。
+			w.currentResolutionFeatureSpills[feature] = nil
 		}
 	}
 	for _, file := range []*filestream.WriteCloser{&w.timestampsWriter, &w.valuesWriter, &w.indexWriter, &w.metaindexWriter} {
@@ -218,61 +241,58 @@ func (w *downsampleWriter) Abort() error {
 		*file = nil
 		f.MustClose()
 	}
-	w.finished = false
-	if w.path != "" {
+	w.isFinished = false
+	if w.partPath != "" {
 		removeAll := w.removeAll
 		if removeAll == nil {
 			removeAll = os.RemoveAll
 		}
-		if err := removeAll(w.path); err != nil {
-			errs = append(errs, fmt.Errorf("[downsampling] cannot remove unpublished target %q: %w", w.path, err))
+		if err := removeAll(w.partPath); err != nil {
+			errs = append(errs, fmt.Errorf("[downsampling] cannot remove unpublished target %q: %w", w.partPath, err))
 		} else {
-			w.path = ""
+			w.partPath = ""
 		}
 	}
 	err := errors.Join(errs...)
 	if err != nil {
-		w.err = errors.Join(w.err, err)
+		w.writeErr = errors.Join(w.writeErr, err)
 	}
 	return err
 }
 
 // reset 只清理逻辑状态和工作缓冲；调用方必须已完成或显式 Abort 所有文件资源。
 func (w *downsampleWriter) reset() {
-	w.path = ""
-	w.timestampsOffset = 0
-	w.valuesOffset = 0
-	w.indexOffset = 0
+	w.partPath = ""
+	w.timestampsBlockOffset = 0
+	w.valuesBlockOffset = 0
+	w.indexBlockOffset = 0
 	w.compressLevel = 0
-	w.ph.Reset()
-	w.previous = blockHeader{}
-	w.resolution = 0
-	w.indexLimit = 0
-	w.spillData = nil
-	w.hasPrevious = false
-	w.mr = downsampleMetaindexRow{}
-	w.finished = false
-	w.err = nil
+	w.partHeader.Reset()
+	w.previousBlockHeader = blockHeader{}
+	w.currentResolution = 0
+	w.maxIndexBlockSize = 0
+	w.currentFeatureValuesData = nil
+	w.currentIndexMetaindexRow = downsampleMetaindexRow{}
+	w.isFinished = false
+	w.writeErr = nil
 	w.removeAll = nil
-	for i := range w.blocks {
-		w.blocks[i].Reset()
-	}
-	for _, b := range []*[]byte{&w.indexData, &w.compressed} {
+	w.currentFeatureBlock.Reset()
+	for _, b := range []*[]byte{&w.currentIndexBlockData, &w.compressedIndexData, &w.currentBlockTimestampsData} {
 		if cap(*b) > downsampleMaxIndexSize {
 			*b = nil
 		} else {
 			*b = (*b)[:0]
 		}
 	}
-	if cap(w.metaindexData) > 1<<20 {
-		w.metaindexData = nil
+	if cap(w.partMetaindexData) > 1<<20 {
+		w.partMetaindexData = nil
 	} else {
-		w.metaindexData = w.metaindexData[:0]
+		w.partMetaindexData = w.partMetaindexData[:0]
 	}
-	if cap(w.integers) > downsampleMaxPooledRows {
-		w.integers = nil
+	if cap(w.currentFeatureDecimalValues) > downsampleMaxPooledRows {
+		w.currentFeatureDecimalValues = nil
 	} else {
-		w.integers = w.integers[:0]
+		w.currentFeatureDecimalValues = w.currentFeatureDecimalValues[:0]
 	}
 	if cap(w.currentFeatureValues) > downsampleMaxPooledRows {
 		w.currentFeatureValues = nil
@@ -287,12 +307,12 @@ func (w *downsampleWriter) reset() {
 }
 
 func (w *downsampleWriter) fail(err error) error {
-	if !errors.Is(w.err, err) {
-		w.err = errors.Join(w.err, fmt.Errorf("[downsampling] cannot complete target %q: %w", w.path, err))
+	if !errors.Is(w.writeErr, err) {
+		w.writeErr = errors.Join(w.writeErr, fmt.Errorf("[downsampling] cannot complete target %q: %w", w.partPath, err))
 	}
 	// 先保存工作错误，Abort 只追加清理错误，后续重试不能覆盖首次失败原因。
 	_ = w.Abort()
-	return w.err
+	return w.writeErr
 }
 
 func checkDownsampleWriteStopped(stopCh <-chan struct{}) error {
@@ -327,23 +347,24 @@ func (w *downsampleWriter) writeSamplesBlock(tsid *TSID, resolution int64, sampl
 		return fmt.Errorf("[downsampling] invalid output block row count")
 	}
 	h := blockHeader{TSID: *tsid, RowsCount: uint32(n), MinTimestamp: w.currentBlockTimestamps[0], MaxTimestamp: w.currentBlockTimestamps[n-1]}
-	if w.hasPrevious && (resolution < w.resolution || (resolution == w.resolution && (downsampleHeaderLess(&h, &w.previous) || (h.TSID == w.previous.TSID && h.MinTimestamp/resolution <= w.previous.MaxTimestamp/resolution)))) {
+	if w.partHeader.BlocksCount > 0 && (resolution < w.currentResolution || (resolution == w.currentResolution && (downsampleHeaderLess(&h, &w.previousBlockHeader) || (h.TSID == w.previousBlockHeader.TSID && h.MinTimestamp/resolution <= w.previousBlockHeader.MaxTimestamp/resolution)))) {
 		return fmt.Errorf("[downsampling] blocks are out of order or contain duplicate buckets before encoding")
 	}
-	if ^uint64(0)-w.ph.RowsCount < uint64(n)*countOfDownsampleFeatures || ^uint64(0)-w.ph.BlocksCount < countOfDownsampleFeatures {
+	if ^uint64(0)-w.partHeader.RowsCount < uint64(n)*countOfDownsampleFeatures || ^uint64(0)-w.partHeader.BlocksCount < countOfDownsampleFeatures {
 		return fmt.Errorf("[downsampling] part row or block count overflows")
 	}
-	if err := checkDownsampleWriteSpace(filepath.Dir(w.path), n); err != nil {
+	if err := checkDownsampleWriteSpace(filepath.Dir(w.partPath), n); err != nil {
 		return err
 	}
-	if w.hasPrevious && resolution != w.resolution {
+	if w.partHeader.BlocksCount > 0 && resolution != w.currentResolution {
 		if err := w.flushResolution(); err != nil {
 			return err
 		}
 	}
-	w.resolution = resolution
-	sharedTimestampOffset := w.timestampsOffset
-	for feature := range w.blocks {
+	w.currentResolution = resolution
+	sharedTimestampOffset := w.timestampsBlockOffset
+	var sharedTimestampHeader blockHeader
+	for currentFeature := range countOfDownsampleFeatures {
 		w.currentFeatureValues = w.currentFeatureValues[:0]
 		for i := range samples {
 			if err := checkDownsampleWriteStopped(stopCh); err != nil {
@@ -353,55 +374,53 @@ func (w *downsampleWriter) writeSamplesBlock(tsid *TSID, resolution int64, sampl
 			if s.isEmpty() {
 				continue
 			}
-			w.currentFeatureValues = append(w.currentFeatureValues, s.values[feature])
+			w.currentFeatureValues = append(w.currentFeatureValues, s.values[currentFeature])
 		}
 		var scale int16
-		w.integers, scale = decimal.AppendFloatToDecimal(w.integers[:0], w.currentFeatureValues)
-		// 每个特征拥有独立的原生 Block，时间戳和 values 均沿用 raw 的精度。
-		fb := &w.blocks[feature]
-		fb.Init(tsid, w.currentBlockTimestamps, w.integers, scale, precisionBits)
+		w.currentFeatureDecimalValues, scale = decimal.AppendFloatToDecimal(w.currentFeatureDecimalValues[:0], w.currentFeatureValues)
+		// 每个特征依次使用同一个原生 Block；Init 复制输入，编码仍沿用 raw 的精度。
+		fb := &w.currentFeatureBlock
+		fb.Init(tsid, w.currentBlockTimestamps, w.currentFeatureDecimalValues, scale, precisionBits)
 		_, timestampsData, _ := fb.MarshalData(sharedTimestampOffset, 0)
-		if feature > 0 && (!bytes.Equal(timestampsData, w.blocks[0].timestampsData) || !sameDownsampleTimestamps(&fb.bh, &w.blocks[0].bh)) {
+		if currentFeature > 0 && (!bytes.Equal(timestampsData, w.currentBlockTimestampsData) || !sameDownsampleTimestamps(&fb.bh, &sharedTimestampHeader)) {
 			return fmt.Errorf("[downsampling] feature blocks encode different shared timestamps")
 		}
 		if err := validateDownsampleHeader(&fb.bh); err != nil {
 			return err
 		}
-	}
-	if err := checkDownsampleWriteStopped(stopCh); err != nil {
-		return err
-	}
-	if err := writeDownsamplePayload(w.timestampsWriter, &w.timestampsOffset, w.blocks[0].timestampsData); err != nil {
-		return err
-	}
-	for i := range w.blocks {
 		if err := checkDownsampleWriteStopped(stopCh); err != nil {
 			return err
 		}
-		if w.spills[i] == nil {
-			w.spills[i] = filestream.NewSpillWriter(w.path, downsampleFeatureNames[i])
+		if currentFeature == downsampleFeatureLast {
+			// 后续 Init/MarshalData 会覆盖 Block 缓冲，必须保存独立副本作为五列共享时间戳的基准。
+			w.currentBlockTimestampsData = append(w.currentBlockTimestampsData[:0], timestampsData...)
+			sharedTimestampHeader = fb.bh
+			if err := writeDownsamplePayload(w.timestampsWriter, &w.timestampsBlockOffset, timestampsData); err != nil {
+				return err
+			}
 		}
-		fb := &w.blocks[i]
-		if err := writeDownsampleData(w.spills[i], fb.headerData); err != nil {
+		if w.currentResolutionFeatureSpills[currentFeature] == nil {
+			w.currentResolutionFeatureSpills[currentFeature] = filestream.NewSpillWriter(w.partPath, downsampleFeatureNames[currentFeature])
+		}
+		if err := writeDownsampleData(w.currentResolutionFeatureSpills[currentFeature], fb.headerData); err != nil {
 			return err
 		}
-		if err := writeDownsampleData(w.spills[i], fb.valuesData); err != nil {
+		if err := writeDownsampleData(w.currentResolutionFeatureSpills[currentFeature], fb.valuesData); err != nil {
 			return err
 		}
 	}
-	w.ph.RowsCount += uint64(n) * countOfDownsampleFeatures
-	w.ph.BlocksCount += countOfDownsampleFeatures
-	w.ph.MinTimestamp = min(w.ph.MinTimestamp, h.MinTimestamp)
-	w.ph.MaxTimestamp = max(w.ph.MaxTimestamp, h.MaxTimestamp)
-	w.previous = h
-	w.hasPrevious = true
+	w.partHeader.RowsCount += uint64(n) * countOfDownsampleFeatures
+	w.partHeader.BlocksCount += countOfDownsampleFeatures
+	w.partHeader.MinTimestamp = min(w.partHeader.MinTimestamp, h.MinTimestamp)
+	w.partHeader.MaxTimestamp = max(w.partHeader.MaxTimestamp, h.MaxTimestamp)
+	w.previousBlockHeader = h
 	return nil
 }
 
 // flushResolution 是有界外部转置：每个 spill 已按 TSID/MinTimestamp 排序，
 // 依次消费五个文件即可保证整个 part 的 resolution/feature 全局顺序。
 func (w *downsampleWriter) flushResolution() error {
-	limit := w.indexLimit
+	limit := w.maxIndexBlockSize
 	if limit == 0 {
 		limit = maxBlockSize
 	}
@@ -411,7 +430,7 @@ func (w *downsampleWriter) flushResolution() error {
 	// spill 尚未删除时，最终 values/index/metaindex 仍需额外空间。
 	var pending uint64
 	var spillCount int
-	for _, f := range w.spills {
+	for _, f := range w.currentResolutionFeatureSpills {
 		if f == nil {
 			continue
 		}
@@ -424,12 +443,12 @@ func (w *downsampleWriter) flushResolution() error {
 	if spillCount != countOfDownsampleFeatures {
 		return fmt.Errorf("[downsampling] a feature spill is missing")
 	}
-	if err := checkDownsamplePathSpace(filepath.Dir(w.path), pending); err != nil {
+	if err := checkDownsamplePathSpace(filepath.Dir(w.partPath), pending); err != nil {
 		return err
 	}
 	header := make([]byte, marshaledBlockHeaderSize)
 	var expectedBlocks, expectedRows uint64
-	for feature, f := range w.spills {
+	for feature, f := range w.currentResolutionFeatureSpills {
 		err := f.Read(func(r io.Reader) error {
 			var previous blockHeader
 			var blocks, rows uint64
@@ -448,7 +467,7 @@ func (w *downsampleWriter) flushResolution() error {
 				if err := validateDownsampleHeader(&h); err != nil {
 					return err
 				}
-				if err := checkDownsampleExtent(h.TimestampsBlockOffset, h.TimestampsBlockSize, w.timestampsOffset); err != nil {
+				if err := checkDownsampleExtent(h.TimestampsBlockOffset, h.TimestampsBlockSize, w.timestampsBlockOffset); err != nil {
 					return err
 				}
 				if blocks > 0 && (!downsampleHeadersOrdered(&previous, &h) || h.TimestampsBlockOffset != previous.TimestampsBlockOffset+uint64(previous.TimestampsBlockSize)) {
@@ -457,30 +476,30 @@ func (w *downsampleWriter) flushResolution() error {
 				previous = h
 				blocks++
 				rows += uint64(h.RowsCount)
-				if len(w.indexData)+marshaledBlockHeaderSize > limit || (w.mr.BlockHeadersCount > 0 && !sameDownsampleTenant(&h.TSID, &w.mr.TSID)) {
+				if len(w.currentIndexBlockData)+marshaledBlockHeaderSize > limit || (w.currentIndexMetaindexRow.BlockHeadersCount > 0 && !sameDownsampleTenant(&h.TSID, &w.currentIndexMetaindexRow.TSID)) {
 					if err := w.flushIndex(); err != nil {
 						return err
 					}
 				}
-				if err := checkDownsampleWriteSpace(filepath.Dir(w.path), int(h.RowsCount)); err != nil {
+				if err := checkDownsampleWriteSpace(filepath.Dir(w.partPath), int(h.RowsCount)); err != nil {
 					return err
 				}
-				if cap(w.spillData) < int(h.ValuesBlockSize) {
-					w.spillData = make([]byte, h.ValuesBlockSize)
+				if cap(w.currentFeatureValuesData) < int(h.ValuesBlockSize) {
+					w.currentFeatureValuesData = make([]byte, h.ValuesBlockSize)
 				}
-				w.spillData = w.spillData[:h.ValuesBlockSize]
-				if _, err := io.ReadFull(r, w.spillData); err != nil {
+				w.currentFeatureValuesData = w.currentFeatureValuesData[:h.ValuesBlockSize]
+				if _, err := io.ReadFull(r, w.currentFeatureValuesData); err != nil {
 					return err
 				}
-				h.ValuesBlockOffset = w.valuesOffset
-				if err := writeDownsamplePayload(w.valuesWriter, &w.valuesOffset, w.spillData); err != nil {
+				h.ValuesBlockOffset = w.valuesBlockOffset
+				if err := writeDownsamplePayload(w.valuesWriter, &w.valuesBlockOffset, w.currentFeatureValuesData); err != nil {
 					return err
 				}
-				w.indexData = h.Marshal(w.indexData)
-				w.mr.ResolutionMs, w.mr.feature = w.resolution, uint8(feature)
-				w.mr.RegisterBlockHeader(&h)
-				w.mr.LastTSID = h.TSID
-				w.mr.RowsCount += uint64(h.RowsCount)
+				w.currentIndexBlockData = h.Marshal(w.currentIndexBlockData)
+				w.currentIndexMetaindexRow.ResolutionMs, w.currentIndexMetaindexRow.feature = w.currentResolution, uint8(feature)
+				w.currentIndexMetaindexRow.RegisterBlockHeader(&h)
+				w.currentIndexMetaindexRow.LastTSID = h.TSID
+				w.currentIndexMetaindexRow.RowsCount += uint64(h.RowsCount)
 			}
 			if feature == 0 {
 				expectedBlocks, expectedRows = blocks, rows
@@ -492,51 +511,44 @@ func (w *downsampleWriter) flushResolution() error {
 			}
 			return w.flushIndex()
 		})
+		// 无论 Read 是否成功，本 spill 都只关闭一次；先清除引用，残留文件由 Abort 删除目标目录。
+		w.currentResolutionFeatureSpills[feature] = nil
+		if closeErr := f.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("[downsampling] cannot close feature %d spill: %w", feature, closeErr))
+		}
 		if err != nil {
-			// Read 是只读操作；失败后仍须显式 Close 释放本 spill，其余未消费的
-			// spill 由后续 Abort 兜底清理。
-			if closeErr := f.Close(); closeErr != nil {
-				err = errors.Join(err, fmt.Errorf("[downsampling] cannot close feature %d spill: %w", feature, closeErr))
-			}
-			w.spills[feature] = nil
 			return fmt.Errorf("[downsampling] cannot consume feature %d spill: %w", feature, err)
 		}
-		// Read 是只读操作，不关闭句柄也不删除文件；Close 是最后显式调用，负责
-		// 释放内存、关闭文件并删除临时文件。残留文件仍由目标目录的 Abort 兜底。
-		if err := f.Close(); err != nil {
-			return fmt.Errorf("[downsampling] cannot close feature %d spill: %w", feature, err)
-		}
-		w.spills[feature] = nil
 	}
 	return nil
 }
 
 func (w *downsampleWriter) flushIndex() error {
-	if len(w.indexData) == 0 {
+	if len(w.currentIndexBlockData) == 0 {
 		return nil
 	}
-	if len(w.metaindexData)+downsampleMetaindexRowSize > downsampleMaxMetaindexSize {
+	if len(w.partMetaindexData)+downsampleMetaindexRowSize > downsampleMaxMetaindexSize {
 		return fmt.Errorf("[downsampling] metaindex exceeds the memory limit")
 	}
-	if len(w.indexData) > maxBlockSize || len(w.indexData) != int(w.mr.BlockHeadersCount)*marshaledBlockHeaderSize {
+	if len(w.currentIndexBlockData) > maxBlockSize || len(w.currentIndexBlockData) != int(w.currentIndexMetaindexRow.BlockHeadersCount)*marshaledBlockHeaderSize {
 		return fmt.Errorf("[downsampling] invalid index block length or header count")
 	}
-	if err := checkDownsampleFinishSpace(filepath.Dir(w.path), len(w.indexData), len(w.metaindexData)); err != nil {
+	if err := checkDownsampleFinishSpace(filepath.Dir(w.partPath), len(w.currentIndexBlockData), len(w.partMetaindexData)); err != nil {
 		return err
 	}
-	w.compressed = append(w.compressed[:0], downsampleIndexMagic...)
-	w.compressed = encoding.CompressZSTDLevel(w.compressed, w.indexData, w.compressLevel)
-	if len(w.compressed) > downsampleMaxIndexSize || len(w.compressed) > 2*len(w.indexData)+256+len(downsampleIndexMagic) {
+	w.compressedIndexData = append(w.compressedIndexData[:0], downsampleIndexMagic...)
+	w.compressedIndexData = encoding.CompressZSTDLevel(w.compressedIndexData, w.currentIndexBlockData, w.compressLevel)
+	if len(w.compressedIndexData) > downsampleMaxIndexSize || len(w.compressedIndexData) > 2*len(w.currentIndexBlockData)+256+len(downsampleIndexMagic) {
 		return fmt.Errorf("[downsampling] compressed index block exceeds the size limit")
 	}
-	w.mr.IndexBlockOffset = w.indexOffset
-	w.mr.IndexBlockSize = uint32(len(w.compressed))
-	if err := writeDownsamplePayload(w.indexWriter, &w.indexOffset, w.compressed); err != nil {
+	w.currentIndexMetaindexRow.IndexBlockOffset = w.indexBlockOffset
+	w.currentIndexMetaindexRow.IndexBlockSize = uint32(len(w.compressedIndexData))
+	if err := writeDownsamplePayload(w.indexWriter, &w.indexBlockOffset, w.compressedIndexData); err != nil {
 		return err
 	}
-	w.metaindexData = w.mr.marshal(w.metaindexData)
-	w.indexData = w.indexData[:0]
-	w.mr = downsampleMetaindexRow{}
+	w.partMetaindexData = w.currentIndexMetaindexRow.marshal(w.partMetaindexData)
+	w.currentIndexBlockData = w.currentIndexBlockData[:0]
+	w.currentIndexMetaindexRow = downsampleMetaindexRow{}
 	return nil
 }
 
@@ -569,14 +581,10 @@ func writeDownsampleData(w io.Writer, b []byte) error {
 // 此处不重复扣除活动作业的完整预算，避免将当前 writer 自己的预留算作其他占用。
 // 外部写入和缓存期间的空间变化仍可能引发实际 I/O 错误，writer 必须保留 Abort 路径。
 func checkDownsampleWriteSpace(path string, rowsCount int) error {
-	if rowsCount < 0 || rowsCount > maxRowsPerBlock {
+	if rowsCount <= 0 || rowsCount > maxRowsPerBlock {
 		return fmt.Errorf("[downsampling] invalid downsampling block rows count %d", rowsCount)
 	}
 	size := estimateDownsampleOutputSize(uint64(rowsCount), 1)
-	if rowsCount == 0 {
-		// 未提供实际索引长度时，以格式允许的最大最终输出进行保守检查。
-		size = downsampleMaxIndexSize + downsampleMaxMetaindexSize + downsampleMaxMetadataSize
-	}
 	return checkDownsamplePathSpace(path, size)
 }
 
@@ -652,8 +660,8 @@ func getDownsampleWriter() *downsampleWriter {
 }
 
 func putDownsampleWriter(w *downsampleWriter) {
-	if !w.finished && w.path != "" {
-		if err := w.Abort(); err != nil && w.path != "" {
+	if !w.isFinished && w.partPath != "" {
+		if err := w.Abort(); err != nil && w.partPath != "" {
 			return // 保留路径及错误，不把仍有待删除文件的对象放入池中。
 		}
 	}

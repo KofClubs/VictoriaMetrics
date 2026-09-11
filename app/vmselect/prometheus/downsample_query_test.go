@@ -64,26 +64,3 @@ func TestDownsampleQueryHTTPParameter(t *testing.T) {
 		}
 	}
 }
-
-func TestDownsampleQueryHTTPErrorPrefix(t *testing.T) {
-	for _, handler := range []string{"instant", "range"} {
-		for _, withDownsampleQuery := range []bool{true, false} {
-			for _, args := range []string{"query=", "query=m&step=invalid"} {
-				if withDownsampleQuery {
-					args += "&query.resolution=5m&query.feature=sum"
-				}
-				r := httptest.NewRequest("GET", "/api/v1/query?"+args, nil)
-				w := httptest.NewRecorder()
-				var err error
-				if handler == "instant" {
-					err = QueryHandler(nil, time.Now(), nil, w, r)
-				} else {
-					err = QueryRangeHandler(nil, time.Now(), nil, w, r)
-				}
-				if err == nil || strings.HasPrefix(err.Error(), "[downsampling] ") != withDownsampleQuery {
-					t.Fatalf("HTTP 错误前缀不匹配: handler=%s args=%s err=%v", handler, args, err)
-				}
-			}
-		}
-	}
-}

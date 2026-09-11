@@ -67,7 +67,7 @@ func (sq *SearchQuery) MarshalDownsampleWithoutTenant(dst []byte) ([]byte, error
 func (sq *SearchQuery) UnmarshalDownsample(src []byte) ([]byte, error) {
 	tail, err := sq.Unmarshal(src)
 	if err != nil {
-		return tail, fmt.Errorf("[downsampling] cannot decode search_downsampling_v2 query: %w", err)
+		return tail, err
 	}
 	if len(tail) < 9 {
 		return tail, fmt.Errorf("[downsampling] cannot decode search_downsampling_v2 selector: got %d bytes; need 9", len(tail))

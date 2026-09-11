@@ -51,12 +51,12 @@ func TestDownsampleClusterTenantIsolation(t *testing.T) {
 			t.Fatal(err)
 		}
 		for tenant, tsid := range tsids {
-			if !r.SeekTSID(tsid) || r.Header().TSID != tsid {
+			if !r.NextHeader() || r.Header().TSID != tsid {
 				t.Fatalf("租户 %d 定位失败: %v", tenant, r.Error())
 			}
 			want := [5]float64{float64(tenant*100 + 5), float64(tenant*300 + 15), 3, float64(tenant*100 + 2), float64(tenant*100 + 8)}
 			for feature := range want {
-				bh, err := r.readFeatureHeader(uint8(feature))
+				bh, err := r.readFeatureHeader(r.Header(), uint8(feature))
 				if err != nil || bh.TSID != tsid {
 					t.Fatalf("特征 header 丢失租户身份: %+v / %v", bh.TSID, err)
 				}
@@ -69,23 +69,16 @@ func TestDownsampleClusterTenantIsolation(t *testing.T) {
 					t.Fatalf("租户 %d 特征 %d 出现其他租户贡献: TSID=%+v values=%v", tenant, feature, block.bh.TSID, values)
 				}
 			}
-			if r.NextHeader() && r.Header().TSID == tsid || r.Error() != nil {
-				t.Fatalf("当前租户 TSID 返回额外 Block: %v", r.Error())
-			}
-			for _, missing := range []TSID{
-				{AccountID: 99, ProjectID: tsid.ProjectID, MetricGroupID: tsid.MetricGroupID, JobID: tsid.JobID, InstanceID: tsid.InstanceID, MetricID: tsid.MetricID},
-				{AccountID: tsid.AccountID, ProjectID: 99, MetricGroupID: tsid.MetricGroupID, JobID: tsid.JobID, InstanceID: tsid.InstanceID, MetricID: tsid.MetricID},
-			} {
-				if r.SeekTSID(missing) || r.Error() != nil {
-					t.Fatalf("仅租户标识不同的不存在 TSID 不应读取到数据: %+v / %v", missing, r.Error())
-				}
-			}
+
+		}
+		if r.NextHeader() || r.Error() != nil {
+			t.Fatalf("租户顺序扫描返回额外 block 或错误: %v", r.Error())
 		}
 	}
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if *r.Header() != (blockHeader{}) || r.p != nil || r.block.bh.TSID.AccountID != 0 || r.block.bh.TSID.ProjectID != 0 {
+	if *r.Header() != (blockHeader{}) || r.currentSourcePart != nil || r.currentFeatureBlock.bh.TSID.AccountID != 0 || r.currentFeatureBlock.bh.TSID.ProjectID != 0 {
 		t.Fatal("reader Close 遗留租户身份")
 	}
 }
@@ -358,7 +351,7 @@ func newDownsampleIterationPart(t *testing.T) *part {
 	if err := w.Init(path, 1); err != nil {
 		t.Fatal(err)
 	}
-	w.indexLimit = (downsampleIterationWideSeries + 1) * marshaledBlockHeaderSize
+	w.maxIndexBlockSize = (downsampleIterationWideSeries + 1) * marshaledBlockHeaderSize
 	b := getDownsampleDecodedResolutionFeaturesBlock()
 	defer putDownsampleDecodedResolutionFeaturesBlock(b)
 	var expectedRows uint64
@@ -483,36 +476,31 @@ func checkDownsampleIterationSearch(t *testing.T, ps *partSearch, p *part, tsids
 	}
 }
 
-func checkDownsampleIterationReader(t *testing.T, r *downsampleReader, p *part, resolution int64, feature uint8, currentTSID *TSID) {
+func checkDownsampleIterationReader(t *testing.T, r *downsampleReader, p *part, resolution int64) {
 	t.Helper()
-	var tsids []TSID
-	if currentTSID != nil {
-		tsids = []TSID{*currentTSID}
-	}
 	tr := TimeRange{MinTimestamp: minUnixMilli, MaxTimestamp: maxUnixMilli}
-	expected := downsampleIterationExpected(tsids, resolution, feature, tr)
+	var expected [countOfDownsampleFeatures][]downsampleIterationSample
+	for feature := range expected {
+		expected[feature] = downsampleIterationExpected(nil, resolution, uint8(feature), tr)
+	}
 	if err := r.Init(p, resolution); err != nil {
 		t.Fatal(err)
 	}
-	var ok bool
-	if currentTSID == nil {
-		ok = r.NextHeader()
-	} else {
-		ok = r.SeekTSID(*currentTSID)
-	}
 	count := 0
 	var b downsampleDecodedResolutionFeaturesBlock
-	for ; ok && (currentTSID == nil || r.Header().TSID == *currentTSID); ok = r.NextHeader() {
-		if err := r.ReadBlock(&b); err != nil {
+	for r.NextHeader() {
+		if err := r.ReadBlock(&b, r.Header()); err != nil {
 			t.Fatal(err)
 		}
 		if b.resolution != resolution {
 			t.Fatalf("读取了其他分辨率: %d", b.resolution)
 		}
 		for i, timestamp := range b.timestamps {
-			got := downsampleIterationSample{tsid: b.tsid, timestamp: timestamp, value: b.values[feature][i]}
-			if count >= len(expected) || got != expected[count] {
-				t.Fatalf("reader sample %d is missing, duplicated or belongs to another TSID: %+v", count, got)
+			for feature := range expected {
+				got := downsampleIterationSample{tsid: b.tsid, timestamp: timestamp, value: b.values[feature][i]}
+				if count >= len(expected[feature]) || got != expected[feature][count] {
+					t.Fatalf("reader sample %d feature %d is missing, duplicated or belongs to another TSID: %+v", count, feature, got)
+				}
 			}
 			count++
 		}
@@ -520,10 +508,10 @@ func checkDownsampleIterationReader(t *testing.T, r *downsampleReader, p *part, 
 	if err := r.Error(); err != nil {
 		t.Fatal(err)
 	}
-	if count != len(expected) {
-		t.Fatalf("reader 遗漏样本: got=%d want=%d", count, len(expected))
+	if count != len(expected[downsampleFeatureLast]) {
+		t.Fatalf("reader 遗漏样本: got=%d want=%d", count, len(expected[downsampleFeatureLast]))
 	}
-	if currentTSID == nil && (r.NextHeader() || r.Error() != nil) {
+	if r.NextHeader() || r.Error() != nil {
 		t.Fatalf("reader 结束后再次产生结果或错误: %v", r.Error())
 	}
 }
@@ -576,8 +564,11 @@ func openDownsampleLayoutReaderFixture(t *testing.T, path string) *part {
 
 func checkDownsampleCrossIndexStateCleared(t *testing.T, r *downsampleReader) {
 	t.Helper()
-	for _, index := range r.featureIndexes {
-		if index.hasPreviousIndex || index.previousIndexEnd != 0 || index.previousTimestampEnd != 0 || index.previousValuesEnd != 0 {
+	if len(r.currentTSIDBlockHeaders) != 0 {
+		t.Fatal("reader 重置后仍保留先前 TSID 的 header")
+	}
+	for _, index := range r.currentResolutionFeatureIndexes {
+		if index.currentIndexBlockEndOffset != 0 || len(index.currentIndexBlockHeaders) != 0 {
 			t.Fatal("reader 重置后仍保留先前 index 边界")
 		}
 	}
@@ -592,7 +583,7 @@ func checkDownsampleCrossIndexRows(t *testing.T, r *downsampleReader, ids []uint
 		if i >= len(ids) || r.Header().TSID.MetricID != ids[i] {
 			t.Fatalf("读取顺序或筛选结果错误: position=%d, TSID=%+v", i, r.Header().TSID)
 		}
-		if err := r.ReadBlock(b); err != nil {
+		if err := r.ReadBlock(b, r.Header()); err != nil {
 			t.Fatal(err)
 		}
 		if len(b.timestamps) != 4 {
@@ -614,7 +605,7 @@ func writeDownsampleCrossIndexPart(t *testing.T) string {
 		t.Fatal(err)
 	}
 	// WriteSamples 暂存各 feature，实际切 index 发生在 flushResolution。
-	w.indexLimit = clusterDownsampleHeaderBytes
+	w.maxIndexBlockSize = clusterDownsampleHeaderBytes
 	for _, resolution := range []int64{300000, 3600000} {
 		for id := uint64(1); id <= 4; id++ {
 			b := &downsampleDecodedResolutionFeaturesBlock{tsid: TSID{MetricID: id}, resolution: resolution, precisionBits: 64}
@@ -778,7 +769,7 @@ func assertDownsampleTestPrecision64(t *testing.T, p *part) {
 		blocks := 0
 		for r.NextHeader() {
 			assertDownsampleTestHeaderPrecision(t, r, 64)
-			if err := r.ReadBlock(b); err != nil {
+			if err := r.ReadBlock(b, r.Header()); err != nil {
 				t.Fatal(err)
 			}
 			if b.precisionBits != 64 {
@@ -799,15 +790,15 @@ func assertDownsampleTestHeaderPrecision(t *testing.T, r *downsampleReader, want
 	t.Helper()
 	h := *r.Header()
 	if h.PrecisionBits != want {
-		t.Fatalf("resolution %d lost native precision: got=%d want=%d", r.resolution, h.PrecisionBits, want)
+		t.Fatalf("resolution %d lost native precision: got=%d want=%d", r.currentResolution, h.PrecisionBits, want)
 	}
 	for feature := uint8(0); feature < countOfDownsampleFeatures; feature++ {
-		column, err := r.readFeatureHeader(feature)
+		column, err := r.readFeatureHeader(r.Header(), feature)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if column.PrecisionBits != want || column.TSID != h.TSID || column.RowsCount != h.RowsCount || column.MinTimestamp != h.MinTimestamp || column.MaxTimestamp != h.MaxTimestamp || column.TimestampsBlockOffset != h.TimestampsBlockOffset || column.TimestampsBlockSize != h.TimestampsBlockSize || column.TimestampsMarshalType != h.TimestampsMarshalType {
-			t.Fatalf("resolution %d feature %d lost shared timestamps or precision %d: %+v", r.resolution, feature, want, column)
+			t.Fatalf("resolution %d feature %d lost shared timestamps or precision %d: %+v", r.currentResolution, feature, want, column)
 		}
 	}
 }
@@ -935,7 +926,7 @@ func readDownsampleTestPart(t *testing.T, p *part) map[downsampleTestKey]downsam
 			t.Fatal(err)
 		}
 		for r.NextHeader() {
-			if err := r.ReadBlock(b); err != nil {
+			if err := r.ReadBlock(b, r.Header()); err != nil {
 				t.Fatal(err)
 			}
 			for i, timestamp := range b.timestamps {
@@ -1188,7 +1179,7 @@ func assertDownsampleTestStorageRows(t *testing.T, s *Storage, want map[downsamp
 
 func newDownsampleCloseTestReader(t *testing.T) *downsampleReader {
 	t.Helper()
-	r := &downsampleReader{p: &part{}}
+	r := &downsampleReader{currentSourcePart: &part{}}
 	dir := t.TempDir()
 	newFile := func(name string) filestream.ReadAtCloser {
 		path := filepath.Join(dir, name)
@@ -1373,7 +1364,7 @@ func downsampleTestBlockSamples(block *downsampleDecodedResolutionFeaturesBlock)
 }
 
 // MergeRaw 将一条原始样本展开为五特征后合并；标记同样贡献一次 count。
-// 仅用于测试注入原始样本，生产路径由 downsampleReader.readRawBlock 在读取时批量展开。
+// 仅用于测试注入原始样本，生产路径由 downsampleReader.ReadBlock 在读取时批量展开。
 func (a *downsampleSample) MergeRaw(timestamp int64, value float64, precisionBits uint8) {
 	p := downsampleSample{
 		timestamp:     timestamp,
@@ -1456,7 +1447,7 @@ func readDownsampleBenchmarkBlocks(b *testing.B, p *part) []*downsampleDecodedRe
 		for r.NextHeader() {
 			block := getDownsampleDecodedResolutionFeaturesBlock()
 			b.Cleanup(func() { putDownsampleDecodedResolutionFeaturesBlock(block) })
-			if err := r.ReadBlock(block); err != nil {
+			if err := r.ReadBlock(block, r.Header()); err != nil {
 				b.Fatal(err)
 			}
 			blocks = append(blocks, block)
@@ -1527,13 +1518,13 @@ func assertDownsampleWriterAborted(t *testing.T, w *downsampleWriter, path strin
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("failed writer left its target or spills at %q: %v", path, err)
 	}
-	if w.path != "" || w.finished {
-		t.Fatalf("failed target is still publishable: path=%q; finished=%v", w.path, w.finished)
+	if w.partPath != "" || w.isFinished {
+		t.Fatalf("failed target is still publishable: path=%q; finished=%v", w.partPath, w.isFinished)
 	}
 	if w.timestampsWriter != nil || w.valuesWriter != nil || w.indexWriter != nil || w.metaindexWriter != nil {
 		t.Fatal("failed writer retained a final-file handle")
 	}
-	for _, spill := range w.spills {
+	for _, spill := range w.currentResolutionFeatureSpills {
 		if spill != nil {
 			t.Fatal("failed writer retained a spill")
 		}
@@ -1562,9 +1553,20 @@ func trackDownsampleWriterFiles(w *downsampleWriter) []*failingDownsampleFile {
 // readDownsampleFeatureBlockForTest 为测试单独解码一列，作为五特征共享时间戳读取的对照。
 // 生产合并始终通过 ReadBlock 读取完整五列，不需要这个单列入口。
 func readDownsampleFeatureBlockForTest(r *downsampleReader, dst *Block, feature uint8) error {
-	h, err := r.readFeatureHeader(feature)
+	h, err := r.readFeatureHeader(r.Header(), feature)
 	if err != nil {
 		return err
 	}
 	return r.readNativeBlock(dst, &h)
+}
+
+// downsampleIndexReadTestFile 记录顺序合并实际读取的索引偏移，不改变读取结果。
+type downsampleIndexReadTestFile struct {
+	filestream.ReadAtCloser
+	offsets []int64
+}
+
+func (f *downsampleIndexReadTestFile) ReadAt(dst []byte, offset int64) (int, error) {
+	f.offsets = append(f.offsets, offset)
+	return f.ReadAtCloser.ReadAt(dst, offset)
 }

@@ -63,28 +63,28 @@ func TestDownsampleWriterExistingDirectory(t *testing.T) {
 func TestDownsampleWriterBufferCapacity(t *testing.T) {
 	var w downsampleWriter
 	for i := 0; i < maxRowsPerBlock; i++ {
-		w.integers = append(w.integers, int64(i))
+		w.currentFeatureDecimalValues = append(w.currentFeatureDecimalValues, int64(i))
 		w.currentFeatureValues = append(w.currentFeatureValues, float64(i))
 		w.currentBlockTimestamps = append(w.currentBlockTimestamps, int64(i))
 	}
-	intsCap, floatsCap, timestampsCap := cap(w.integers), cap(w.currentFeatureValues), cap(w.currentBlockTimestamps)
+	intsCap, floatsCap, timestampsCap := cap(w.currentFeatureDecimalValues), cap(w.currentFeatureValues), cap(w.currentBlockTimestamps)
 	w.reset()
-	if cap(w.integers) != intsCap || cap(w.currentFeatureValues) != floatsCap || cap(w.currentBlockTimestamps) != timestampsCap {
+	if cap(w.currentFeatureDecimalValues) != intsCap || cap(w.currentFeatureValues) != floatsCap || cap(w.currentBlockTimestamps) != timestampsCap {
 		t.Fatal("writer discarded normal output buffer capacities")
 	}
-	if len(w.integers) != 0 || len(w.currentFeatureValues) != 0 || len(w.currentBlockTimestamps) != 0 {
+	if len(w.currentFeatureDecimalValues) != 0 || len(w.currentFeatureValues) != 0 || len(w.currentBlockTimestamps) != 0 {
 		t.Fatal("writer retained output buffer contents after reset")
 	}
 	w.currentFeatureValues = make([]float64, downsampleMaxPooledRows+1)
-	w.integers = make([]int64, downsampleMaxPooledRows+1)
+	w.currentFeatureDecimalValues = make([]int64, downsampleMaxPooledRows+1)
 	w.currentBlockTimestamps = make([]int64, downsampleMaxPooledRows+1)
 	w.reset()
-	if w.currentFeatureValues != nil || w.integers != nil || w.currentBlockTimestamps != nil {
+	if w.currentFeatureValues != nil || w.currentFeatureDecimalValues != nil || w.currentBlockTimestamps != nil {
 		t.Fatal("writer retained oversized output buffers")
 	}
 }
 
-// TestDownsampleNativeBlockReuse 验证五个独立 Block 共用精度，且 reader 返回原生 codec 的标准解码状态。
+// TestDownsampleNativeBlockReuse 逐列核对原生 Block 编码、共享时间戳和标准解码状态。
 func TestDownsampleNativeBlockReuse(t *testing.T) {
 	for _, precision := range []uint8{64, 8} {
 		t.Run(fmt.Sprintf("shared_precision_%d", precision), func(t *testing.T) {
@@ -113,20 +113,33 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 					t.Fatalf("少量数据写入创建了 spill 临时目录: %q", entry.Name())
 				}
 			}
-			var stored [5]Block
-			for feature := range w.blocks {
-				fb := &w.blocks[feature]
-				if fb.bh.TSID != batch.tsid || fb.bh.RowsCount != 1024 || fb.nextIdx != 0 || len(fb.values) != 0 || len(fb.timestamps) != 0 || len(fb.headerData) != marshaledBlockHeaderSize || fb.bh.PrecisionBits != batch.precisionBits {
-					t.Fatalf("特征 %d 未保持原生 Block 的编码状态", feature)
+			var stored [countOfDownsampleFeatures]Block
+			for feature := range stored {
+				// 独立构造原生编码作为对照，不依赖 writer 复用缓冲中的上一特征内容。
+				values, scale := decimal.AppendFloatToDecimal(nil, batch.values[feature])
+				want := &stored[feature]
+				want.Init(&batch.tsid, batch.timestamps, values, scale, precision)
+				want.MarshalData(0, 0)
+				if !bytes.Equal(w.currentBlockTimestampsData, want.timestampsData) || want.bh.TimestampsBlockOffset != 0 {
+					t.Fatalf("特征 %d 未引用同一时间戳负载", feature)
 				}
-				var originalHeader blockHeader
-				if tail, err := originalHeader.Unmarshal(fb.headerData); err != nil || len(tail) != 0 || originalHeader != fb.bh {
-					t.Fatalf("特征 %d 的 header 不是原生 Block header: %v", feature, err)
+				if err := w.currentResolutionFeatureSpills[feature].Read(func(r io.Reader) error {
+					got, err := io.ReadAll(r)
+					if err != nil {
+						return err
+					}
+					wantData := append(append([]byte(nil), want.headerData...), want.valuesData...)
+					if !bytes.Equal(got, wantData) {
+						return fmt.Errorf("feature %d spill differs from native Block encoding", feature)
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
 				}
-				stored[feature].CopyFrom(fb)
-				if feature > 0 && (!bytes.Equal(fb.timestampsData, w.blocks[0].timestampsData) || fb.bh.TimestampsBlockOffset != w.blocks[0].bh.TimestampsBlockOffset) {
-					t.Fatal("五个独立 Block 未引用同一时间戳负载")
-				}
+			}
+			fb := &w.currentFeatureBlock
+			if fb.bh != stored[downsampleFeatureMax].bh || fb.nextIdx != 0 || len(fb.values) != 0 || len(fb.timestamps) != 0 || !bytes.Equal(fb.headerData, stored[downsampleFeatureMax].headerData) || !bytes.Equal(fb.timestampsData, w.currentBlockTimestampsData) || !bytes.Equal(fb.valuesData, stored[downsampleFeatureMax].valuesData) {
+				t.Fatal("writer 未保持最后一个特征的原生 Block 编码状态")
 			}
 			if _, err := w.Finish(); err != nil {
 				t.Fatal(err)
@@ -169,7 +182,7 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 					t.Fatalf("特征 %d 未通过原生 Block 完成解码", feature)
 				}
 				// 查询用 header 直接进入既有 BlockRef，验证扩展格式不需要专用查询 decoder。
-				bh, err := r.readFeatureHeader(uint8(feature))
+				bh, err := r.readFeatureHeader(r.Header(), uint8(feature))
 				if err != nil || bh.PrecisionBits != precision {
 					t.Fatalf("查询未保留共享精度: %+v / %v", bh, err)
 				}
@@ -204,15 +217,13 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 				}
 			}
 			w.reset()
-			for feature := range w.blocks {
-				if w.blocks[feature].bh != (blockHeader{}) || len(w.blocks[feature].timestampsData) != 0 || len(w.blocks[feature].valuesData) != 0 {
-					t.Fatal("writer Reset 遗留特征 Block 状态")
-				}
+			if w.currentFeatureBlock.bh != (blockHeader{}) || len(w.currentFeatureBlock.timestampsData) != 0 || len(w.currentFeatureBlock.valuesData) != 0 || len(w.currentBlockTimestampsData) != 0 {
+				t.Fatal("writer Reset 遗留特征 Block 状态")
 			}
 			if err := r.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if r.block.bh != (blockHeader{}) || len(r.block.values) != 0 || len(r.block.timestamps) != 0 {
+			if r.currentFeatureBlock.bh != (blockHeader{}) || len(r.currentFeatureBlock.values) != 0 || len(r.currentFeatureBlock.timestamps) != 0 {
 				t.Fatal("reader Close 遗留 Block 状态")
 			}
 		})
@@ -468,7 +479,7 @@ func TestDownsampleSpaceBoundCoversEncodedParts(t *testing.T) {
 			if err := w.Init(path, 1); err != nil {
 				t.Fatal(err)
 			}
-			w.indexLimit = tc.indexLimit
+			w.maxIndexBlockSize = tc.indexLimit
 			var timestampBytes, valuesBytes uint64
 			for i := 0; i < tc.blockCount; i++ {
 				b := downsampleDecodedResolutionFeaturesBlock{tsid: TSID{MetricID: uint64(i + 1)}, resolution: downsampleResolution5m, precisionBits: 64}
@@ -485,13 +496,20 @@ func TestDownsampleSpaceBoundCoversEncodedParts(t *testing.T) {
 				if err := writeDownsampleTestBlock(w, &b); err != nil {
 					t.Fatal(err)
 				}
-				timestampBytes += uint64(len(w.blocks[0].timestampsData))
-				for feature := range w.blocks {
-					valuesBytes += uint64(len(w.blocks[feature].valuesData))
+				// 由独立的原生编码计算应写字节数，避免依赖 writer 已复用的特征缓冲。
+				for feature := range countOfDownsampleFeatures {
+					values, scale := decimal.AppendFloatToDecimal(nil, b.values[feature])
+					var nativeBlock Block
+					nativeBlock.Init(&b.tsid, b.timestamps, values, scale, b.precisionBits)
+					_, timestampsData, valuesData := nativeBlock.MarshalData(0, 0)
+					if feature == downsampleFeatureLast {
+						timestampBytes += uint64(len(timestampsData))
+					}
+					valuesBytes += uint64(len(valuesData))
 				}
 			}
 			var spillBytes uint64
-			for feature, f := range w.spills {
+			for feature, f := range w.currentResolutionFeatureSpills {
 				if f == nil {
 					t.Fatalf("missing spill for feature %d", feature)
 				}
@@ -501,15 +519,15 @@ func TestDownsampleSpaceBoundCoversEncodedParts(t *testing.T) {
 			if spillBytes != wantSpill {
 				t.Fatalf("spill must contain five headers/values, no timestamps: got %d; want %d", spillBytes, wantSpill)
 			}
-			if w.timestampsOffset != timestampBytes || w.valuesOffset != 0 || w.indexOffset != 0 {
-				t.Fatalf("before resolution flush only shared timestamps may reach final files: timestampsOffset=%d; valuesOffset=%d; indexOffset=%d; timestamps=%d", w.timestampsOffset, w.valuesOffset, w.indexOffset, timestampBytes)
+			if w.timestampsBlockOffset != timestampBytes || w.valuesBlockOffset != 0 || w.indexBlockOffset != 0 {
+				t.Fatalf("before resolution flush only shared timestamps may reach final files: timestampsOffset=%d; valuesOffset=%d; indexOffset=%d; timestamps=%d", w.timestampsBlockOffset, w.valuesBlockOffset, w.indexBlockOffset, timestampBytes)
 			}
 			ph, err := w.Finish()
 			if err != nil {
 				t.Fatal(err)
 			}
-			if w.timestampsOffset != timestampBytes || w.valuesOffset != valuesBytes {
-				t.Fatalf("flush duplicated timestamps or lost values: timestampsOffset=%d; valuesOffset=%d; timestamps=%d; values=%d", w.timestampsOffset, w.valuesOffset, timestampBytes, valuesBytes)
+			if w.timestampsBlockOffset != timestampBytes || w.valuesBlockOffset != valuesBytes {
+				t.Fatalf("flush duplicated timestamps or lost values: timestampsOffset=%d; valuesOffset=%d; timestamps=%d; values=%d", w.timestampsBlockOffset, w.valuesBlockOffset, timestampBytes, valuesBytes)
 			}
 			var encodedSize uint64
 			entries, err := os.ReadDir(path)
@@ -526,7 +544,7 @@ func TestDownsampleSpaceBoundCoversEncodedParts(t *testing.T) {
 			if len(entries) != 5 {
 				t.Fatalf("finished part must contain only five final files, no spills: got %d entries", len(entries))
 			}
-			for feature, f := range w.spills {
+			for feature, f := range w.currentResolutionFeatureSpills {
 				if f != nil {
 					t.Fatalf("finished writer retained spill %d", feature)
 				}
@@ -593,7 +611,7 @@ func TestDownsampleAvailableSpaceBoundaries(t *testing.T) {
 			t.Fatalf("invalid space budget did not return the space sentinel: %+v: %v", tc, err)
 		}
 	}
-	for _, rows := range []int{-1, maxRowsPerBlock + 1} {
+	for _, rows := range []int{-1, 0, maxRowsPerBlock + 1} {
 		if err := checkDownsampleWriteSpace("unused", rows); err == nil {
 			t.Fatalf("invalid block row count %d was accepted", rows)
 		}
@@ -699,8 +717,8 @@ func TestDownsampleWriterMetadataCompletion(t *testing.T) {
 			}()
 			switch scenario {
 			case "success":
-				if finishErr != nil || interrupted || !w.finished {
-					t.Fatalf("Finish did not complete: err=%v interrupted=%v finished=%v", finishErr, interrupted, w.finished)
+				if finishErr != nil || interrupted || !w.isFinished {
+					t.Fatalf("Finish did not complete: err=%v interrupted=%v finished=%v", finishErr, interrupted, w.isFinished)
 				}
 				m, err := readDownsampleMetadata(path)
 				if err != nil || m == nil || m.partHeader != ph {
@@ -719,8 +737,8 @@ func TestDownsampleWriterMetadataCompletion(t *testing.T) {
 					t.Fatalf("empty output must not publish completion metadata: %v", err)
 				}
 			default:
-				if !interrupted || w.finished {
-					t.Fatalf("interrupted Finish published its output: interrupted=%v finished=%v", interrupted, w.finished)
+				if !interrupted || w.isFinished {
+					t.Fatalf("interrupted Finish published its output: interrupted=%v finished=%v", interrupted, w.isFinished)
 				}
 				if m, err := readDownsampleMetadata(path); err == nil || m != nil {
 					t.Fatalf("interrupted data write has completion metadata: %+v / %v", m, err)
@@ -742,7 +760,7 @@ func TestDownsampleWriterMetadataCompletion(t *testing.T) {
 }
 
 func TestDownsampleWriterSpillAndValidationFailures(t *testing.T) {
-	for _, scenario := range []string{"spill_truncated_header", "invalid_next_batch"} {
+	for _, scenario := range []string{"spill_truncated_header", "invalid_next_batch", "later_feature_write"} {
 		t.Run(scenario, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "part")
 			var w downsampleWriter
@@ -756,7 +774,7 @@ func TestDownsampleWriterSpillAndValidationFailures(t *testing.T) {
 			}
 			switch scenario {
 			case "spill_truncated_header":
-				if _, err := w.spills[2].Write([]byte{1}); err != nil {
+				if _, err := w.currentResolutionFeatureSpills[2].Write([]byte{1}); err != nil {
 					t.Fatal(err)
 				}
 				_, err = w.Finish()
@@ -765,6 +783,21 @@ func TestDownsampleWriterSpillAndValidationFailures(t *testing.T) {
 				}
 			case "invalid_next_batch":
 				err = writeDownsampleTestBlock(&w, nil)
+			case "later_feature_write":
+				// 第三个特征失败时，共享时间戳和前两个特征已写入，仍须撤销整个目标。
+				spills := w.currentResolutionFeatureSpills
+				lastBytes, sumBytes := spills[downsampleFeatureLast].Size(), spills[downsampleFeatureSum].Size()
+				timestampBytes := w.timestampsBlockOffset
+				if err := spills[downsampleFeatureCount].Close(); err != nil {
+					t.Fatal(err)
+				}
+				err = writeDownsampleTestBlock(&w, fileTestDownsampleBlock(2, downsampleResolution5m))
+				if !errors.Is(err, os.ErrClosed) {
+					t.Fatalf("closed later feature spill must fail: %v", err)
+				}
+				if spills[downsampleFeatureLast].Size() <= lastBytes || spills[downsampleFeatureSum].Size() <= sumBytes || w.timestampsBlockOffset <= timestampBytes {
+					t.Fatal("later feature failure did not follow partial batch output")
+				}
 			}
 			if err == nil {
 				t.Fatal("expected failure")
@@ -828,7 +861,7 @@ func TestDownsampleWriterAbortRetriesOnlyDirectory(t *testing.T) {
 	if err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, downsampleResolution5m)); err != nil {
 		t.Fatal(err)
 	}
-	spills := w.spills
+	spills := w.currentResolutionFeatureSpills
 	writeErr := errors.New("injected write failure")
 	removeErr1 := errors.New("injected first removal failure")
 	removeErr2 := errors.New("injected second removal failure")
@@ -852,11 +885,11 @@ func TestDownsampleWriterAbortRetriesOnlyDirectory(t *testing.T) {
 	if !errors.Is(err, writeErr) || !errors.Is(err, removeErr1) || !strings.HasPrefix(err.Error(), "[downsampling]") {
 		t.Fatalf("failure lost its original cause or context: %v", err)
 	}
-	if w.path != path || w.finished {
+	if w.partPath != path || w.isFinished {
 		t.Fatal("failed removal lost the target's cleanup ownership")
 	}
 	for feature, spill := range spills {
-		if w.spills[feature] != nil {
+		if w.currentResolutionFeatureSpills[feature] != nil {
 			t.Fatalf("released spill %d remains available for repeated cleanup", feature)
 		}
 		if _, err := spill.Write(nil); !errors.Is(err, os.ErrClosed) {
@@ -872,21 +905,21 @@ func TestDownsampleWriterAbortRetriesOnlyDirectory(t *testing.T) {
 	if err := w.Init(newPath, 1); err == nil || !errors.Is(err, writeErr) || !errors.Is(err, removeErr1) {
 		t.Fatalf("Init discarded pending cleanup or its error: %v", err)
 	}
-	if w.path != path || removes != 1 {
+	if w.partPath != path || removes != 1 {
 		t.Fatal("Init changed or retried a pending target implicitly")
 	}
 	if err := w.Abort(); !errors.Is(err, removeErr2) {
 		t.Fatalf("removal was not retried: %v", err)
 	}
 	for _, cause := range []error{writeErr, removeErr1, removeErr2} {
-		if !errors.Is(w.err, cause) {
-			t.Fatalf("retry lost an earlier error %v: %v", cause, w.err)
+		if !errors.Is(w.writeErr, cause) {
+			t.Fatalf("retry lost an earlier error %v: %v", cause, w.writeErr)
 		}
 	}
 	if err := w.Abort(); err != nil {
 		t.Fatalf("successful cleanup reported an old operation error: %v", err)
 	}
-	if w.path != "" || removes != 3 {
+	if w.partPath != "" || removes != 3 {
 		t.Fatal("successful removal did not release the directory")
 	}
 	if err := w.Abort(); err != nil || removes != 3 {
@@ -897,13 +930,13 @@ func TestDownsampleWriterAbortRetriesOnlyDirectory(t *testing.T) {
 			t.Fatal("directory retry repeated final file cleanup")
 		}
 	}
-	if !errors.Is(w.err, writeErr) || !errors.Is(w.err, removeErr1) || !errors.Is(w.err, removeErr2) {
-		t.Fatalf("successful cleanup discarded the operation's error history: %v", w.err)
+	if !errors.Is(w.writeErr, writeErr) || !errors.Is(w.writeErr, removeErr1) || !errors.Is(w.writeErr, removeErr2) {
+		t.Fatalf("successful cleanup discarded the operation's error history: %v", w.writeErr)
 	}
 	if err := w.Init(newPath, 1); err != nil {
 		t.Fatalf("fully cleaned writer cannot be reused: %v", err)
 	}
-	if w.err != nil {
+	if w.writeErr != nil {
 		t.Fatal("new operation inherited the previous failure")
 	}
 }
@@ -931,7 +964,7 @@ func TestDownsampleWriterFinishedTargetOwnership(t *testing.T) {
 			if err := w.Init(newPath, 1); err != nil {
 				t.Fatalf("finished writer cannot be reused: %v", err)
 			}
-			if w.path != newPath || w.finished {
+			if w.partPath != newPath || w.isFinished {
 				t.Fatal("Init did not start an independent target")
 			}
 			if _, err := os.Stat(path); err != nil {
@@ -980,7 +1013,7 @@ func TestDownsampleWriterPoolKeepsPendingCleanup(t *testing.T) {
 	cause := errors.New("injected persistent removal failure")
 	w.removeAll = func(string) error { return cause }
 	putDownsampleWriter(&w)
-	if w.path != path || !errors.Is(w.err, cause) {
+	if w.partPath != path || !errors.Is(w.writeErr, cause) {
 		t.Fatal("pool release discarded pending cleanup ownership")
 	}
 	for _, f := range files {
@@ -1034,7 +1067,7 @@ func TestDownsampleWriterSamplesPreserveInput(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if w.ph.RowsCount != 0 || w.ph.BlocksCount != 0 || w.hasPrevious {
+			if w.partHeader.RowsCount != 0 || w.partHeader.BlocksCount != 0 {
 				t.Fatal("empty samples changed the output")
 			}
 			if err := w.WriteSamples(&tsid, downsampleResolution5m, samples, nil); err != nil {
@@ -1090,7 +1123,7 @@ func TestDownsampleWriterSamplesLaterBlockFailure(t *testing.T) {
 				if writes != 2 {
 					return nil
 				}
-				if w.ph.BlocksCount != countOfDownsampleFeatures {
+				if w.partHeader.BlocksCount != countOfDownsampleFeatures {
 					t.Fatal("failure did not occur after a completed output block")
 				}
 				if scenario == "cancel" {
