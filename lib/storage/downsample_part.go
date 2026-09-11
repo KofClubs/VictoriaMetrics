@@ -256,6 +256,13 @@ func openDownsamplePart(path string) (_ *part, err error) {
 	return p, nil
 }
 
+func checkDownsampleExtent(offset uint64, size uint32, fileSize uint64) error {
+	if offset > uint64(^uint64(0)>>1)-uint64(size) || offset > fileSize || uint64(size) > fileSize-offset {
+		return fmt.Errorf("[downsampling] payload exceeds file bounds: offset=%d size=%d fileSize=%d", offset, size, fileSize)
+	}
+	return nil
+}
+
 // 普通文件校验与打开失败清理由 filestream 负责；成功后交给 part 或 reader 持有。
 func openDownsamplePartDataFile(path, name string, dst *filestream.ReadAtCloser, size *uint64) error {
 	filePath := filepath.Join(path, name)
@@ -269,65 +276,67 @@ func openDownsamplePartDataFile(path, name string, dst *filestream.ReadAtCloser,
 }
 
 // 五路只保留各自当前 index block，不建立随 part 大小增长的 header/offset 集合。
-// 打开时验证全部索引，避免过滤查询跳过缺失列、跨组空洞或未引用尾部。
+// 打开校验仅读取索引，不借用合并 reader，也不解码 timestamps.bin 或 values.bin。
 func validateDownsamplePartIndexes(p *part) error {
-	var readers [countOfDownsampleFeatures]*downsampleReader
-	defer func() {
-		for _, r := range readers {
-			if r != nil {
-				putDownsampleReader(r)
-			}
-		}
-	}()
+	var cursors [countOfDownsampleFeatures]downsamplePartIndexCursor
 	var timestampEnd, valuesEnd uint64
+	metaPos := 0
 	for _, resolution := range p.dsMetadata.Resolutions {
 		var firstValues, lastValues [countOfDownsampleFeatures]uint64
+		var previousHeaders [countOfDownsampleFeatures]blockHeader
 		var seen bool
-		for feature := range readers {
-			if readers[feature] == nil {
-				readers[feature] = getDownsampleReader()
+		for feature := range cursors {
+			start := metaPos
+			for metaPos < len(p.dsMetaindex) && p.dsMetaindex[metaPos].ResolutionMs == resolution && p.dsMetaindex[metaPos].feature == uint8(feature) {
+				metaPos++
 			}
-			if err := readers[feature].Init(p, resolution, uint8(feature)); err != nil {
-				return err
-			}
+			cursors[feature].rows = p.dsMetaindex[start:metaPos]
+			cursors[feature].headers = cursors[feature].headers[:0]
+			cursors[feature].headerPos = 0
 		}
 		for {
-			var present [countOfDownsampleFeatures]bool
-			for feature, r := range readers {
-				present[feature] = r.NextHeader()
-				if err := r.Error(); err != nil {
+			var headers [countOfDownsampleFeatures]*blockHeader
+			for feature := range cursors {
+				h, err := cursors[feature].nextHeader(p)
+				if err != nil {
 					return err
 				}
+				headers[feature] = h
 			}
 			for feature := 1; feature < countOfDownsampleFeatures; feature++ {
-				if present[feature] != present[0] {
+				if (headers[feature] != nil) != (headers[0] != nil) {
 					return fmt.Errorf("[downsampling] missing feature columns or extra blocks at resolution %d", resolution)
 				}
 			}
-			if !present[0] {
+			h := headers[0]
+			if h == nil {
 				break
 			}
-			h := readers[0].Header()
 			if h.TimestampsBlockOffset != timestampEnd {
 				return fmt.Errorf("[downsampling] shared timestamp payloads are not contiguous")
 			}
 			timestampEnd += uint64(h.TimestampsBlockSize)
-			for feature, r := range readers {
-				column := r.Header()
+			for feature, column := range headers {
 				if !sameDownsampleTimestamps(h, column) {
 					return fmt.Errorf("[downsampling] the five feature columns have inconsistent timestamp descriptors at resolution %d", resolution)
 				}
 				if !seen {
 					firstValues[feature] = column.ValuesBlockOffset
-				} else if column.ValuesBlockOffset != lastValues[feature] {
-					return fmt.Errorf("[downsampling] feature column values payloads are not contiguous")
+				} else {
+					if !downsampleHeadersOrdered(&previousHeaders[feature], column) {
+						return fmt.Errorf("[downsampling] index blocks are out of order or have overlapping time ranges")
+					}
+					if column.ValuesBlockOffset != lastValues[feature] {
+						return fmt.Errorf("[downsampling] feature column values payloads are not contiguous")
+					}
 				}
 				lastValues[feature] = column.ValuesBlockOffset + uint64(column.ValuesBlockSize)
+				previousHeaders[feature] = *column
 			}
 			seen = true
 		}
 		if seen {
-			for feature := range readers {
+			for feature := range cursors {
 				if firstValues[feature] != valuesEnd {
 					return fmt.Errorf("[downsampling] values payloads are not contiguous across resolution/feature groups")
 				}
@@ -335,10 +344,123 @@ func validateDownsamplePartIndexes(p *part) error {
 			}
 		}
 	}
-	if timestampEnd != p.dsTimestampsSize || valuesEnd != p.dsValuesSize {
+	if metaPos != len(p.dsMetaindex) || timestampEnd != p.dsTimestampsSize || valuesEnd != p.dsValuesSize {
 		return fmt.Errorf("[downsampling] payload is truncated or contains an unreferenced tail")
 	}
 	return nil
+}
+
+// downsamplePartIndexCursor 只用于打开校验；各特征独立推进，允许其 index 分块边界不同。
+// 文件由 part 持有，游标只管理当前 index 的解码工作区，没有文件或对象池所有权。
+type downsamplePartIndexCursor struct {
+	rows       []downsampleMetaindexRow // 当前分辨率、特征尚未读取的索引行。
+	headers    []blockHeader            // 当前 index 的原生 header，下一次读取时复用容量。
+	headerPos  int                      // 当前 index 中下一条 header 的位置。
+	compressed []byte                   // 单个 index 的压缩读取缓冲。
+	indexData  []byte                   // 单个 index 的限长解压缓冲。
+}
+
+func (c *downsamplePartIndexCursor) nextHeader(p *part) (*blockHeader, error) {
+	if c.headerPos == len(c.headers) {
+		if len(c.rows) == 0 {
+			return nil, nil
+		}
+		m := &c.rows[0]
+		c.rows = c.rows[1:]
+		if m.IndexBlockSize > downsampleMaxIndexSize || m.BlockHeadersCount == 0 {
+			return nil, fmt.Errorf("[downsampling] invalid index block size or header count")
+		}
+		if err := checkDownsampleExtent(m.IndexBlockOffset, m.IndexBlockSize, p.dsIndexSize); err != nil {
+			return nil, err
+		}
+		if cap(c.compressed) < int(m.IndexBlockSize) {
+			c.compressed = make([]byte, m.IndexBlockSize)
+		} else {
+			c.compressed = c.compressed[:m.IndexBlockSize]
+		}
+		n, err := p.dsIndexFile.ReadAt(c.compressed, int64(m.IndexBlockOffset))
+		if err != nil {
+			return nil, fmt.Errorf("[downsampling] cannot read index block: %w", err)
+		}
+		if n != len(c.compressed) {
+			return nil, fmt.Errorf("[downsampling] cannot read complete index block: %w", io.ErrUnexpectedEOF)
+		}
+		if len(c.compressed) < len(downsampleIndexMagic) || string(c.compressed[:len(downsampleIndexMagic)]) != downsampleIndexMagic {
+			return nil, fmt.Errorf("[downsampling] invalid index magic")
+		}
+		c.indexData, err = encoding.DecompressZSTDLimited(c.indexData[:0], c.compressed[len(downsampleIndexMagic):], maxBlockSize)
+		if err != nil {
+			return nil, fmt.Errorf("[downsampling] cannot decompress index block: %w", err)
+		}
+		c.headers, err = unmarshalDownsampleIndexBlock(c.headers[:0], c.indexData, m, p.dsTimestampsSize, p.dsValuesSize, p.dsIndexSize)
+		if err != nil {
+			return nil, err
+		}
+		c.headerPos = 0
+	}
+	h := &c.headers[c.headerPos]
+	c.headerPos++
+	return h, nil
+}
+
+// unmarshalDownsampleIndexBlock 将已解压的单个 index block 解码为原生 header。
+// part 打开校验、合并和查询共用此无状态校验；跨 index 的完整性由各自的遍历负责。
+func unmarshalDownsampleIndexBlock(dst []blockHeader, data []byte, m *downsampleMetaindexRow, timestampsSize, valuesSize, indexSize uint64) ([]blockHeader, error) {
+	if m == nil || m.BlockHeadersCount == 0 || uint64(m.BlockHeadersCount)*uint64(marshaledBlockHeaderSize) > maxBlockSize || len(data) != int(m.BlockHeadersCount)*marshaledBlockHeaderSize {
+		return dst, fmt.Errorf("[downsampling] invalid decoded index size or header count")
+	}
+	if m.IndexBlockSize > downsampleMaxIndexSize {
+		return dst, fmt.Errorf("[downsampling] invalid index block size")
+	}
+	if err := checkDownsampleExtent(m.IndexBlockOffset, m.IndexBlockSize, indexSize); err != nil {
+		return dst, err
+	}
+	start := len(dst)
+	var err error
+	dst, err = unmarshalBlockHeaders(dst, data, int(m.BlockHeadersCount))
+	if err != nil {
+		return dst[:start], fmt.Errorf("[downsampling] cannot decode index block headers: %w", err)
+	}
+	headers := dst[start:]
+	var rows uint64
+	first, last := &headers[0], &headers[len(headers)-1]
+	minTime, maxTime := first.MinTimestamp, first.MaxTimestamp
+	for i := range headers {
+		h := &headers[i]
+		if err := validateDownsampleHeader(h); err != nil {
+			return dst[:start], err
+		}
+		if !sameDownsampleTenant(&h.TSID, &m.TSID) || h.TSID.Less(&m.TSID) || m.LastTSID.Less(&h.TSID) {
+			return dst[:start], fmt.Errorf("[downsampling] index block has an invalid tenant or TSID range")
+		}
+		if i > 0 {
+			previous := &headers[i-1]
+			if !downsampleHeadersOrdered(previous, h) {
+				return dst[:start], fmt.Errorf("[downsampling] block headers are out of order or have overlapping time ranges")
+			}
+			if h.TimestampsBlockOffset != previous.TimestampsBlockOffset+uint64(previous.TimestampsBlockSize) || h.ValuesBlockOffset != previous.ValuesBlockOffset+uint64(previous.ValuesBlockSize) {
+				return dst[:start], fmt.Errorf("[downsampling] adjacent block payloads are not contiguous")
+			}
+		}
+		if err := checkDownsampleExtent(h.TimestampsBlockOffset, h.TimestampsBlockSize, timestampsSize); err != nil {
+			return dst[:start], err
+		}
+		if err := checkDownsampleExtent(h.ValuesBlockOffset, h.ValuesBlockSize, valuesSize); err != nil {
+			return dst[:start], err
+		}
+		rows += uint64(h.RowsCount)
+		minTime, maxTime = min(minTime, h.MinTimestamp), max(maxTime, h.MaxTimestamp)
+	}
+	if m.IndexBlockOffset == 0 && (first.TimestampsBlockOffset != 0 || first.ValuesBlockOffset != 0) {
+		return dst[:start], fmt.Errorf("[downsampling] the first payload offset is not zero")
+	}
+	if m.IndexBlockOffset+uint64(m.IndexBlockSize) == indexSize && (last.TimestampsBlockOffset+uint64(last.TimestampsBlockSize) != timestampsSize || last.ValuesBlockOffset+uint64(last.ValuesBlockSize) != valuesSize) {
+		return dst[:start], fmt.Errorf("[downsampling] payloads are truncated or have an unreferenced tail")
+	}
+	if rows != m.RowsCount || first.TSID != m.TSID || last.TSID != m.LastTSID || minTime != m.MinTimestamp || maxTime != m.MaxTimestamp {
+		return dst[:start], fmt.Errorf("[downsampling] index statistics do not match the metaindex row")
+	}
+	return dst, nil
 }
 
 // estimateDownsamplePartSize 估算整个目标 part 的编码上界，不假设源 part 已被删除。

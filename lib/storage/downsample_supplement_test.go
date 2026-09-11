@@ -56,12 +56,12 @@ func TestDownsampleClusterTenantIsolation(t *testing.T) {
 			}
 			want := [5]float64{float64(tenant*100 + 5), float64(tenant*300 + 15), 3, float64(tenant*100 + 2), float64(tenant*100 + 8)}
 			for feature := range want {
-				bh, err := r.FieldHeader(uint8(feature))
+				bh, err := r.featureHeader(uint8(feature))
 				if err != nil || bh.TSID != tsid {
-					t.Fatalf("字段 header 丢失租户身份: %+v / %v", bh.TSID, err)
+					t.Fatalf("特征 header 丢失租户身份: %+v / %v", bh.TSID, err)
 				}
 				var block Block
-				if err := r.readFieldBlock(&block, uint8(feature)); err != nil {
+				if err := readDownsampleFeatureBlockForTest(r, &block, uint8(feature)); err != nil {
 					t.Fatal(err)
 				}
 				_, values := block.AppendRowsWithTimeRangeFilter(nil, nil, TimeRange{MinTimestamp: base, MaxTimestamp: base + resolution - 1})
@@ -465,10 +465,10 @@ func checkDownsampleIterationBlock(t *testing.T, br *BlockRef, tr TimeRange, exp
 	}
 }
 
-func checkDownsampleIterationSearch(t *testing.T, ps *partSearch, p *part, tsids []TSID, q DownsampleQueryField, tr TimeRange) {
+func checkDownsampleIterationSearch(t *testing.T, ps *partSearch, p *part, tsids []TSID, q DownsampleQuery, tr TimeRange) {
 	t.Helper()
 	expected := downsampleIterationExpected(tsids, q.ResolutionMs, q.Feature, tr)
-	ps.initWithDownsampleField(p, tsids, tr, &q)
+	ps.Init(p, tsids, tr, &q)
 	count := 0
 	for ps.NextBlock() {
 		checkDownsampleIterationBlock(t, &ps.BlockRef, tr, expected, &count)
@@ -494,7 +494,7 @@ func checkDownsampleIterationReader(t *testing.T, r *downsampleReader, p *part, 
 	r.SetFilter(filter, tr.MinTimestamp, tr.MaxTimestamp)
 	count := 0
 	for r.NextHeader() {
-		h, err := r.FieldHeader(feature)
+		h, err := r.featureHeader(feature)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -614,7 +614,7 @@ func writeDownsampleCrossIndexPart(t *testing.T) string {
 		t.Fatal(err)
 	}
 	// WriteSamples 暂存各 feature，实际切 index 发生在 flushResolution。
-	w.indexLimit = clusterDownsampleFieldHeaderBytes
+	w.indexLimit = clusterDownsampleHeaderBytes
 	for _, resolution := range []int64{300000, 3600000} {
 		for id := uint64(1); id <= 4; id++ {
 			b := &downsampleDecodedResolutionFeaturesBlock{tsid: TSID{MetricID: id}, resolution: resolution, precisionBits: 64}
@@ -665,7 +665,7 @@ func rewriteDownsampleCrossIndexFile(t *testing.T, path string, target int, muta
 		size := binary.BigEndian.Uint32(mr[60:64])
 		frame := indexFile[offset : offset+uint64(size)]
 		data, err := encoding.DecompressZSTDLimited(nil, frame[8:], maxBlockSize)
-		if err != nil || len(data) != clusterDownsampleFieldHeaderBytes || binary.BigEndian.Uint32(mr[32:36]) != 1 {
+		if err != nil || len(data) != clusterDownsampleHeaderBytes || binary.BigEndian.Uint32(mr[32:36]) != 1 {
 			t.Fatalf("测试 index 不是一个 89 字节原生 header: size=%d, err=%v", len(data), err)
 		}
 		if pos/clusterDownsampleMetaindexBytes == target {
@@ -686,8 +686,8 @@ func rewriteDownsampleCrossIndexFile(t *testing.T, path string, target int, muta
 }
 
 const (
-	clusterDownsampleFieldHeaderBytes = 89
-	clusterDownsampleMetaindexBytes   = 113
+	clusterDownsampleHeaderBytes    = 89
+	clusterDownsampleMetaindexBytes = 113
 )
 
 func makeDownsampleLayoutBlocks(blocksPerResolution int, singleRow bool) []*downsampleDecodedResolutionFeaturesBlock {
@@ -802,7 +802,7 @@ func assertDownsampleTestHeaderPrecision(t *testing.T, r *downsampleReader, want
 		t.Fatalf("resolution %d lost native precision: got=%d want=%d", r.resolution, h.PrecisionBits, want)
 	}
 	for feature := uint8(0); feature < countOfDownsampleFeatures; feature++ {
-		column, err := r.FieldHeader(feature)
+		column, err := r.featureHeader(feature)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1214,6 +1214,15 @@ type downsampleCloseTestFile struct {
 	closes   int
 }
 
+type downsampleQueryIndexTestFile struct {
+	filestream.ReadAtCloser
+	read func([]byte, int64) (int, error)
+}
+
+func (f *downsampleQueryIndexTestFile) ReadAt(dst []byte, offset int64) (int, error) {
+	return f.read(dst, offset)
+}
+
 func (f *downsampleCloseTestFile) Close() error {
 	f.closes++
 	return errors.Join(f.ReadAtCloser.Close(), f.closeErr)
@@ -1544,4 +1553,14 @@ func trackDownsampleWriterFiles(w *downsampleWriter) []*failingDownsampleFile {
 		files = append(files, f)
 	}
 	return files
+}
+
+// readDownsampleFeatureBlockForTest 为测试单独解码一列，作为五特征共享时间戳读取的对照。
+// 生产合并始终通过 ReadBlock 读取完整五列，不需要这个单列入口。
+func readDownsampleFeatureBlockForTest(r *downsampleReader, dst *Block, feature uint8) error {
+	h, err := r.featureHeader(feature)
+	if err != nil {
+		return err
+	}
+	return r.readNativeBlock(dst, &h)
 }

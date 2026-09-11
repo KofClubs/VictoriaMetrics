@@ -31,8 +31,8 @@ func (api *downsampleSearchTestAPI) InitSearch(_ *querytracer.Tracer, sq *storag
 	copy := *sq
 	api.received = &copy
 	value := int64(100)
-	if sq.DownsampleField != nil {
-		value += int64(sq.DownsampleField.Feature)
+	if sq.DownsampleQuery != nil {
+		value += int64(sq.DownsampleQuery.Feature)
 	}
 	mn := storage.MetricName{AccountID: sq.AccountID, ProjectID: sq.ProjectID, MetricGroup: []byte("downsample_rpc_probe")}
 	mb := storage.MetricBlock{MetricName: mn.Marshal(nil)}
@@ -80,8 +80,8 @@ func runDownsampleSearchRPC(t *testing.T, rpc string, payload []byte) ([]byte, *
 		defer bc.Close()
 		s := &Server{api: api, concurrencyLimitCh: make(chan struct{}, 1), searchRequests: &metrics.Counter{}, metricBlocksRead: &metrics.Counter{}}
 		ctx := &vmselectRequestCtx{bc: bc}
-		// 模拟连接上一次执行过字段查询，原生查询必须清除残留字段。
-		ctx.sq.DownsampleField = &storage.DownsampleQueryField{ResolutionMs: 3600000, Feature: 4}
+		// 模拟连接上一次执行过降采样查询，原生查询必须清除残留降采样参数。
+		ctx.sq.DownsampleQuery = &storage.DownsampleQuery{ResolutionMs: 3600000, Feature: 4}
 		err = s.processRPC(ctx, rpc)
 		if err == nil {
 			err = bc.Flush()
@@ -111,17 +111,21 @@ func runDownsampleSearchRPC(t *testing.T, rpc string, payload []byte) ([]byte, *
 
 func TestDownsampleSearchRPCDispatch(t *testing.T) {
 	for _, tenant := range []storage.TenantToken{{AccountID: 7, ProjectID: 11}, {AccountID: 7, ProjectID: 19}, {AccountID: 17, ProjectID: 11}} {
-		for _, selector := range []string{"", "5m:last", "5m:sum", "5m:count", "5m:min", "5m:max", "1h:last", "1h:sum", "1h:count", "1h:min", "1h:max"} {
-			t.Run(fmt.Sprintf("%s/%s", tenant.String(), selector), func(t *testing.T) {
+		for _, selection := range []struct{ resolution, feature string }{
+			{},
+			{"5m", "last"}, {"5m", "sum"}, {"5m", "count"}, {"5m", "min"}, {"5m", "max"},
+			{"1h", "last"}, {"1h", "sum"}, {"1h", "count"}, {"1h", "min"}, {"1h", "max"},
+		} {
+			t.Run(fmt.Sprintf("%s/%s/%s", tenant.String(), selection.resolution, selection.feature), func(t *testing.T) {
 				sq := storage.NewSearchQuery(tenant.AccountID, tenant.ProjectID, 86400001, 90000000, nil, 37)
-				field, err := storage.ParseDownsampleQueryField(selector)
+				downsampleQuery, err := storage.ParseDownsampleQuery(selection.resolution, selection.feature)
 				if err != nil {
 					t.Fatal(err)
 				}
-				sq.DownsampleField = field
+				sq.DownsampleQuery = downsampleQuery
 				rpc := "search_v7"
 				payload := sq.MarshalWithoutTenant(tenant.Marshal(nil))
-				if field != nil {
+				if downsampleQuery != nil {
 					rpc = "search_downsampling_v2"
 					payload, err = sq.MarshalDownsampleWithoutTenant(tenant.Marshal(nil))
 					if err != nil {
@@ -132,10 +136,10 @@ func TestDownsampleSearchRPCDispatch(t *testing.T) {
 				if err != nil || received == nil {
 					t.Fatalf("RPC 未到达存储 API: %v", err)
 				}
-				if received.AccountID != tenant.AccountID || received.ProjectID != tenant.ProjectID || !reflect.DeepEqual(received.DownsampleField, field) {
-					t.Fatalf("RPC 字段或租户丢失: %+v", received)
+				if received.AccountID != tenant.AccountID || received.ProjectID != tenant.ProjectID || !reflect.DeepEqual(received.DownsampleQuery, downsampleQuery) {
+					t.Fatalf("RPC 分辨率、特征或租户丢失: %+v", received)
 				}
-				// 响应继续使用原有帧和 MetricBlock 编解码，不增加字段专用响应格式。
+				// 响应继续使用原有帧和 MetricBlock 编解码，不增加降采样专用响应格式。
 				if len(response) < 24 || !bytes.Equal(response[:8], make([]byte, 8)) {
 					t.Fatalf("RPC 响应缺少原有空错误帧: %x", response)
 				}
@@ -156,8 +160,8 @@ func TestDownsampleSearchRPCDispatch(t *testing.T) {
 				}
 				ts, values := mb.Block.AppendRowsWithTimeRangeFilter(nil, nil, sq.GetTimeRange())
 				want := float64(100)
-				if field != nil {
-					want += float64(field.Feature)
+				if downsampleQuery != nil {
+					want += float64(downsampleQuery.Feature)
 				}
 				if len(ts) != 1 || ts[0] != sq.MinTimestamp || len(values) != 1 || values[0] != want {
 					t.Fatalf("单特征 Block 响应错误: %v %v", ts, values)
@@ -171,23 +175,23 @@ func TestDownsampleSearchRPCRejectsInvalidPayload(t *testing.T) {
 	tenant := storage.TenantToken{AccountID: 7, ProjectID: 11}
 	sq := storage.NewSearchQuery(7, 11, 86400001, 90000000, nil, 37)
 	legacy := sq.MarshalWithoutTenant(tenant.Marshal(nil))
-	sq.DownsampleField = &storage.DownsampleQueryField{ResolutionMs: 300000, Feature: 2}
-	fieldPayload, err := sq.MarshalDownsampleWithoutTenant(tenant.Marshal(nil))
+	sq.DownsampleQuery = &storage.DownsampleQuery{ResolutionMs: 300000, Feature: 2}
+	downsamplePayload, err := sq.MarshalDownsampleWithoutTenant(tenant.Marshal(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	badFeature := append([]byte(nil), fieldPayload...)
+	badFeature := append([]byte(nil), downsamplePayload...)
 	badFeature[len(badFeature)-1] = 255
 	for _, tc := range []struct {
 		name    string
 		rpc     string
 		payload []byte
 	}{
-		{"字段查询缺少字段", "search_downsampling_v2", legacy},
-		{"字段查询字段截断", "search_downsampling_v2", fieldPayload[:len(fieldPayload)-1]},
-		{"字段查询非法字段", "search_downsampling_v2", badFeature},
-		{"字段查询多余尾部", "search_downsampling_v2", append(append([]byte(nil), fieldPayload...), 0)},
-		{"原生查询不接受扩展字段", "search_v7", fieldPayload},
+		{"降采样查询缺少分辨率与特征", "search_downsampling_v2", legacy},
+		{"降采样查询特征被截断", "search_downsampling_v2", downsamplePayload[:len(downsamplePayload)-1]},
+		{"降采样查询特征非法", "search_downsampling_v2", badFeature},
+		{"降采样查询多余尾部", "search_downsampling_v2", append(append([]byte(nil), downsamplePayload...), 0)},
+		{"原生查询不接受降采样参数", "search_v7", downsamplePayload},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, received, err := runDownsampleSearchRPC(t, tc.rpc, tc.payload)
@@ -239,7 +243,7 @@ func TestDownsampleSearchRPCErrorPrefixReuse(t *testing.T) {
 		payload := sq.MarshalWithoutTenant(tenant.Marshal(nil))
 		if downsample {
 			rpc = "search_downsampling_v2"
-			sq.DownsampleField = &storage.DownsampleQueryField{ResolutionMs: 300000, Feature: 1}
+			sq.DownsampleQuery = &storage.DownsampleQuery{ResolutionMs: 300000, Feature: 1}
 			payload, err = sq.MarshalDownsampleWithoutTenant(tenant.Marshal(nil))
 			if err != nil {
 				t.Fatal(err)

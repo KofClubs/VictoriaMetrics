@@ -123,7 +123,7 @@ func benchmarkTableSearch(b *testing.B, rowsCount, tsidsCount, tsidsSearch int) 
 			for i := range tsids {
 				tsids[i].MetricID = 1 + uint64(i)
 			}
-			ts.Init(tb, tsids, tr)
+			ts.Init(tb, tsids, tr, nil)
 			for ts.NextBlock() {
 				ts.BlockRef.MustReadBlock(&tmpBlock)
 			}

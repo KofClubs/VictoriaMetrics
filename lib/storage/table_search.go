@@ -54,16 +54,13 @@ func (ts *tableSearch) reset() {
 }
 
 // Init initializes the ts.
+// downsampleQuery is passed through to each partition search.
 //
 // tsids must be sorted.
 // tsids cannot be modified after the Init call, since it is owned by ts.
 //
 // MustClose must be called then the tableSearch is done.
-func (ts *tableSearch) Init(tb *table, tsids []TSID, tr TimeRange) {
-	ts.initWithDownsampleField(tb, tsids, tr, nil)
-}
-
-func (ts *tableSearch) initWithDownsampleField(tb *table, tsids []TSID, tr TimeRange, field *DownsampleQueryField) {
+func (ts *tableSearch) Init(tb *table, tsids []TSID, tr TimeRange, downsampleQuery *DownsampleQuery) {
 	if ts.needClosing {
 		logger.Panicf("BUG: missing MustClose call before the next call to Init")
 	}
@@ -91,7 +88,7 @@ func (ts *tableSearch) initWithDownsampleField(tb *table, tsids []TSID, tr TimeR
 	// Initialize the ptsPool.
 	ts.ptsPool = slicesutil.SetLength(ts.ptsPool, len(ts.ptws))
 	for i, ptw := range ts.ptws {
-		ts.ptsPool[i].initWithDownsampleField(ptw.pt, tsids, tr, field)
+		ts.ptsPool[i].Init(ptw.pt, tsids, tr, downsampleQuery)
 	}
 
 	// Initialize the ptsHeap.

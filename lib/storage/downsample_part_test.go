@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -172,5 +173,104 @@ func TestEstimateDownsamplePartSize(t *testing.T) {
 		if got := estimateDownsamplePartSize(pws); got != math.MaxUint64 {
 			t.Fatalf("overflow or invalid input must saturate the estimate: got %d", got)
 		}
+	}
+}
+
+// 打开校验按原生 header 对齐五列，不能假设不同 feature 的 index 分块边界相同。
+func TestDownsamplePartIndependentFeatureIndexes(t *testing.T) {
+	path := writeDownsampleCrossIndexPart(t)
+	p, err := openDownsamplePart(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := append([]downsampleMetaindexRow(nil), p.dsMetaindex...)
+	p.MustClose()
+	indexFile, err := os.ReadFile(filepath.Join(path, indexFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rewrittenIndex, rewrittenMeta []byte
+	for i := 0; i < len(rows); i++ {
+		m := rows[i]
+		frame := indexFile[m.IndexBlockOffset : m.IndexBlockOffset+uint64(m.IndexBlockSize)]
+		data := decodeDownsampleLayoutFrame(t, frame, "VMDSIX")
+		if m.feature == downsampleFeatureSum && m.TSID.MetricID == 1 {
+			// 仅 sum 合并前两个 index，其余四个 feature 仍是一条 header 一个 index。
+			i++
+			next := &rows[i]
+			frame := indexFile[next.IndexBlockOffset : next.IndexBlockOffset+uint64(next.IndexBlockSize)]
+			data = append(data, decodeDownsampleLayoutFrame(t, frame, "VMDSIX")...)
+			m.LastTSID = next.LastTSID
+			m.RowsCount += next.RowsCount
+			m.BlockHeadersCount += next.BlockHeadersCount
+			m.MinTimestamp = min(m.MinTimestamp, next.MinTimestamp)
+			m.MaxTimestamp = max(m.MaxTimestamp, next.MaxTimestamp)
+		}
+		frame = encoding.CompressZSTDLevel([]byte(downsampleIndexMagic), data, 1)
+		m.IndexBlockOffset = uint64(len(rewrittenIndex))
+		m.IndexBlockSize = uint32(len(frame))
+		rewrittenIndex = append(rewrittenIndex, frame...)
+		rewrittenMeta = m.marshal(rewrittenMeta)
+	}
+	if err := os.WriteFile(filepath.Join(path, indexFilename), rewrittenIndex, 0644); err != nil {
+		t.Fatal(err)
+	}
+	meta := encoding.CompressZSTDLevel([]byte(downsampleMetaindexMagic), rewrittenMeta, 1)
+	if err := os.WriteFile(filepath.Join(path, metaindexFilename), meta, 0644); err != nil {
+		t.Fatal(err)
+	}
+	p, err = openDownsamplePart(path)
+	if err != nil {
+		t.Fatalf("valid feature columns with independent index boundaries were rejected: %v", err)
+	}
+	defer p.MustClose()
+	if len(p.dsMetaindex) != len(rows)-len(downsampleResolutions) {
+		t.Fatal("fixture did not change the sum feature index boundaries")
+	}
+}
+
+// 查询缓存及打开校验共用原生 header 解码；失败不能把半个 index 暴露给调用方。
+func TestUnmarshalDownsampleIndexBlock(t *testing.T) {
+	first := blockHeader{
+		TSID:         TSID{AccountID: 1, ProjectID: 2, MetricID: 3},
+		MinTimestamp: minUnixMilli + 1, MaxTimestamp: minUnixMilli + 1,
+		RowsCount: 1, PrecisionBits: 64,
+		TimestampsMarshalType: encoding.MarshalTypeConst,
+		ValuesMarshalType:     encoding.MarshalTypeConst,
+	}
+	last := first
+	last.TSID.MetricID++
+	last.MinTimestamp++
+	last.MaxTimestamp++
+	m := downsampleMetaindexRow{
+		metaindexRow: metaindexRow{TSID: first.TSID, MinTimestamp: first.MinTimestamp, MaxTimestamp: last.MaxTimestamp, BlockHeadersCount: 2, IndexBlockSize: 16},
+		ResolutionMs: downsampleResolution5m, LastTSID: last.TSID, RowsCount: 2,
+	}
+	prefix := blockHeader{TSID: TSID{MetricID: 99}}
+	data := last.Marshal(first.Marshal(nil))
+	got, err := unmarshalDownsampleIndexBlock([]blockHeader{prefix}, data, &m, 0, 0, 16)
+	if err != nil || !reflect.DeepEqual(got, []blockHeader{prefix, first, last}) {
+		t.Fatalf("index headers changed when appended to an existing cache buffer: %+v; %v", got, err)
+	}
+	for _, name := range []string{"truncated", "invalid_last_header", "statistics_mismatch"} {
+		t.Run(name, func(t *testing.T) {
+			corrupt := append([]byte(nil), data...)
+			metadata := m
+			switch name {
+			case "truncated":
+				corrupt = corrupt[:len(corrupt)-1]
+			case "invalid_last_header":
+				// 保留前一条合法 header，令后一条的精度非法。
+				corrupt[len(corrupt)-1] = 0
+			case "statistics_mismatch":
+				metadata.RowsCount++
+			}
+			dst := make([]blockHeader, 1, 3)
+			dst[0] = prefix
+			got, err := unmarshalDownsampleIndexBlock(dst, corrupt, &metadata, 0, 0, 16)
+			if err == nil || !reflect.DeepEqual(got, []blockHeader{prefix}) {
+				t.Fatalf("invalid index exposed partial headers or changed the existing cache prefix: %+v; %v", got, err)
+			}
+		})
 	}
 }

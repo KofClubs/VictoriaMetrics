@@ -8,17 +8,44 @@ import (
 	"time"
 )
 
-func TestDownsampleQueryFieldHTTPParameter(t *testing.T) {
-	for _, field := range []string{"5m:last", "5m:sum", "5m:count", "5m:min", "5m:max", "1h:last", "1h:sum", "1h:count", "1h:min", "1h:max"} {
-		r := httptest.NewRequest("GET", "/api/v1/query?query=m&query.field="+url.QueryEscape(field), nil)
-		if q, err := getDownsampleQueryField(r); q == nil || err != nil {
-			t.Fatalf("合法参数 %q 被拒绝: %v", field, err)
+func TestDownsampleQueryHTTPParameter(t *testing.T) {
+	for _, resolution := range []struct {
+		name         string
+		milliseconds int64
+	}{{"5m", 300000}, {"1h", 3600000}} {
+		for featureID, feature := range []string{"last", "sum", "count", "min", "max"} {
+			args := url.Values{"query.resolution": {resolution.name}, "query.feature": {feature}}.Encode()
+			for _, method := range []string{"GET", "POST"} {
+				r := httptest.NewRequest(method, "/api/v1/query?query=m&"+args, nil)
+				if method == "POST" {
+					r = httptest.NewRequest(method, "/api/v1/query?query=m", strings.NewReader(args))
+					r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				}
+				q, err := getDownsampleQuery(r)
+				if err != nil || q == nil || q.ResolutionMs != resolution.milliseconds || q.Feature != uint8(featureID) {
+					t.Fatalf("合法参数解析错误: method=%s args=%s query=%+v err=%v", method, args, q, err)
+				}
+			}
 		}
 	}
-	if q, err := getDownsampleQueryField(httptest.NewRequest("GET", "/api/v1/query?query=m", nil)); q != nil || err != nil {
-		t.Fatalf("未指定字段时改变原始路径: %v %v", q, err)
+	if q, err := getDownsampleQuery(httptest.NewRequest("GET", "/api/v1/query?query=m", nil)); q != nil || err != nil {
+		t.Fatalf("未指定降采样参数时改变原始路径: %v %v", q, err)
 	}
-	for _, args := range []string{"query.field=", "query.field=5m%3Asum&query.field=1h%3Asum", "query.field=1m%3Asum", "query.field=5m%3Aavg", "query.field=%zz"} {
+	r := httptest.NewRequest("POST", "/api/v1/query?query.resolution=5m", strings.NewReader("query.resolution=5m&query.feature=sum"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if q, err := getDownsampleQuery(r); q != nil || err == nil || !strings.HasPrefix(err.Error(), "[downsampling] ") {
+		t.Fatalf("请求 URL 与正文中的重复参数未被拒绝: query=%+v err=%v", q, err)
+	}
+	for _, args := range []string{
+		"query.resolution=", "query.feature=", "query.resolution=5m", "query.feature=sum",
+		"query.resolution=&query.feature=sum", "query.resolution=5m&query.feature=",
+		"query.resolution=5m&query.resolution=1h&query.feature=sum",
+		"query.resolution=5m&query.feature=sum&query.feature=max",
+		"query.resolution=1m&query.feature=sum", "query.resolution=5m&query.feature=avg",
+		"query.field=", "query.field=5m%3Asum",
+		"query.field=5m%3Asum&query.resolution=5m&query.feature=sum",
+		"query.resolution=%zz&query.feature=sum",
+	} {
 		for _, handler := range []string{"instant", "range"} {
 			r := httptest.NewRequest("GET", "/api/v1/query?query=m&"+args, nil)
 			w := httptest.NewRecorder()
@@ -29,10 +56,10 @@ func TestDownsampleQueryFieldHTTPParameter(t *testing.T) {
 				err = QueryRangeHandler(nil, time.Now(), nil, w, r)
 			}
 			if err == nil {
-				t.Fatalf("%s 接受了无效字段: %s", handler, args)
+				t.Fatalf("%s 接受了无效降采样参数: %s", handler, args)
 			}
-			if args != "query.field=%zz" && !strings.HasPrefix(err.Error(), "[downsampling] ") {
-				t.Fatalf("%s 无效字段错误缺少降采样前缀: %s: %v", handler, args, err)
+			if args != "query.resolution=%zz&query.feature=sum" && !strings.HasPrefix(err.Error(), "[downsampling] ") {
+				t.Fatalf("%s 无效降采样参数错误缺少降采样前缀: %s: %v", handler, args, err)
 			}
 		}
 	}
@@ -40,10 +67,10 @@ func TestDownsampleQueryFieldHTTPParameter(t *testing.T) {
 
 func TestDownsampleQueryHTTPErrorPrefix(t *testing.T) {
 	for _, handler := range []string{"instant", "range"} {
-		for _, withField := range []bool{true, false} {
+		for _, withDownsampleQuery := range []bool{true, false} {
 			for _, args := range []string{"query=", "query=m&step=invalid"} {
-				if withField {
-					args += "&query.field=5m%3Asum"
+				if withDownsampleQuery {
+					args += "&query.resolution=5m&query.feature=sum"
 				}
 				r := httptest.NewRequest("GET", "/api/v1/query?"+args, nil)
 				w := httptest.NewRecorder()
@@ -53,7 +80,7 @@ func TestDownsampleQueryHTTPErrorPrefix(t *testing.T) {
 				} else {
 					err = QueryRangeHandler(nil, time.Now(), nil, w, r)
 				}
-				if err == nil || strings.HasPrefix(err.Error(), "[downsampling] ") != withField {
+				if err == nil || strings.HasPrefix(err.Error(), "[downsampling] ") != withDownsampleQuery {
 					t.Fatalf("HTTP 错误前缀不匹配: handler=%s args=%s err=%v", handler, args, err)
 				}
 			}

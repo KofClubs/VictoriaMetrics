@@ -449,7 +449,7 @@ func exportHandler(qt *querytracer.Tracer, at *auth.Token, w http.ResponseWriter
 	}
 
 	w.Header().Set("Content-Type", contentType)
-	sq.DownsampleField = cp.downsampleField
+	sq.DownsampleQuery = cp.downsampleQuery
 
 	doneCh := make(chan error, 1)
 	if !reduceMemUsage {
@@ -965,39 +965,39 @@ var seriesDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/
 // See https://prometheus.io/docs/prometheus/latest/querying/api/#instant-queries
 func QueryHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w http.ResponseWriter, r *http.Request) error {
 	defer queryDuration.UpdateDuration(startTime)
-	field, err := getDownsampleQueryField(r)
+	downsampleQuery, err := getDownsampleQuery(r)
 	if err != nil {
 		return err
 	}
 	errorPrefix := ""
-	if field != nil {
+	if downsampleQuery != nil {
 		errorPrefix = "[downsampling] "
 	}
 
 	ct := startTime.UnixNano() / 1e6
 	deadline := searchutil.GetDeadlineForQuery(r, startTime)
-	noCache := field != nil || httputil.GetBool(r, "nocache")
+	noCache := downsampleQuery != nil || httputil.GetBool(r, "nocache")
 	query := r.FormValue("query")
 	if len(query) == 0 {
 		return httpserver.InvalidParamError(fmt.Errorf("%smissing `query` arg", errorPrefix))
 	}
 	start, err := httputil.GetTime(r, "time", ct)
 	if err != nil {
-		if field != nil {
+		if downsampleQuery != nil {
 			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
 		}
 		return httpserver.InvalidParamError(err)
 	}
 	lookbackDelta, err := getMaxLookback(r)
 	if err != nil {
-		if field != nil {
+		if downsampleQuery != nil {
 			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
 		}
 		return httpserver.InvalidParamError(err)
 	}
 	step, err := httputil.GetDuration(r, "step", lookbackDelta)
 	if err != nil {
-		if field != nil {
+		if downsampleQuery != nil {
 			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
 		}
 		return httpserver.InvalidParamError(err)
@@ -1012,7 +1012,7 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w
 	}
 	etfs, err := searchutil.GetExtraTagFilters(r)
 	if err != nil {
-		if field != nil {
+		if downsampleQuery != nil {
 			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
 		}
 		return httpserver.InvalidParamError(err)
@@ -1034,7 +1034,7 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w
 
 		tagFilterss, err := getTagFilterssFromMatches([]string{childQuery})
 		if err != nil {
-			if field != nil {
+			if downsampleQuery != nil {
 				err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
 			}
 			return httpserver.InvalidParamError(err)
@@ -1046,7 +1046,7 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w
 			start:           start,
 			end:             end,
 			filterss:        filterss,
-			downsampleField: field,
+			downsampleQuery: downsampleQuery,
 		}
 		if err := exportHandler(qt, at, w, cp, "promapi", 0, false); err != nil {
 			return fmt.Errorf(errorPrefix+"error when exporting data for query=%q on the time range (start=%d, end=%d): %w", childQuery, start, end, err)
@@ -1072,7 +1072,7 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w
 		start -= offset
 		end := start
 		start = end - window
-		if err := queryRangeHandler(qt, startTime, at, w, childQuery, start, end, step, lookbackDelta, r, ct, etfs, field); err != nil {
+		if err := queryRangeHandler(qt, startTime, at, w, childQuery, start, end, step, lookbackDelta, r, ct, etfs, downsampleQuery); err != nil {
 			return fmt.Errorf(errorPrefix+"error when executing query=%q on the time range (start=%d, end=%d, step=%d): %w", childQuery, start, end, step, err)
 		}
 		return nil
@@ -1080,7 +1080,7 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w
 
 	queryOffset, err := getLatencyOffsetMilliseconds(r)
 	if err != nil {
-		if field != nil {
+		if downsampleQuery != nil {
 			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
 		}
 		return httpserver.InvalidParamError(err)
@@ -1103,7 +1103,7 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w
 		QuotedRemoteAddr:    httpserver.GetQuotedRemoteAddr(r),
 		Deadline:            deadline,
 		NoCache:             noCache,
-		DownsampleField:     field,
+		DownsampleQuery:     downsampleQuery,
 		LookbackDelta:       lookbackDelta,
 		RoundDigits:         getRoundDigits(r),
 		EnforcedTagFilterss: etfs,
@@ -1160,12 +1160,12 @@ var queryDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v
 // See https://prometheus.io/docs/prometheus/latest/querying/api/#range-queries
 func QueryRangeHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w http.ResponseWriter, r *http.Request) error {
 	defer queryRangeDuration.UpdateDuration(startTime)
-	field, err := getDownsampleQueryField(r)
+	downsampleQuery, err := getDownsampleQuery(r)
 	if err != nil {
 		return err
 	}
 	errorPrefix := ""
-	if field != nil {
+	if downsampleQuery != nil {
 		errorPrefix = "[downsampling] "
 	}
 
@@ -1180,49 +1180,49 @@ func QueryRangeHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Tok
 	}
 	start, err := httputil.GetTime(r, "start", ct-defaultStep)
 	if err != nil {
-		if field != nil {
+		if downsampleQuery != nil {
 			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
 		}
 		return httpserver.InvalidParamError(err)
 	}
 	end, err := httputil.GetTime(r, "end", ct)
 	if err != nil {
-		if field != nil {
+		if downsampleQuery != nil {
 			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
 		}
 		return httpserver.InvalidParamError(err)
 	}
 	step, err := httputil.GetDuration(r, "step", defaultStep)
 	if err != nil {
-		if field != nil {
+		if downsampleQuery != nil {
 			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
 		}
 		return httpserver.InvalidParamError(err)
 	}
 	etfs, err := searchutil.GetExtraTagFilters(r)
 	if err != nil {
-		if field != nil {
+		if downsampleQuery != nil {
 			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
 		}
 		return httpserver.InvalidParamError(err)
 	}
 	lookbackDelta, err := getMaxLookback(r)
 	if err != nil {
-		if field != nil {
+		if downsampleQuery != nil {
 			err = fmt.Errorf("[downsampling] invalid query parameters: %w", err)
 		}
 		return httpserver.InvalidParamError(err)
 	}
-	if err := queryRangeHandler(qt, startTime, at, w, query, start, end, step, lookbackDelta, r, ct, etfs, field); err != nil {
+	if err := queryRangeHandler(qt, startTime, at, w, query, start, end, step, lookbackDelta, r, ct, etfs, downsampleQuery); err != nil {
 		return fmt.Errorf(errorPrefix+"error when executing query=%q on the time range (start=%d, end=%d, step=%d): %w", query, start, end, step, err)
 	}
 	return nil
 }
 
 func queryRangeHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Token, w http.ResponseWriter, query string,
-	start, end, step, lookbackDelta int64, r *http.Request, ct int64, etfs [][]storage.TagFilter, field *storage.DownsampleQueryField) error {
+	start, end, step, lookbackDelta int64, r *http.Request, ct int64, etfs [][]storage.TagFilter, downsampleQuery *storage.DownsampleQuery) error {
 	deadline := searchutil.GetDeadlineForQuery(r, startTime)
-	noCache := field != nil || httputil.GetBool(r, "nocache")
+	noCache := downsampleQuery != nil || httputil.GetBool(r, "nocache")
 	optimizeRepeatedBinaryOpSubexprs := httputil.GetBool(r, "optimize_repeated_binary_op_subexprs")
 	if start > end {
 		end = start + defaultStep
@@ -1243,7 +1243,7 @@ func queryRangeHandler(qt *querytracer.Tracer, startTime time.Time, at *auth.Tok
 		QuotedRemoteAddr:                 httpserver.GetQuotedRemoteAddr(r),
 		Deadline:                         deadline,
 		NoCache:                          noCache,
-		DownsampleField:                  field,
+		DownsampleQuery:                  downsampleQuery,
 		OptimizeRepeatedBinaryOpSubexprs: optimizeRepeatedBinaryOpSubexprs,
 		LookbackDelta:                    lookbackDelta,
 		RoundDigits:                      getRoundDigits(r),
@@ -1475,7 +1475,7 @@ type commonParams struct {
 	end              int64
 	currentTimestamp int64
 	filterss         [][]storage.TagFilter
-	downsampleField  *storage.DownsampleQueryField
+	downsampleQuery  *storage.DownsampleQuery
 }
 
 func (cp *commonParams) IsDefaultTimeRange() bool {

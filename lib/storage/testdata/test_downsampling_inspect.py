@@ -171,15 +171,15 @@ class InspectTests(unittest.TestCase):
         meta = self.zstd.frame((self.path / "metaindex.bin").read_bytes(), b"VMDSMI", 65536)
         row = inspect.decode_meta(meta[:113])
         self.assertEqual((row["resolution_ms"], row["feature"], row["blocks"], row["rows"]), (300000, 0, 2, 6))
-        header = inspect.decode_field(fixture.indexes[0][2][0], row)
+        header = inspect.decode_block_header(fixture.indexes[0][2][0], row)
         self.assertEqual(header["tsid"], (7, 11, 10, 1, 1, 101))
         self.assertEqual((header["first_value"], header["scale"], header["precision"]), (-19, -3, 64))
         self.assertEqual((header["timestamp_offset"], header["value_offset"]), (0, 0))
-        other = inspect.decode_field(fixture.indexes[0][2][0], {**row, "resolution_ms": 3600000, "feature": 4})
+        other = inspect.decode_block_header(fixture.indexes[0][2][0], {**row, "resolution_ms": 3600000, "feature": 4})
         self.assertEqual((other["resolution_ms"], other["feature"]), (3600000, 4))
         for size in (88, 90, 99):
             with self.subTest(size=size), self.assertRaisesRegex(ValueError, "header 长度"):
-                inspect.decode_field(bytes(size), row)
+                inspect.decode_block_header(bytes(size), row)
 
     def test_global_layout_shared_timestamps_and_tenants(self):
         report = self.parse(Fixture(self.zstd))

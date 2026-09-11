@@ -10,7 +10,7 @@ import time
 
 sys.dont_write_bytecode = True
 
-from downsampling_compare import (CONTROL_METRIC, FIELDS, METRIC, RESOLUTIONS, Server,
+from downsampling_compare import (CONTROL_METRIC, FEATURES, METRIC, RESOLUTIONS, Server,
                                   aggregate, assert_samples, binary_manifest, fixture, range_expected, write_json)
 
 
@@ -26,7 +26,7 @@ def verify(stage, servers, inputs, base, summary, output):
         actual = sum(part["metadata"]["RowsCount"] for part in parts)
         expected = sum(len(rows) for rows in inputs.values())
         if server.downsampling:
-            expected = sum(len(aggregate(rows, metric, resolution)) * len(FIELDS)
+            expected = sum(len(aggregate(rows, metric, resolution)) * len(FEATURES)
                            for rows in inputs.values() for metric in METRICS
                            for resolution in RESOLUTIONS.values())
         assert actual == expected, (stage, server.name, "全租户物理行数", actual, expected)
@@ -49,31 +49,31 @@ def verify(stage, servers, inputs, base, summary, output):
                                                          prefix + ":original:" + metric + ":" + resolution + ":bare-range"))
                 expected = aggregate(reference, metric, milliseconds)
                 write_json(servers[1].root / (prefix + "-" + metric + "-" + resolution + "-expected.json"), expected)
-                for field in FIELDS:
-                    actual = servers[1].query(prefix, metric, base, end, resolution, field)
-                    wanted = [(row["timestamp"], row[field]) for row in expected]
-                    summary["checks"].append(assert_samples(actual, wanted, prefix + ":" + metric + ":" + resolution + ":" + field))
-                    actual = servers[1].query(prefix, metric, start, end, resolution, field, True)
+                for feature in FEATURES:
+                    actual = servers[1].query(prefix, metric, base, end, resolution, feature)
+                    wanted = [(row["timestamp"], row[feature]) for row in expected]
+                    summary["checks"].append(assert_samples(actual, wanted, prefix + ":" + metric + ":" + resolution + ":" + feature))
+                    actual = servers[1].query(prefix, metric, start, end, resolution, feature, True)
                     wanted_range = range_expected(wanted, start, end, milliseconds)
                     summary["checks"].append(assert_samples(actual, wanted_range,
-                                                             prefix + ":" + metric + ":" + resolution + ":" + field + ":bare-range"))
+                                                             prefix + ":" + metric + ":" + resolution + ":" + feature + ":bare-range"))
         write_json(output / "summary.json", summary)
     # 未写入的租户必须为空，不能透出其它租户的相同指标。
     for server in servers:
         server.cluster.tenant = "999:999"
-        selectors = [(None, None)] if not server.downsampling else [(r, f) for r in RESOLUTIONS for f in FIELDS]
-        for resolution, field in selectors:
+        selectors = [(None, None)] if not server.downsampling else [(r, f) for r in RESOLUTIONS for f in FEATURES]
+        for resolution, feature in selectors:
             params = {"query": METRIC + "[10800000ms]", "time": end / 1000, "nocache": "1"}
-            if field is not None:
-                params["query.field"] = resolution + ":" + field
+            if feature is not None:
+                params.update({"query.resolution": resolution, "query.feature": feature})
             response = json.loads(server.request("/api/v1/query", params))
             assert response == {"status": "success", "data": {"resultType": "matrix", "result": []}}, response
-            name = stage + "-absent-tenant-" + str(resolution) + "-" + str(field)
+            name = stage + "-absent-tenant-" + str(resolution) + "-" + str(feature)
             write_json(server.root / (name + ".json"), {"url": server.url("/api/v1/query"), "params": params, "response": response})
             summary["checks"].append({"check": server.name + ":" + name, "rows": 0})
     summary["stages"].append(stage)
     write_json(output / "summary.json", summary)
-    print(stage + ": 三个租户与空租户的隔离、全部字段与裸查询验证通过", flush=True)
+    print(stage + ": 三个租户与空租户的隔离、全部特征与裸查询验证通过", flush=True)
 
 
 def main():

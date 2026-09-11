@@ -373,11 +373,7 @@ func (ctx *vmselectRequestCtx) readAccountIDProjectID() (uint32, uint32, error) 
 // see https://github.com/VictoriaMetrics/VictoriaMetrics/issues/5154#issuecomment-1757216612
 const maxSearchQuerySize = 5 * 1024 * 1024
 
-func (ctx *vmselectRequestCtx) readSearchQuery() error {
-	return ctx.readSearchQueryVersion(false)
-}
-
-func (ctx *vmselectRequestCtx) readSearchQueryVersion(downsample bool) error {
+func (ctx *vmselectRequestCtx) readSearchQuery(downsample bool) error {
 	ctx.errorPrefix = ""
 	if downsample {
 		ctx.errorPrefix = "[downsampling] "
@@ -664,7 +660,7 @@ func (s *Server) processDeleteSeries(ctx *vmselectRequestCtx) error {
 	s.deleteSeriesRequests.Inc()
 
 	// Read request
-	if err := ctx.readSearchQuery(); err != nil {
+	if err := ctx.readSearchQuery(false); err != nil {
 		return err
 	}
 
@@ -694,7 +690,7 @@ func (s *Server) processLabelNames(ctx *vmselectRequestCtx) error {
 	s.labelNamesRequests.Inc()
 
 	// Read request
-	if err := ctx.readSearchQuery(); err != nil {
+	if err := ctx.readSearchQuery(false); err != nil {
 		return err
 	}
 	maxLabelNames, err := ctx.readLimit()
@@ -745,7 +741,7 @@ func (s *Server) processLabelValues(ctx *vmselectRequestCtx) error {
 		return fmt.Errorf("cannot read labelName: %w", err)
 	}
 	labelName := string(ctx.dataBuf)
-	if err := ctx.readSearchQuery(); err != nil {
+	if err := ctx.readSearchQuery(false); err != nil {
 		return err
 	}
 	maxLabelValues, err := ctx.readLimit()
@@ -880,7 +876,7 @@ func (s *Server) processTSDBStatus(ctx *vmselectRequestCtx) error {
 	s.tsdbStatusRequests.Inc()
 
 	// Read request
-	if err := ctx.readSearchQuery(); err != nil {
+	if err := ctx.readSearchQuery(false); err != nil {
 		return err
 	}
 	if err := ctx.readDataBufBytes(maxLabelValueSize); err != nil {
@@ -1000,7 +996,7 @@ func (s *Server) processSearchMetricNames(ctx *vmselectRequestCtx) error {
 	s.searchMetricNamesRequests.Inc()
 
 	// Read request.
-	if err := ctx.readSearchQuery(); err != nil {
+	if err := ctx.readSearchQuery(false); err != nil {
 		return err
 	}
 
@@ -1038,7 +1034,7 @@ func (s *Server) processSearch(ctx *vmselectRequestCtx, downsample bool) error {
 	s.searchRequests.Inc()
 
 	// Read request.
-	if err := ctx.readSearchQueryVersion(downsample); err != nil {
+	if err := ctx.readSearchQuery(downsample); err != nil {
 		return err
 	}
 	if err := s.beginConcurrentRequest(ctx); err != nil {

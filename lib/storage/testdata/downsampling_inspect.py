@@ -13,9 +13,9 @@ import struct
 import sys
 
 
-FIELDS = ("last", "sum", "count", "min", "max")
+FEATURES = ("last", "sum", "count", "min", "max")
 RESOLUTIONS = {300_000: "5m", 3_600_000: "1h"}
-FIELD_HEADER_BYTES = 89
+BLOCK_HEADER_BYTES = 89
 METAINDEX_ROW_BYTES = 113
 MIN_TIMESTAMP = 86_400_000
 MAX_TIMESTAMP = 9_222_422_399_999
@@ -90,8 +90,8 @@ class Zstandard:
         return destination.raw[:count]
 
 
-def decode_field(data, entry):
-    require(len(data) == FIELD_HEADER_BYTES, "单特征 header 长度错误")
+def decode_block_header(data, entry):
+    require(len(data) == BLOCK_HEADER_BYTES, "单特征 header 长度错误")
     # 原生集群 blockHeader 不含 resolution/feature，两者只能从所属 metaindex row 继承。
     header = {
         "resolution_ms": entry["resolution_ms"], "feature": entry["feature"],
@@ -104,7 +104,7 @@ def decode_field(data, entry):
         "timestamp_codec": data[86], "value_codec": data[87], "precision": data[88],
     }
     require(header["resolution_ms"] in RESOLUTIONS, "非法分辨率")
-    require(0 <= header["feature"] < len(FIELDS), "非法特征编号")
+    require(0 <= header["feature"] < len(FEATURES), "非法特征编号")
     require(1 <= header["rows"] <= 8192, "单特征 Block 行数超出限制")
     require(MIN_TIMESTAMP <= header["min_timestamp"] <= header["max_timestamp"] <= MAX_TIMESTAMP,
             "Block 时间范围无效")
@@ -135,12 +135,12 @@ def decode_meta(data):
         "last_tsid": tsid_at(data, 73), "rows": unsigned(data, 105, 8),
     }
     require(result["resolution_ms"] in RESOLUTIONS, "metaindex 分辨率无效")
-    require(0 <= result["feature"] < len(FIELDS), "metaindex 特征编号无效（当前格式为 0..4）")
+    require(0 <= result["feature"] < len(FEATURES), "metaindex 特征编号无效（当前格式为 0..4）")
     require(result["first_tsid"] <= result["last_tsid"], "metaindex TSID 首末范围无效")
     require(result["first_tsid"][:2] == result["last_tsid"][:2], "metaindex 首末 TSID 不属于同一租户")
     require(MIN_TIMESTAMP <= result["min_timestamp"] <= result["max_timestamp"] <= MAX_TIMESTAMP,
             "metaindex 时间范围无效")
-    require(0 < result["blocks"] <= 65536 // FIELD_HEADER_BYTES, "metaindex 单特征 Block 数量无效")
+    require(0 < result["blocks"] <= 65536 // BLOCK_HEADER_BYTES, "metaindex 单特征 Block 数量无效")
     require(result["blocks"] <= result["rows"] <= result["blocks"] * 8192,
             "metaindex 物理行数无效")
     require(8 < result["size"] <= 131072, "index 压缩负载大小无效")
@@ -212,10 +212,10 @@ def column_headers(entries, index_file, sizes, zstd, reports, endpoints):
         frame = index_file.read(entry["size"])
         require(len(frame) == entry["size"], "index 文件被截断或测试期间发生变化")
         index = zstd.frame(frame, b"VMDSIX", 65536)
-        require(len(index) == entry["blocks"] * FIELD_HEADER_BYTES,
+        require(len(index) == entry["blocks"] * BLOCK_HEADER_BYTES,
                 "index 长度与物理 Block 数量不一致")
-        headers = [decode_field(index[offset:offset + FIELD_HEADER_BYTES], entry)
-                   for offset in range(0, len(index), FIELD_HEADER_BYTES)]
+        headers = [decode_block_header(index[offset:offset + BLOCK_HEADER_BYTES], entry)
+                   for offset in range(0, len(index), BLOCK_HEADER_BYTES)]
         require(headers[0]["tsid"] == entry["first_tsid"] and headers[-1]["tsid"] == entry["last_tsid"],
                 "index 与 metaindex 的物理 TSID 首末标识不一致")
         require(sum(header["rows"] for header in headers) == entry["rows"]
@@ -224,7 +224,7 @@ def column_headers(entries, index_file, sizes, zstd, reports, endpoints):
                 "index 与 metaindex 的行数或时间范围不一致")
         reports.append({
             "number": entry["number"], "resolution": RESOLUTIONS[entry["resolution_ms"]],
-            "feature": FIELDS[entry["feature"]], "feature_id": entry["feature"],
+            "feature": FEATURES[entry["feature"]], "feature_id": entry["feature"],
             "account_id": entry["first_tsid"][0], "project_id": entry["first_tsid"][1],
             "offset": entry["offset"], "size": entry["size"],
             "physical_blocks": entry["blocks"], "physical_rows": entry["rows"],
@@ -282,7 +282,7 @@ def inspect_part(partition, path, zstd):
 
     reports, boundaries, endpoints = [], [], {}
     series, metric_ids = {}, {}
-    field_tsid_sets = collections.defaultdict(lambda: [set() for _ in FIELDS])
+    feature_tsid_sets = collections.defaultdict(lambda: [set() for _ in FEATURES])
     next_timestamp_offset = next_value_offset = 0
     physical_rows = physical_blocks = shared_timestamp_batches = 0
     zero_value_payloads = zero_timestamp_payloads = 0
@@ -290,9 +290,9 @@ def inspect_part(partition, path, zstd):
     with (path / "index.bin").open("rb") as index_file:
         for resolution in sorted(RESOLUTIONS):
             readers = [column_headers(groups[(resolution, feature)], index_file, sizes, zstd, reports, endpoints)
-                       for feature in range(len(FIELDS))]
-            first_values = [None] * len(FIELDS)
-            last_values = [None] * len(FIELDS)
+                       for feature in range(len(FEATURES))]
+            first_values = [None] * len(FEATURES)
+            last_values = [None] * len(FEATURES)
             while True:
                 batch = [next(reader, None) for reader in readers]
                 require(all(header is None for header in batch) or all(header is not None for header in batch),
@@ -311,21 +311,21 @@ def inspect_part(partition, path, zstd):
                 if identity not in series:
                     series[identity] = {"resolution": RESOLUTIONS[resolution], "tsid": tsid_text(identity[1]),
                                         "account_id": identity[1][0], "project_id": identity[1][1],
-                                        "blocks_by_field": dict.fromkeys(FIELDS, 0), "rows_by_field": dict.fromkeys(FIELDS, 0),
+                                        "blocks_by_feature": dict.fromkeys(FEATURES, 0), "rows_by_feature": dict.fromkeys(FEATURES, 0),
                                         "batch_rows": [], "index_numbers": set(),
-                                        "index_numbers_by_field": {field: set() for field in FIELDS}}
+                                        "index_numbers_by_feature": {feature: set() for feature in FEATURES}}
                 stat = series[identity]
                 stat["batch_rows"].append(first["rows"])
-                for feature, header in enumerate(batch):
-                    if first_values[feature] is None:
-                        first_values[feature] = header["value_offset"]
-                    last_values[feature] = header["value_offset"] + header["value_size"]
-                    field = FIELDS[feature]
-                    stat["blocks_by_field"][field] += 1
-                    stat["rows_by_field"][field] += header["rows"]
+                for feature_index, header in enumerate(batch):
+                    if first_values[feature_index] is None:
+                        first_values[feature_index] = header["value_offset"]
+                    last_values[feature_index] = header["value_offset"] + header["value_size"]
+                    feature = FEATURES[feature_index]
+                    stat["blocks_by_feature"][feature] += 1
+                    stat["rows_by_feature"][feature] += header["rows"]
                     stat["index_numbers"].add(header["index_number"])
-                    stat["index_numbers_by_field"][field].add(header["index_number"])
-                    field_tsid_sets[resolution][feature].add(header["tsid"])
+                    stat["index_numbers_by_feature"][feature].add(header["index_number"])
+                    feature_tsid_sets[resolution][feature_index].add(header["tsid"])
                     metric_id = header["tsid"][-1]
                     require(metric_id not in metric_ids or metric_ids[metric_id] == header["tsid"],
                             "同一 MetricID 对应多个物理 TSID")
@@ -360,21 +360,21 @@ def inspect_part(partition, path, zstd):
             "previous_index": number - 1, "next_index": number, "kind": kind,
             "previous_resolution": RESOLUTIONS[previous["resolution_ms"]],
             "next_resolution": RESOLUTIONS[first["resolution_ms"]],
-            "previous_feature": FIELDS[previous["feature"]], "next_feature": FIELDS[first["feature"]],
+            "previous_feature": FEATURES[previous["feature"]], "next_feature": FEATURES[first["feature"]],
             "previous_tsid": tsid_text(previous["tsid"]), "next_tsid": tsid_text(first["tsid"]),
             "previous_batch_min_timestamp": previous["min_timestamp"],
             "next_batch_min_timestamp": first["min_timestamp"],
         })
     physical_tsids = {}
-    for resolution, sets in sorted(field_tsid_sets.items()):
+    for resolution, sets in sorted(feature_tsid_sets.items()):
         require(all(values == sets[0] for values in sets), "同分辨率下五个特征的物理 TSID 集合不一致")
         physical_tsids[RESOLUTIONS[resolution]] = [tsid_text(tsid) for tsid in sorted(sets[0])]
     for stat in series.values():
-        require(len(set(stat["blocks_by_field"].values())) == 1 and len(set(stat["rows_by_field"].values())) == 1,
+        require(len(set(stat["blocks_by_feature"].values())) == 1 and len(set(stat["rows_by_feature"].values())) == 1,
                 "同一物理 TSID 五个特征的 Block 数量或行数不一致")
         stat["index_numbers"] = sorted(stat["index_numbers"])
-        stat["index_numbers_by_field"] = {field: sorted(numbers)
-                                           for field, numbers in stat["index_numbers_by_field"].items()}
+        stat["index_numbers_by_feature"] = {feature: sorted(numbers)
+                                           for feature, numbers in stat["index_numbers_by_feature"].items()}
     return {
         "partition": partition, "path": str(path), "metadata": metadata, "file_sizes": sizes,
         "physical_rows": physical_rows, "physical_blocks": physical_blocks,
@@ -409,14 +409,14 @@ def summarize(parts):
             if key not in partition["series"]:
                 partition["series"][key] = {"tsid": stat["tsid"], "resolution": stat["resolution"],
                                             "account_id": stat["account_id"], "project_id": stat["project_id"],
-                                            "blocks_by_field": dict.fromkeys(FIELDS, 0),
-                                            "rows_by_field": dict.fromkeys(FIELDS, 0), "part_count": 0}
+                                            "blocks_by_feature": dict.fromkeys(FEATURES, 0),
+                                            "rows_by_feature": dict.fromkeys(FEATURES, 0), "part_count": 0}
             total = partition["series"][key]
             total["part_count"] += 1
-            for field in FIELDS:
-                total["blocks_by_field"][field] += stat["blocks_by_field"][field]
-                total["rows_by_field"][field] += stat["rows_by_field"][field]
-            if stat["resolution"] == "5m" and stat["rows_by_field"]["last"] > 8192 and stat["blocks_by_field"]["last"] > 1:
+            for feature in FEATURES:
+                total["blocks_by_feature"][feature] += stat["blocks_by_feature"][feature]
+                total["rows_by_feature"][feature] += stat["rows_by_feature"][feature]
+            if stat["resolution"] == "5m" and stat["rows_by_feature"]["last"] > 8192 and stat["blocks_by_feature"]["last"] > 1:
                 split_evidence.append({"partition": part["partition"], "part": part["path"], **stat})
         for boundary in part["index_boundaries"]:
             evidence = {"partition": part["partition"], "part": part["path"], **boundary}

@@ -6,7 +6,7 @@
 
 通过 `-storage.downsampling.enabled=true` 或 `OpenOptions.DownsamplingEnabled=true` 启用文件降采样，默认关闭。启用时要求存储端 `dedup.minScrapeInterval=0`。
 
-分辨率固定为 `5m`（300000 毫秒）和 `1h`（3600000 毫秒），特征固定为 `last`、`sum`、`count`、`min`、`max`。磁盘格式和字段查询协议统一采用编号 `0..4`，依次对应上述五个特征。格式版本和语义版本均为 `2`。
+分辨率固定为 `5m`（300000 毫秒）和 `1h`（3600000 毫秒），特征固定为 `last`、`sum`、`count`、`min`、`max`。磁盘格式和降采样查询协议统一采用编号 `0..4`，依次对应上述五个特征。格式版本和语义版本均为 `2`。
 
 | 术语 | 含义 |
 |---|---|
@@ -20,7 +20,7 @@
 
 内存数据的缓冲、序列化和内存归并使用原始格式。降采样处理目标为磁盘文件的写出或归并任务，IndexDB、TSID 分配和原始数据接收流程使用原有实现。
 
-降采样专属生产代码按 block、metaindex row、reader、writer、merger、part、partition、query 八个模块组织。block 定义样本、分桶计算、多特征解码缓冲及 header 校验；metaindex row 定义索引行及其编解码；part 管理格式标识和元数据大小限制；query 包含字段解析、查询协议编解码和 part 搜索定位。各模块的代码导航与调用边界见实现说明。
+降采样专属生产代码按 block、metaindex row、reader、writer、merger、part、partition、query 八个模块组织。block 定义样本、分桶计算、多特征解码缓冲及 header 校验；metaindex row 仅定义索引行及其编解码；part 管理格式标识、元数据大小限制和原生 header 索引解码；query 包含分辨率与特征解析、查询协议编解码和 part 搜索定位。各模块的代码导航与调用边界见实现说明。
 
 ## 2. 数据语义
 
@@ -226,7 +226,7 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 `ReadBlock` 返回 `downsampleDecodedResolutionFeaturesBlock`。主 reader 默认定位 last，其余四个 feature 的 reader 按需创建，只负责各列索引的推进与对齐。
 
-`Init` 绑定源 part、分辨率及可选特征，未指定特征时使用 last。`SetFilter` 设置目标 TSID 和时间范围；对于降采样 part，先在 metaindex 中二分定位分辨率和特征区段，再利用 `LastTSID` 定位可能包含目标 TSID 的首个 index。迭代时继续筛选时间范围相交的 index 和 Block。
+`Init` 绑定源 part 和分辨率，主游标固定为 last；其余特征只由内部 reader 对齐。`SetFilter` 设置目标 TSID 和时间范围；对于降采样 part，先在 metaindex 中二分定位分辨率和特征区段，再利用 `LastTSID` 定位可能包含目标 TSID 的首个 index。迭代时继续筛选时间范围相交的 index 和 Block。
 
 首列通过原生 `Block.UnmarshalData` 完整解码时间戳和值；后四列验证共享时间戳描述后，由 `downsampleReader.readNativeValues` 仅读取各自 values，并直接调用原有 `encoding.UnmarshalValues` 解码，复用该原生 Block 中的时间戳。reader 负责清除上一列的值、校验时间戳与数值行数一致，并清理编码缓冲和重置读取位置；共享的 `block.go` 保持原有实现。时间戳在本次多特征批次内只读取、解码一次，下一批次重新读取；查询单列读取也独立解码。
 
@@ -258,20 +258,20 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 ### 5.2 SpillWriter 与列顺序
 
-`filestream.SpillWriter` 管理临时字节流，提供以下接口：
+`filestream.SpillWriter` 管理临时字节流，由 `NewSpillWriter(dir, name)` 创建；`name` 标识同一目录中的独立 spill。提供以下接口：
 
 | 接口 | 行为 |
 |---|---|
 | `Write([]byte)` | 追加到内存；超过阈值时，将满块追加到同一个临时文件 |
-| `ReadAll(func(io.Reader) error)` | 以流方式读出全部已写字节，只允许调用一次 |
+| `Read(func(io.Reader) error)` | 以流方式读出全部已写字节；可重复调用，不关闭或删除临时文件 |
 | `Size()` | 返回已接收字节数，包含缓冲中的数据 |
-| `Close()` | 丢弃未消费缓冲，关闭文件并删除临时文件和目录 |
+| `Close()` | 释放内存，关闭并删除本 spill 创建的临时文件 |
 
-每个 spill 的内存阈值由常量 `spillMaxMemorySize` 设为 **16 MiB**，缓冲按需增长，容量不超过阈值。累计数据不超过阈值（含恰好达到阈值）时，不创建任何临时文件或目录。满块之后仍有数据写入时，才将该满块落盘；超大的单次写入按同样规则分段处理。后续满块追加到同一个文件，最后一段保留在内存中。`ReadAll` 依次读取文件前缀和内存尾部，不为读回而将尾部落盘。
+每个 spill 的内存阈值默认为 **16 MiB**，通过 `-downsampling.spillMaxMemorySize` 配置。缓冲按需增长，容量不超过阈值。累计数据不超过阈值（含恰好达到阈值）时，不创建临时文件。满块之后仍有数据写入时，才将该满块落盘；超大的单次写入按同样规则分段处理。后续满块追加到同一个文件，最后一段保留在内存中。`Read` 依次读取文件前缀和内存尾部，不为读回而将尾部落盘。
 
-临时文件位于目标目录下独占的 `.spill-*` 子目录。子目录权限为 `0700 & ~umask`，文件权限为 `0666 & ~umask`。满块直接写文件，不再叠加写缓冲；文件读回沿用 filestream 的缓冲大小，使用独立读缓冲池，归还时解除文件引用。内存尾部不入池，在消费完成、关闭或出错时释放引用。读写沿用 filestream 的 I/O 统计，纯内存路径不计入实际文件 I/O；临时数据不执行 fsync。开始读回或发生错误后，禁止继续写入。
+临时文件直接位于调用方指定目录，名称为 `.spill-<name>`，文件权限为 `0666 & ~umask`。降采样 writer 使用五个特征名称区分 spill，独占目标 part 目录。满块直接写文件，不再叠加写缓冲；文件读回沿用 filestream 的缓冲大小，使用独立读缓冲池，归还时解除文件引用。内存尾部不入池，在 `Close` 时释放引用。读写沿用 filestream 的 I/O 统计，纯内存路径不计入实际文件 I/O；临时数据不执行 fsync。
 
-`ReadAll` 单独校验文件前缀的长度，不能以内存尾部补齐被截断的文件。回调必须消费全部逻辑字节。完成或出错后均释放内存、关闭并尝试删除临时文件；删除失败返回错误并保留路径，允许通过 `Close` 重试。
+`Read` 单独校验文件前缀长度，不能以内存尾部补齐被截断的文件；回调必须消费全部逻辑字节。读取成功或失败均不关闭、删除或封闭 spill，调用方最后必须显式执行 `Close`。写入失败会封闭 spill 并立即尝试清理；删除失败返回错误并保留路径，允许通过 `Close` 重试。单个 spill 不支持并发使用。
 
 分辨率结束或 `Finish` 时，`flushResolution` 按 last、sum、count、min、max 的顺序，逐个完整读回 spill：
 
@@ -286,7 +286,7 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 ### 6.1 打开校验
 
-`openDownsamplePart` 有界读取 metadata 和 metaindex，核验版本、语义字段、行长度、排序、租户及物理统计，再为每个分辨率使用五个 reader 遍历全部 index header。
+`openDownsamplePart` 有界读取 metadata 和 metaindex，核验版本、语义字段、行长度、排序、租户及物理统计，再由 part 层为每个分辨率维护五个索引游标，遍历全部 index header；不创建 `downsampleReader`。
 
 校验包括：
 
@@ -311,9 +311,9 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 | 单 index block 的解压数据 | 64 KiB，当前集群版最多 736 条 header |
 | metaindex 文件和解压数据 | 分别限制为 64 MiB |
 | metadata 文件 | 64 KiB |
-| 单个 spill 的内存缓冲容量 | 16 MiB，按需分配，关闭后不保留到池中 |
+| 单个 spill 的内存缓冲容量 | 默认 16 MiB，由 downsampling.spillMaxMemorySize 配置；按需分配，关闭后不保留到池中 |
 
-索引 reader 各自只保留当前 index block，源 part 的 metaindex 整体驻留内存。merger 的聚合状态按当前 TSID 的时间范围分配。writer 保留当前批次及其编码缓冲、当前分辨率的五个 spill 缓冲、临时文件读回缓冲、当前未输出的 index，以及整个目标 part 尚未压缩的 metaindex；压缩时复用压缩缓冲。五个 spill 当前持有的缓冲容量合计最多 80 MiB，不含扩容过程中尚待 GC 的旧分配及其他工作缓冲。
+索引 reader 各自只保留当前 index block，源 part 的 metaindex 整体驻留内存。merger 的聚合状态按当前 TSID 的时间范围分配。writer 保留当前批次及其编码缓冲、当前分辨率的五个 spill 缓冲、临时文件读回缓冲、当前未输出的 index，以及整个目标 part 尚未压缩的 metaindex；压缩时复用压缩缓冲。默认配置下，五个 spill 当前持有的缓冲容量合计最多 80 MiB，不含扩容过程中尚待 GC 的旧分配及其他工作缓冲。
 
 这些是单项边界，不是进程内存的统一额度。总占用还受源 part 数量、并发任务、对象池保留容量和系统页缓存影响。`reset` 清除 `currentResolutionReaders`、`currentResolutionReaderHeap` 和 `currentTSIDReaders` 中的全部源引用，将切片长度归零，保留底层数组用于复用；reader 指针切片不设容量丢弃阈值。bucket 切片仍以 `downsampleMaxPooledBuckets = 17856` 控制 `reset` 后保留的池缓存容量，该阈值不限制任务的 bucket 数量。
 
@@ -362,17 +362,19 @@ writer 自身验证、spill 读回及接口返回的写入错误会阻止发布�
 
 合法原始文件可以与降采样文件共存，并在后续归并时转换。格式检测结合 metadata 和文件标识；带有降采样语义但版本缺失、标识矛盾或内容损坏的文件会报错，不按原始格式打开。降采样 reader 只接受本文规定的布局；版本值相同并不代表其他二进制布局兼容。当前不提供布局迁移。
 
-## 8. 字段查询
+## 8. 降采样查询
 
-`query.field` 使用 `分辨率:特征` 形式，例如 `5m:last` 或 `1h:count`，共十种合法组合。参数经 HTTP、EvalConfig、SearchQuery 传递到存储端。非法参数返回错误；字段查询禁用结果缓存及为缓存进行的时间范围对齐。
+HTTP 使用两个独立参数：`query.resolution` 指定 `5m` 或 `1h`，`query.feature` 指定 `last`、`sum`、`count`、`min` 或 `max`，例如 `query.resolution=5m&query.feature=sum`。两个参数必须同时提供且各出现一次；空值、非法值、重复参数和旧参数 `query.field` 均返回错误。两者均未提供时使用原始查询路径。
+
+参数解析为 `DownsampleQuery{ResolutionMs, Feature}`，经 HTTP、`EvalConfig`、`SearchQuery` 和集群 RPC 传递到存储端。`Search.Init → tableSearch.Init → partitionSearch.Init → partSearch.Init` 均在原有参数表末尾接收 `*DownsampleQuery`；`nil` 表示原始查询。各层只透传选择，不复制一套搜索入口，也不在查询中重新降采样。
 
 | 查询方式 | 读取范围 |
 |---|---|
-| 指定 `query.field` | 只读取已落盘的降采样 part 中对应分辨率、对应特征；跳过原始 part |
-| 未指定 `query.field` | 使用原有查询流程；跳过降采样 part |
+| 同时指定 `query.resolution` 和 `query.feature` | 只读取已落盘的降采样 part 中对应分辨率、对应特征；跳过原始 part |
+| 两个参数均未指定 | 使用原有查询流程；跳过降采样 part |
 
-字段 RPC 为 `search_downsampling_v2`。它保留原有租户、时间范围和筛选条件的组织方式，在查询负载后追加 8 字节分辨率和 1 字节特征编号；编号与磁盘格式相同。响应继续使用原生 MetricBlock。字段请求要求全部目标存储节点成功，节点不支持该协议时返回错误，不接受部分结果。
+降采样 RPC 为 `search_downsampling_v2`。它保留原有租户、时间范围和筛选条件的组织方式，在查询负载后追加 8 字节分辨率和 1 字节特征编号；编号与磁盘格式相同。响应继续使用原生 MetricBlock。降采样请求要求全部目标存储节点成功，节点不支持该协议时返回错误，不接受部分结果。降采样查询禁用结果缓存及为缓存进行的时间范围对齐。
 
-查询由 `partSearch` 使用 `downsampleReader` 定位目标列 header，再由 `BlockRef` 和原生 `Block` 按偏移读取 payload；查询不读取其余四个特征的 index 和 payload。存储层按共享时间戳选择记录，不恢复或重新裁剪 bucket 内原始贡献；HTTP 查询继续遵循 PromQL 的回看窗口和求值网格。
+`partSearch` 直接按分辨率和特征筛选 metaindex，读取目标列的 index，并复用原有索引缓存、TSID 与时间范围筛选以及 `BlockRef` 构造流程。定位到原生 `blockHeader` 后，由 `BlockRef` 和原生 `Block` 按偏移读取并解码 payload；查询不读取其余四个特征的 index 和 payload。`downsampleReader` 仅供归并使用，查询不创建或借用该 reader。
 
-vmselect 与 vmstorage 的去重配置独立生效，需要保留全部降采样记录时，两端都应设置 `dedup.minScrapeInterval=0`。当前字段接口不聚合尚未合并的跨 part 记录，不组合原始与降采样结果，也不提供自定义分辨率或任意时间区间的精确原始聚合。
+存储层按共享时间戳选择记录，不恢复或重新裁剪 bucket 内原始贡献；HTTP 查询继续遵循 PromQL 的回看窗口和求值网格。vmselect 与 vmstorage 的去重配置独立生效，需要保留全部降采样记录时，两端都应设置 `dedup.minScrapeInterval=0`。当前降采样接口不聚合尚未合并的跨 part 记录，不组合原始与降采样结果，也不提供自定义分辨率或任意时间区间的精确原始聚合。

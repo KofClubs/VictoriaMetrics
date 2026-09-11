@@ -10,7 +10,7 @@ import pathlib
 import time
 
 from downsampling_compare import (
-    CONTROL_METRIC, FIELDS, INPUT_STEPS_MS, METRIC, RESOLUTIONS, Server,
+    CONTROL_METRIC, FEATURES, INPUT_STEPS_MS, METRIC, RESOLUTIONS, Server,
     aggregate, assert_samples, binary_manifest, fixture, range_expected, write_json,
 )
 
@@ -67,9 +67,9 @@ def capture(server, stage, samples, base, summary):
     snapshots = {}
     for resolution, milliseconds in RESOLUTIONS.items():
         expected = {metric: aggregate(samples, metric, milliseconds) for metric in (METRIC, CONTROL_METRIC)}
-        for field in FIELDS:
+        for feature in FEATURES:
             for query_type in ("matrix", "range"):
-                params = {"nocache": "1", "query.field": resolution + ":" + field}
+                params = {"nocache": "1", "query.resolution": resolution, "query.feature": feature}
                 start = base + milliseconds - 1
                 if query_type == "matrix":
                     path = "/api/v1/query"
@@ -78,7 +78,7 @@ def capture(server, stage, samples, base, summary):
                     path = "/api/v1/query_range"
                     params.update(query=SELECTOR, start=start / 1000, end=end / 1000,
                                   step=resolution, max_lookback=resolution)
-                key = resolution + ":" + field + ":" + query_type
+                key = resolution + ":" + feature + ":" + query_type
                 server.cluster.assert_running()
                 response = json.loads(server.request(path, params))
                 write_json(server.root / (stage + "-" + key.replace(":", "-") + ".json"),
@@ -88,7 +88,7 @@ def capture(server, stage, samples, base, summary):
                     {"__name__": metric} for metric in sorted(expected)], (stage, key, actual)
                 for series in actual:
                     metric = series["metric"]["__name__"]
-                    want = [(row["timestamp"], row[field]) for row in expected[metric]]
+                    want = [(row["timestamp"], row[feature]) for row in expected[metric]]
                     if query_type == "range":
                         want = range_expected(want, start, end, milliseconds)
                     points = [(round(timestamp * 1000), float(value)) for timestamp, value in series["values"]]
@@ -106,7 +106,7 @@ def run(server, phases, base, summary):
         server.ingest(batch)
         server.force_merge("batch-" + str(index))
     before_parts = server.part_metadata("before-restart")
-    expected_rows = sum(len(aggregate(samples, metric, resolution)) * len(FIELDS)
+    expected_rows = sum(len(aggregate(samples, metric, resolution)) * len(FEATURES)
                         for metric in (METRIC, CONTROL_METRIC) for resolution in RESOLUTIONS.values())
     assert sum(part["metadata"]["RowsCount"] for part in before_parts) == expected_rows, before_parts
     summary["checks"].append({"check": "downsampling-physical-rows", "rows": expected_rows})
@@ -133,7 +133,7 @@ def run(server, phases, base, summary):
     assert before_parts == after_parts, ("重启前后活动 part 变化", before_parts, after_parts)
     summary["checks"].append({"check": "active-parts-unchanged", "parts": len(after_parts)})
     after = capture(server, "after-restart", samples, base, summary)
-    assert before.keys() == after.keys(), "重启前后的字段查询集合变化"
+    assert before.keys() == after.keys(), "重启前后的降采样查询集合变化"
     for key in before:
         summary["checks"].append(assert_unchanged(before[key], after[key], "restart-exact:" + key))
     summary["exact_comparisons"] = len(before)
@@ -153,7 +153,7 @@ def main():
     write_json(args.output / "fixture.json", {"base_ms": base, "input_steps_ms": INPUT_STEPS_MS, "phases": phases})
     summary = {"status": "running", "mode": "cluster", "tenant": args.tenant, "base_ms": base,
                "input_rows": sum(map(len, phases)), "input_steps_ms": INPUT_STEPS_MS,
-               "fields": [resolution + ":" + field for resolution in RESOLUTIONS for field in FIELDS],
+               "query_combinations": [resolution + ":" + feature for resolution in RESOLUTIONS for feature in FEATURES],
                "restart_comparison": "标签、时间戳、数值字符串严格相等；仅规范化时间线顺序",
                "oracle_tolerance": {"relative": 1e-10, "absolute": 1e-9}, "checks": [],
                "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat()}

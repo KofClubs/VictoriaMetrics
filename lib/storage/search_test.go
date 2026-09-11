@@ -312,7 +312,7 @@ func testAssertSearchResult(st *Storage, tr TimeRange, tfs *TagFilters, want []M
 	}
 
 	var s Search
-	s.Init(nil, st, []*TagFilters{tfs}, tr, 1e5, noDeadline)
+	s.Init(nil, st, []*TagFilters{tfs}, tr, 1e5, noDeadline, nil)
 	defer s.MustClose()
 	var mbs []metricBlock
 	for s.NextMetricBlock() {

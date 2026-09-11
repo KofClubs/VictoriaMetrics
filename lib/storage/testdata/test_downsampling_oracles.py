@@ -85,7 +85,7 @@ class OracleTests(unittest.TestCase):
 
     def assert_both_oracles(self, resolution, expected):
         short = single.aggregate(self.rows, single.METRIC, resolution)
-        actual = [(row["timestamp"], tuple(row[field] for field in single.FIELDS)) for row in short]
+        actual = [(row["timestamp"], tuple(row[feature] for feature in single.FEATURES)) for row in short]
         self.assertEqual(actual, expected)
         self.assertEqual(multi.aggregate_map({self.key: list(reversed(self.points))}, resolution), {self.key: expected})
 
@@ -145,9 +145,9 @@ class OracleTests(unittest.TestCase):
 
     def test_matrix_clips_only_shared_timestamp(self):
         data = {self.key: [(299_000, (7.0, 9.0, 3.0, -2.0, 7.0))]}
-        self.assertEqual(multi.filter_points(data, 14_000, 298_999, field=1), {})
-        self.assertEqual(multi.filter_points(data, 14_000, 299_000, field=1), {self.key: [(299_000, 9.0)]})
-        self.assertEqual(multi.filter_points(data, 0, 300_000, selected=set(), field=1), {})
+        self.assertEqual(multi.filter_points(data, 14_000, 298_999, feature_index=1), {})
+        self.assertEqual(multi.filter_points(data, 14_000, 299_000, feature_index=1), {self.key: [(299_000, 9.0)]})
+        self.assertEqual(multi.filter_points(data, 0, 300_000, selected=set(), feature_index=1), {})
 
 
 if __name__ == "__main__":

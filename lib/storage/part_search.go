@@ -40,18 +40,12 @@ type partSearch struct {
 
 	err error
 
-	dsReader      *downsampleReader
-	dsField       DownsampleQueryField
-	dsFilterReady bool
+	// 当前查询分辨率和特征对应的剩余 metaindex；不持有 merge reader 或额外文件句柄。
+	dsMetaindex []downsampleMetaindexRow
 }
 
 func (ps *partSearch) reset() {
-	if ps.dsReader != nil {
-		putDownsampleReader(ps.dsReader)
-		ps.dsReader = nil
-	}
-	ps.dsField = DownsampleQueryField{}
-	ps.dsFilterReady = false
+	ps.dsMetaindex = nil
 	ps.BlockRef.reset()
 	ps.p = nil
 	ps.tsids = nil
@@ -68,14 +62,11 @@ var isInTest = func() bool {
 }()
 
 // Init initializes the ps with the given p, tsids and tr.
+// downsampleQuery selects a stored resolution and feature; nil searches raw data.
 //
 // tsids must be sorted.
 // tsids cannot be modified after the Init call, since it is owned by ps.
-func (ps *partSearch) Init(p *part, tsids []TSID, tr TimeRange) {
-	ps.initWithDownsampleField(p, tsids, tr, nil)
-}
-
-func (ps *partSearch) initWithDownsampleField(p *part, tsids []TSID, tr TimeRange, field *DownsampleQueryField) {
+func (ps *partSearch) Init(p *part, tsids []TSID, tr TimeRange, downsampleQuery *DownsampleQuery) {
 	ps.reset()
 	ps.p = p
 
@@ -88,22 +79,26 @@ func (ps *partSearch) initWithDownsampleField(p *part, tsids []TSID, tr TimeRang
 	}
 	ps.tr = tr
 	ps.metaindex = p.metaindex
-	if field != nil {
-		if !field.valid() {
-			ps.err = fmt.Errorf("[downsampling] invalid query field")
+	if downsampleQuery != nil {
+		if !downsampleQuery.valid() {
+			ps.err = fmt.Errorf("[downsampling] invalid query resolution or feature")
 			return
 		}
-		// 指定字段时只查询磁盘摘要，防止原始值冒充 sum 或 count。
+		// 指定分辨率和特征时只查询对应的降采样数据，原始值不能作为 sum 或 count 返回。
 		if p.dsMetadata == nil {
 			ps.err = io.EOF
 			return
 		}
-		ps.dsField = *field
-		ps.dsReader = getDownsampleReader()
-		ps.err = ps.dsReader.Init(p, field.ResolutionMs, field.Feature)
-		return
-	}
-	if p.dsMetadata != nil {
+		rows := p.dsMetaindex
+		start := sort.Search(len(rows), func(i int) bool {
+			return rows[i].ResolutionMs > downsampleQuery.ResolutionMs ||
+				(rows[i].ResolutionMs == downsampleQuery.ResolutionMs && rows[i].feature >= downsampleQuery.Feature)
+		})
+		end := start + sort.Search(len(rows)-start, func(i int) bool {
+			return rows[start+i].ResolutionMs > downsampleQuery.ResolutionMs || rows[start+i].feature > downsampleQuery.Feature
+		})
+		ps.dsMetaindex = rows[start:end]
+	} else if p.dsMetadata != nil {
 		ps.err = io.EOF
 		return
 	}
@@ -120,9 +115,6 @@ func (ps *partSearch) initWithDownsampleField(p *part, tsids []TSID, tr TimeRang
 // The blocks are sorted by (TDIS, MinTimestamp). Two subsequent blocks
 // for the same TSID may contain overlapped time ranges.
 func (ps *partSearch) NextBlock() bool {
-	if ps.dsReader != nil {
-		return ps.err == nil && ps.nextDownsampleBlock()
-	}
 	for {
 		if ps.err != nil {
 			return false
@@ -184,6 +176,9 @@ func (ps *partSearch) skipTSIDsSmallerThan(tsid *TSID) bool {
 }
 
 func (ps *partSearch) nextBHS() bool {
+	if ps.p.dsMetadata != nil {
+		return ps.nextDownsampleBHS()
+	}
 	for len(ps.metaindex) > 0 {
 		// Optimization: skip tsid values smaller than the minimum value from ps.metaindex.
 		if !ps.skipTSIDsSmallerThan(&ps.metaindex[0].TSID) {
@@ -306,7 +301,7 @@ func (ps *partSearch) searchBHS() bool {
 
 		// Invariant: tsid <= bh.TSID
 
-		if bh.TSID.MetricID != tsid.MetricID {
+		if bh.TSID.MetricID != tsid.MetricID || (ps.p.dsMetadata != nil && bh.TSID != *tsid) {
 			// tsid < bh.TSID: no more blocks with the given tsid.
 			// Proceed to the next (bigger) tsid.
 			if !ps.skipTSIDsSmallerThan(&bh.TSID) {

@@ -6,21 +6,21 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 )
 
-func TestDownsampleQueryFieldCacheAndCopy(t *testing.T) {
-	field, err := storage.ParseDownsampleQueryField("5m:sum")
+func TestDownsampleQueryCacheAndCopy(t *testing.T) {
+	downsampleQuery, err := storage.ParseDownsampleQuery("5m", "sum")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ec := &EvalConfig{Start: 1000, End: 2000, Step: 1000, DownsampleField: field}
+	ec := &EvalConfig{Start: 1000, End: 2000, Step: 1000, DownsampleQuery: downsampleQuery}
 	if ec.MayCache() {
-		t.Fatal("摘要查询使用了未区分特征值的结果缓存")
+		t.Fatal("降采样查询使用了未区分特征值的结果缓存")
 	}
 	copy := copyEvalConfig(ec)
-	if copy.DownsampleField != field || copy.MayCache() {
-		t.Fatal("子查询复制丢失字段选择或重新启用了结果缓存")
+	if copy.DownsampleQuery != downsampleQuery || copy.MayCache() {
+		t.Fatal("子查询复制丢失分辨率与特征选择或重新启用了结果缓存")
 	}
 	ec.Start = ec.End
 	if ec.MayCache() {
-		t.Fatal("瞬时摘要查询未禁用结果缓存")
+		t.Fatal("瞬时降采样查询未禁用结果缓存")
 	}
 }

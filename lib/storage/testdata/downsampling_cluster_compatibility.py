@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""验证集群字段查询协议与原版组件的兼容边界。"""
+"""验证集群降采样查询协议与原版组件的兼容边界。"""
 
 import argparse
 import json
@@ -13,7 +13,7 @@ sys.dont_write_bytecode = True
 from downsampling_compare import Server, assert_samples, binary_manifest, range_expected, write_json
 
 
-def assert_field_rejected(server, path, params, evidence):
+def assert_downsample_query_rejected(server, path, params, evidence):
     server.cluster.assert_running()
     log_path = server.root / "vmstorage.log"
     log_offset = log_path.stat().st_size
@@ -39,10 +39,10 @@ def assert_field_rejected(server, path, params, evidence):
         assert 400 <= error.code < 600 and response.get("status") == "error", response
         assert "search_downsampling_v2" in response.get("error", ""), response
         assert b'unsupported rpcName: "search_downsampling_v2"' in appended, \
-            ("本次请求未产生不支持字段 RPC 的 vmstorage 日志", str(excerpt_path), response)
+            ("本次请求未产生不支持降采样 RPC 的 vmstorage 日志", str(excerpt_path), response)
         return {"check": server.name + ":" + evidence, "http_status": error.code,
                 "unsupported_rpc_log": str(excerpt_path)}
-    raise AssertionError(("旧 vmstorage 的字段查询未明确失败", path, result))
+    raise AssertionError(("旧 vmstorage 的降采样查询未明确失败", path, result))
 
 
 def main():
@@ -85,12 +85,12 @@ def main():
                                                          name + ":native-range"))
                 if new_select:
                     params = {"query": metric + "[300001ms]", "time": (base + 300000) / 1000,
-                              "nocache": "1", "query.field": "5m:sum"}
-                    summary["checks"].append(assert_field_rejected(
+                              "nocache": "1", "query.resolution": "5m", "query.feature": "sum"}
+                    summary["checks"].append(assert_downsample_query_rejected(
                         server, "/api/v1/query", params, "unsupported-downsampling-v2-matrix"))
                     params = {"query": metric, "start": start / 1000, "end": end / 1000, "step": "16s",
-                              "nocache": "1", "query.field": "5m:sum"}
-                    summary["checks"].append(assert_field_rejected(
+                              "nocache": "1", "query.resolution": "5m", "query.feature": "sum"}
+                    summary["checks"].append(assert_downsample_query_rejected(
                         server, "/api/v1/query_range", params, "unsupported-downsampling-v2-range"))
             finally:
                 server.stop()

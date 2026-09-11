@@ -55,16 +55,13 @@ func (pts *partitionSearch) reset() {
 }
 
 // Init initializes the search in the given partition for the given tsid and tr.
+// downsampleQuery is passed through to each part search.
 //
 // tsids must be sorted.
 // tsids cannot be modified after the Init call, since it is owned by pts.
 //
 // MustClose must be called when partition search is done.
-func (pts *partitionSearch) Init(pt *partition, tsids []TSID, tr TimeRange) {
-	pts.initWithDownsampleField(pt, tsids, tr, nil)
-}
-
-func (pts *partitionSearch) initWithDownsampleField(pt *partition, tsids []TSID, tr TimeRange, field *DownsampleQueryField) {
+func (pts *partitionSearch) Init(pt *partition, tsids []TSID, tr TimeRange, downsampleQuery *DownsampleQuery) {
 	if pts.needClosing {
 		logger.Panicf("BUG: missing partitionSearch.MustClose call before the next call to Init")
 	}
@@ -107,7 +104,7 @@ func (pts *partitionSearch) initWithDownsampleField(pt *partition, tsids []TSID,
 	// Initialize psPool.
 	pts.psPool = slicesutil.SetLength(pts.psPool, len(pts.pws))
 	for i, pw := range pts.pws {
-		pts.psPool[i].initWithDownsampleField(pw.p, filteredTSIDs, tr, field)
+		pts.psPool[i].Init(pw.p, filteredTSIDs, tr, downsampleQuery)
 	}
 
 	// Initialize the psHeap.
@@ -191,10 +188,6 @@ func (pts *partitionSearch) MustClose() {
 		logger.Panicf("BUG: missing Init call before the MustClose call")
 	}
 
-	// 先归还 reader，再释放其引用的 part，避免与删除旧文件并发。
-	for i := range pts.psPool {
-		pts.psPool[i].reset()
-	}
 	pts.pt.PutParts(pts.pws)
 	pts.reset()
 }

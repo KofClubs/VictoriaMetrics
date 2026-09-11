@@ -21,7 +21,7 @@ sys.dont_write_bytecode = True
 
 
 RESOLUTIONS = {"5m": 300_000, "1h": 3_600_000}
-FIELDS = ("last", "sum", "count", "min", "max")
+FEATURES = ("last", "sum", "count", "min", "max")
 METRIC = "downsampling_compare_value"
 CONTROL_METRIC = "downsampling_compare_control"
 INPUT_STEPS_MS = (14_000, 15_000, 16_000)
@@ -221,7 +221,7 @@ class Server:
         write_json(self.root / (stage + "-parts.json"), parts)
         return parts
 
-    def query(self, stage, metric, start, end, resolution=None, field=None, range_query=False):
+    def query(self, stage, metric, start, end, resolution=None, feature=None, range_query=False):
         params = {"nocache": "1"}
         if range_query:
             params.update({"query": metric, "start": start / 1000, "end": end / 1000,
@@ -233,10 +233,10 @@ class Server:
             params.update({"query": metric + "[" + str(end - start + 1) + "ms]", "time": end / 1000})
             path = "/api/v1/query"
             suffix = "matrix"
-        if field is not None:
-            params["query.field"] = resolution + ":" + field
+        if feature is not None:
+            params.update({"query.resolution": resolution, "query.feature": feature})
         response = json.loads(self.request(path, params))
-        name = "-".join(filter(None, (stage, metric, resolution, field, suffix)))
+        name = "-".join(filter(None, (stage, metric, resolution, feature, suffix)))
         write_json(self.root / (name + ".json"), {"path": path, "url": self.url(path), "params": params, "response": response})
         assert response.get("status") == "success", response
         assert response["data"]["resultType"] == "matrix", response
@@ -320,7 +320,7 @@ def verify_stage(stage, servers, samples, base, summary):
         physical_rows = sum(part["metadata"]["RowsCount"] for part in parts)
         expected_rows = len(samples)
         if server.downsampling:
-            expected_rows = sum(len(aggregate(samples, metric, resolution)) * len(FIELDS)
+            expected_rows = sum(len(aggregate(samples, metric, resolution)) * len(FEATURES)
                                 for metric in (METRIC, CONTROL_METRIC)
                                 for resolution in RESOLUTIONS.values())
         assert physical_rows == expected_rows, (stage, server.name, "metadata.RowsCount", physical_rows, expected_rows)
@@ -343,15 +343,15 @@ def verify_stage(stage, servers, samples, base, summary):
             candidate = servers[1]
             expected = aggregate(samples, metric, milliseconds)
             write_json(candidate.root / (stage + "-" + metric + "-" + resolution + "-expected.json"), expected)
-            for field in FIELDS:
-                actual = candidate.query(stage, metric, base, end, resolution, field)
-                want = [(row["timestamp"], row[field]) for row in expected]
+            for feature in FEATURES:
+                actual = candidate.query(stage, metric, base, end, resolution, feature)
+                want = [(row["timestamp"], row[feature]) for row in expected]
                 summary["checks"].append(assert_samples(
-                    actual, want, stage + ":candidate:" + metric + ":" + resolution + ":" + field + ":matrix"))
-                actual_range = candidate.query(stage, metric, start, end, resolution, field, range_query=True)
+                    actual, want, stage + ":candidate:" + metric + ":" + resolution + ":" + feature + ":matrix"))
+                actual_range = candidate.query(stage, metric, start, end, resolution, feature, range_query=True)
                 summary["checks"].append(assert_samples(
                     actual_range, range_expected(want, start, end, milliseconds),
-                    stage + ":candidate:" + metric + ":" + resolution + ":" + field + ":bare-range"))
+                    stage + ":candidate:" + metric + ":" + resolution + ":" + feature + ":bare-range"))
     print(stage + ": 查询与独立参考聚合结果一致", flush=True)
 
 
@@ -372,7 +372,7 @@ def main():
     write_json(args.output / "fixture.json", {"base_ms": base, "input_steps_ms": INPUT_STEPS_MS,
                                              "unique_timestamps_per_series": True, "phases": phases})
     summary = {"status": "running", "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-               "base_ms": base, "query_field_format": "5m:last", "mode": args.mode, "tenant": args.tenant, "checks": [], "stages": [],
+               "base_ms": base, "query_parameters": {"query.resolution": "5m", "query.feature": "last"}, "mode": args.mode, "tenant": args.tenant, "checks": [], "stages": [],
                "input_steps_ms": INPUT_STEPS_MS, "input_rows": sum(map(len, phases)),
                "tolerance": {"relative": 1e-10, "absolute": 1e-9}, "binaries": {},
                "scope": ("真实集群 1+1+1" if args.mode == "cluster" else "单节点") +

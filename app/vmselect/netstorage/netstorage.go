@@ -1837,7 +1837,7 @@ func (e *tmpBlocksFileErr) Unwrap() error {
 // Results.RunParallel or Results.Cancel must be called on the returned Results.
 func ProcessSearchQuery(qt *querytracer.Tracer, denyPartialResponse bool, sq *storage.SearchQuery, deadline searchutil.Deadline) (*Results, bool, error) {
 	errorPrefix := ""
-	if sq.DownsampleField != nil {
+	if sq.DownsampleQuery != nil {
 		errorPrefix = "[downsampling] "
 	}
 	qt = qt.NewChild("fetch matching series: %s", sq)
@@ -1992,7 +1992,7 @@ func processBlocksInternal(qt *querytracer.Tracer, sns []*storageNode, denyParti
 		}
 		return nil
 	}
-	isPartial, err := snr.collectDataSearchResults(sq.DownsampleField, consumeResult)
+	isPartial, err := snr.collectDataSearchResults(sq.DownsampleQuery, consumeResult)
 	// Make sure that processBlock is no longer called after the exit from processBlocks() function.
 	for i := range wgs {
 		muwg := &wgs[i]
@@ -2004,7 +2004,7 @@ func processBlocksInternal(qt *querytracer.Tracer, sns []*storageNode, denyParti
 		wgs[i].wg.Wait()
 	}
 	if err != nil {
-		if sq.DownsampleField != nil {
+		if sq.DownsampleQuery != nil {
 			return isPartial, fmt.Errorf("[downsampling] cannot fetch query results from vmstorage nodes: %w", err)
 		}
 		return isPartial, fmt.Errorf("cannot fetch query results from vmstorage nodes: %w", err)

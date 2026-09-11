@@ -496,7 +496,7 @@ func TestDownsampleMergerSharedPrecisionAndColumnScales(t *testing.T) {
 			scales := make(map[int16]bool)
 			for feature := range block.values {
 				_, scale := decimal.AppendFloatToDecimal(nil, block.values[feature])
-				column, err := r.FieldHeader(uint8(feature))
+				column, err := r.featureHeader(uint8(feature))
 				if err != nil {
 					t.Fatal(err)
 				}

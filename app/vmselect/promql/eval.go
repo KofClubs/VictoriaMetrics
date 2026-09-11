@@ -136,8 +136,8 @@ type EvalConfig struct {
 	// Whether the response must not be cached.
 	NoCache bool
 
-	// DownsampleField 选择测试用磁盘摘要字段，并禁用结果缓存。
-	DownsampleField *storage.DownsampleQueryField
+	// DownsampleQuery 透传降采样分辨率与特征，并禁用未区分这两个参数的结果缓存。
+	DownsampleQuery *storage.DownsampleQuery
 
 	// Whether repeated cacheable binary op subexpressions can be optimized.
 	OptimizeRepeatedBinaryOpSubexprs bool
@@ -189,7 +189,7 @@ func copyEvalConfig(src *EvalConfig) *EvalConfig {
 	ec.MaxPointsPerSeries = src.MaxPointsPerSeries
 	ec.Deadline = src.Deadline
 	ec.NoCache = src.NoCache
-	ec.DownsampleField = src.DownsampleField
+	ec.DownsampleQuery = src.DownsampleQuery
 	ec.OptimizeRepeatedBinaryOpSubexprs = src.OptimizeRepeatedBinaryOpSubexprs
 	ec.LookbackDelta = src.LookbackDelta
 	ec.RoundDigits = src.RoundDigits
@@ -219,7 +219,7 @@ func (ec *EvalConfig) validate() {
 
 // MayCache returns true if the query results can be cached.
 func (ec *EvalConfig) MayCache() bool {
-	if ec.DownsampleField != nil {
+	if ec.DownsampleQuery != nil {
 		return false
 	}
 	if *disableCache {
@@ -1884,7 +1884,7 @@ func evalRollupFuncNoCache(qt *querytracer.Tracer, ec *EvalConfig, funcName stri
 	} else {
 		sq = storage.NewSearchQuery(ec.AuthTokens[0].AccountID, ec.AuthTokens[0].ProjectID, minTimestamp, ec.End, tfss, ec.MaxSeries)
 	}
-	sq.DownsampleField = ec.DownsampleField
+	sq.DownsampleQuery = ec.DownsampleQuery
 	rss, isPartial, err := netstorage.ProcessSearchQuery(qt, ec.DenyPartialResponse, sq, ec.Deadline)
 	if err != nil {
 		return nil, err

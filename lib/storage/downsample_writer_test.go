@@ -162,14 +162,14 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 					t.Fatal(err)
 				}
 				var got Block
-				if err := r.readFieldBlock(&got, uint8(feature)); err != nil {
+				if err := readDownsampleFeatureBlockForTest(r, &got, uint8(feature)); err != nil {
 					t.Fatal(err)
 				}
 				if !reflect.DeepEqual(got.timestamps, want.timestamps) || !reflect.DeepEqual(got.values, want.values) || got.bh.Scale != want.bh.Scale || got.bh.PrecisionBits != batch.precisionBits || len(got.timestampsData) != 0 || len(got.valuesData) != 0 || got.nextIdx != 0 {
 					t.Fatalf("特征 %d 未通过原生 Block 完成解码", feature)
 				}
 				// 查询用 header 直接进入既有 BlockRef，验证扩展格式不需要专用查询 decoder。
-				bh, err := r.FieldHeader(uint8(feature))
+				bh, err := r.featureHeader(uint8(feature))
 				if err != nil || bh.PrecisionBits != precision {
 					t.Fatalf("查询未保留共享精度: %+v / %v", bh, err)
 				}
@@ -206,7 +206,7 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 			w.reset()
 			for feature := range w.blocks {
 				if w.blocks[feature].bh != (blockHeader{}) || len(w.blocks[feature].timestampsData) != 0 || len(w.blocks[feature].valuesData) != 0 {
-					t.Fatal("writer Reset 遗留字段 Block 状态")
+					t.Fatal("writer Reset 遗留特征 Block 状态")
 				}
 			}
 			if err := r.Close(); err != nil {
@@ -222,7 +222,7 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 // TestDownsampleFilePhysicalLayout 按设计中的固定字节位置检查真实文件。
 // 不调用降采样 reader 或 header decoder，避免写入端与读取端的相同错误互相抵消。
 func TestDownsampleFilePhysicalLayout(t *testing.T) {
-	if marshaledTSIDSize != 32 || marshaledBlockHeaderSize != clusterDownsampleFieldHeaderBytes || downsampleMetaindexRowSize != clusterDownsampleMetaindexBytes {
+	if marshaledTSIDSize != 32 || marshaledBlockHeaderSize != clusterDownsampleHeaderBytes || downsampleMetaindexRowSize != clusterDownsampleMetaindexBytes {
 		t.Fatal("集群磁盘格式尺寸与独立约定不一致")
 	}
 	for _, tc := range []struct {
@@ -276,7 +276,7 @@ func TestDownsampleFilePhysicalLayout(t *testing.T) {
 				expectedTimestamps = append(expectedTimestamps, payload...)
 			}
 			var zeroColumns, nonzeroColumns int
-			nextField := 0
+			nextFeatureBlock := 0
 			minTimestamp, maxTimestamp := blocks[0].timestamps[0], blocks[0].timestamps[0]
 			for pos := 0; pos < len(meta); pos += clusterDownsampleMetaindexBytes {
 				mr := meta[pos : pos+clusterDownsampleMetaindexBytes]
@@ -285,15 +285,15 @@ func TestDownsampleFilePhysicalLayout(t *testing.T) {
 				count := binary.BigEndian.Uint32(mr[32:36])
 				offset := binary.BigEndian.Uint64(mr[52:60])
 				size := binary.BigEndian.Uint32(mr[60:64])
-				resIndex := nextField / (tc.blocksPerRes * 5)
-				col := nextField / tc.blocksPerRes % 5
-				start := nextField % tc.blocksPerRes
+				resIndex := nextFeatureBlock / (tc.blocksPerRes * 5)
+				col := nextFeatureBlock / tc.blocksPerRes % 5
+				start := nextFeatureBlock % tc.blocksPerRes
 				if resIndex >= 2 || feature != col || resolution != []int64{300000, 3600000}[resIndex] || count == 0 || count > 736 || start+int(count) > tc.blocksPerRes || offset != nextIndexOffset || offset+uint64(size) > uint64(len(files["index.bin"])) {
 					t.Fatalf("metaindex 第 %d 行的 feature 分组、数量或 index offset/size 错误", pos/clusterDownsampleMetaindexBytes)
 				}
 				nextIndexOffset += uint64(size)
 				index := decodeDownsampleLayoutFrame(t, files["index.bin"][offset:nextIndexOffset], "VMDSIX")
-				if len(index) != int(count)*clusterDownsampleFieldHeaderBytes {
+				if len(index) != int(count)*clusterDownsampleHeaderBytes {
 					t.Fatalf("index 长度=%d，与 %d 个 89 字节原生 header 不一致", len(index), count)
 				}
 				blockStart := resIndex*tc.blocksPerRes + start
@@ -350,9 +350,9 @@ func TestDownsampleFilePhysicalLayout(t *testing.T) {
 				minTimestamp = min(minTimestamp, groupMin)
 				maxTimestamp = max(maxTimestamp, groupMax)
 				totalRows += groupRows
-				nextField += int(count)
+				nextFeatureBlock += int(count)
 			}
-			if nextField != len(blocks)*5 || nextIndexOffset != uint64(len(files["index.bin"])) {
+			if nextFeatureBlock != len(blocks)*5 || nextIndexOffset != uint64(len(files["index.bin"])) {
 				t.Fatal("block 数量错误或 index 存在未引用字节")
 			}
 			if !bytes.Equal(files["values.bin"], expectedValues) || !bytes.Equal(files["timestamps.bin"], expectedTimestamps) {

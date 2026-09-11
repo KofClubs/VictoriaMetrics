@@ -93,7 +93,7 @@ func TestDownsampleFileConstantAndFilter(t *testing.T) {
 	if !r.NextHeader() {
 		t.Fatalf("丢失相交 block: %v", r.Error())
 	}
-	h, err := r.FieldHeader(downsampleFeatureCount)
+	h, err := r.featureHeader(downsampleFeatureCount)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,32 +457,32 @@ func TestDownsampleIterationReaderReuse(t *testing.T) {
 
 func TestDownsampleReaderCrossIndexOffsets(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		field string
-		shift int64
+		name    string
+		payload string
+		shift   int64
 	}{
 		{name: "continuous"},
-		{name: "timestamp_gap", field: "timestamp", shift: 1},
-		{name: "timestamp_overlap", field: "timestamp", shift: -1},
-		{name: "values_gap", field: "values", shift: 1},
-		{name: "values_overlap", field: "values", shift: -1},
+		{name: "timestamp_gap", payload: "timestamp", shift: 1},
+		{name: "timestamp_overlap", payload: "timestamp", shift: -1},
+		{name: "values_gap", payload: "values", shift: 1},
+		{name: "values_overlap", payload: "values", shift: -1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeDownsampleCrossIndexPart(t)
-			if tc.field != "" {
+			if tc.payload != "" {
 				// 改动中间 index 的完整 block 偏移，保持列间连续及文件边界合法。
 				// 若只校验单个 index 内部，四种损坏均不会在读取 header 时报错。
 				rewriteDownsampleCrossIndexFile(t, path, 1, func(data []byte) {
 					pos := 56 // 原生 blockHeader.TimestampsBlockOffset
-					if tc.field == "values" {
+					if tc.payload == "values" {
 						pos = 64 // 原生 blockHeader.ValuesBlockOffset
 					}
 					offset := binary.BigEndian.Uint64(data[pos : pos+8])
 					binary.BigEndian.PutUint64(data[pos:pos+8], uint64(int64(offset)+tc.shift))
 				})
 			}
-			if tc.field != "" {
-				assertDownsampleLayoutOpenRejected(t, path, "payloads are not contiguous across adjacent index blocks")
+			if tc.payload != "" {
+				assertDownsampleLayoutOpenRejected(t, path, "payloads are not contiguous")
 			}
 			p := openDownsampleLayoutReaderFixture(t, path)
 			r := getDownsampleReader()
@@ -494,7 +494,7 @@ func TestDownsampleReaderCrossIndexOffsets(t *testing.T) {
 			for r.NextHeader() {
 				count++
 			}
-			if tc.field == "" {
+			if tc.payload == "" {
 				if count != 4 || r.Error() != nil {
 					t.Fatalf("正常跨 index 扫描失败: count=%d, err=%v", count, r.Error())
 				}
@@ -616,7 +616,7 @@ func TestDownsampleReaderDuplicateBatchKey(t *testing.T) {
 				t.Fatal(err)
 			}
 			if separateIndexes {
-				w.indexLimit = clusterDownsampleFieldHeaderBytes
+				w.indexLimit = clusterDownsampleHeaderBytes
 			}
 			for i := 0; i < 2; i++ {
 				b := fileTestDownsampleBlock(1, 300000)
@@ -660,12 +660,12 @@ func TestDownsampleReaderDuplicateBatchKey(t *testing.T) {
 				if separateIndexes {
 					wantHeaders = 1
 				}
-				if err != nil || len(data) != wantHeaders*clusterDownsampleFieldHeaderBytes {
+				if err != nil || len(data) != wantHeaders*clusterDownsampleHeaderBytes {
 					t.Fatalf("重复键 fixture 的 index 长度错误: %d, err=%v", len(data), err)
 				}
 				if !separateIndexes || pos/clusterDownsampleMetaindexBytes%2 == 1 {
 					// 每个 feature 只替换第二个批次的 MinTimestamp，保留负载和其他统计。
-					batchOffset := clusterDownsampleFieldHeaderBytes
+					batchOffset := clusterDownsampleHeaderBytes
 					if separateIndexes {
 						batchOffset = 0
 					}
@@ -790,7 +790,7 @@ func TestDownsampleReaderCloseBorrowedFiles(t *testing.T) {
 	if !r.NextHeader() {
 		t.Fatalf("missing header: %v", r.Error())
 	}
-	if _, err := r.FieldHeader(downsampleFeatureSum); err != nil {
+	if _, err := r.featureHeader(downsampleFeatureSum); err != nil {
 		t.Fatal(err)
 	}
 	if r.peers[downsampleFeatureSum] == nil {
@@ -877,7 +877,7 @@ func TestDownsampleReaderInitFailureReleasesPartialSource(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := r.Init(p, downsampleResolution1h, downsampleFeatureMax); err != nil {
+	if err := r.Init(p, downsampleResolution1h); err != nil {
 		t.Fatal(err)
 	}
 	files := []filestream.ReadAtCloser{r.timestampsReader, r.valuesReader, r.indexReader}
@@ -942,11 +942,11 @@ func TestDownsampleReaderSharedTimestampsValuesOnly(t *testing.T) {
 			var columns [countOfDownsampleFeatures]blockHeader
 			var expected [countOfDownsampleFeatures]Block
 			for feature := range columns {
-				columns[feature], err = r.FieldHeader(uint8(feature))
+				columns[feature], err = r.featureHeader(uint8(feature))
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := r.readFieldBlock(&expected[feature], uint8(feature)); err != nil {
+				if err := readDownsampleFeatureBlockForTest(&r, &expected[feature], uint8(feature)); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -958,7 +958,7 @@ func TestDownsampleReaderSharedTimestampsValuesOnly(t *testing.T) {
 			defer f.Close()
 			r.timestampsReader = f
 			var got Block
-			if err := r.readFieldBlock(&got, downsampleFeatureLast); err != nil {
+			if err := readDownsampleFeatureBlockForTest(&r, &got, downsampleFeatureLast); err != nil {
 				t.Fatal(err)
 			}
 			if err := f.Close(); err != nil {
@@ -981,8 +981,8 @@ func TestDownsampleReaderSharedTimestampsValuesOnly(t *testing.T) {
 				}
 			}
 			// 查询的单列读取仍完整读取时间戳，不借用另一次操作留下的缓存。
-			if err := r.readFieldBlock(&got, downsampleFeatureMax); !errors.Is(err, os.ErrClosed) {
-				t.Fatalf("readFieldBlock unexpectedly reused timestamps: %v", err)
+			if err := readDownsampleFeatureBlockForTest(&r, &got, downsampleFeatureMax); !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("single-feature reference read unexpectedly reused timestamps: %v", err)
 			}
 			// 下一次多特征读取也必须重新读取首列，不能跨 ReadBlock 缓存。
 			var next downsampleDecodedResolutionFeaturesBlock
@@ -1012,9 +1012,9 @@ func TestDownsampleReaderSharedTimestampsSwitches(t *testing.T) {
 		defer p.MustClose()
 		parts = append(parts, p)
 	}
-	var r, query downsampleReader
+	var r, reference downsampleReader
 	defer r.Close()
-	defer query.Close()
+	defer reference.Close()
 	var got downsampleDecodedResolutionFeaturesBlock
 	// 同源切换分辨率、跨源切换，最后重新读取第一个源，均复用同一组工作缓冲。
 	for _, step := range []struct {
@@ -1025,24 +1025,24 @@ func TestDownsampleReaderSharedTimestampsSwitches(t *testing.T) {
 		if err := r.Init(p, step.resolution); err != nil {
 			t.Fatal(err)
 		}
-		if err := query.Init(p, step.resolution); err != nil {
+		if err := reference.Init(p, step.resolution); err != nil {
 			t.Fatal(err)
 		}
 		blocks := 0
 		for r.NextHeader() {
-			if !query.NextHeader() {
-				t.Fatalf("query lost block: %v", query.Error())
+			if !reference.NextHeader() {
+				t.Fatalf("reference reader lost block: %v", reference.Error())
 			}
 			if err := r.ReadBlock(&got); err != nil {
 				t.Fatal(err)
 			}
-			h := query.Header()
+			h := reference.Header()
 			if got.tsid != h.TSID || got.resolution != step.resolution || got.precisionBits != h.PrecisionBits {
 				t.Fatal("block identity was reused across TSID, source or resolution")
 			}
 			for feature := range got.values {
 				var want Block
-				if err := query.readFieldBlock(&want, uint8(feature)); err != nil {
+				if err := readDownsampleFeatureBlockForTest(&reference, &want, uint8(feature)); err != nil {
 					t.Fatal(err)
 				}
 				if !reflect.DeepEqual(got.timestamps, want.timestamps) {
@@ -1063,8 +1063,8 @@ func TestDownsampleReaderSharedTimestampsSwitches(t *testing.T) {
 		if err := r.Error(); err != nil {
 			t.Fatal(err)
 		}
-		if query.NextHeader() || query.Error() != nil || blocks != 3 {
-			t.Fatalf("lost blocks after switching: got %d; query error %v", blocks, query.Error())
+		if reference.NextHeader() || reference.Error() != nil || blocks != 3 {
+			t.Fatalf("lost blocks after switching: got %d; reference reader error %v", blocks, reference.Error())
 		}
 	}
 }
@@ -1082,14 +1082,14 @@ func TestDownsampleReaderSharedTimestampsValidation(t *testing.T) {
 		t.Fatalf("cannot position reader: %v / %v", err, r.Error())
 	}
 	shared := *r.Header()
-	column, err := r.FieldHeader(downsampleFeatureSum)
+	column, err := r.featureHeader(downsampleFeatureSum)
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertInvalidValues := func(t *testing.T, h *blockHeader) {
 		t.Helper()
 		var b Block
-		if err := r.readFieldBlock(&b, downsampleFeatureLast); err != nil {
+		if err := readDownsampleFeatureBlockForTest(&r, &b, downsampleFeatureLast); err != nil {
 			t.Fatal(err)
 		}
 		if err := r.readNativeValues(&b, h, &shared); err == nil {
@@ -1115,13 +1115,12 @@ func TestDownsampleReaderSharedTimestampsValidation(t *testing.T) {
 			h := column
 			mutate(&h)
 			assertInvalidValues(t, &h)
-			// FieldHeader validates cached peers before returning a query header;
-			// this path must reject mismatches without relying on values decoding.
+			// featureHeader validates cached peer headers before merge values decoding.
 			peer := r.peers[downsampleFeatureSum]
 			peer.current = h
 			defer func() { peer.current = column }()
-			if _, err := r.FieldHeader(downsampleFeatureSum); err == nil {
-				t.Fatal("FieldHeader accepted a peer with different shared timestamps")
+			if _, err := r.featureHeader(downsampleFeatureSum); err == nil {
+				t.Fatal("featureHeader accepted a peer with different shared timestamps")
 			}
 		})
 	}

@@ -15,7 +15,9 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from downsampling_cluster import ClusterRuntime
-from downsampling_cluster_compatibility import assert_field_rejected
+from downsampling_cluster_compatibility import assert_downsample_query_rejected
+from downsampling_compare import Server
+from downsampling_multiseries_compare import MultiServer
 
 
 class Response(io.BytesIO):
@@ -49,15 +51,36 @@ class ClusterRuntimeTests(unittest.TestCase):
                 self.runtime.tenant = tenant
             self.assertEqual(self.runtime.tenant, "11:17")
 
-    def test_query_field_is_preserved_in_both_http_query_routes(self):
-        for path in ("/api/v1/query", "/api/v1/query_range"):
-            for resolution in ("5m", "1h"):
-                for field in ("last", "sum", "count", "min", "max"):
-                    with mock.patch("downsampling_cluster.urllib.request.urlopen", return_value=Response(b"{}")) as request:
-                        self.runtime.request(path, {"query": "probe", "query.field": resolution + ":" + field})
-                    parsed = urllib.parse.urlparse(request.call_args.args[0].full_url)
-                    self.assertEqual(parsed.path, "/select/11:17/prometheus" + path)
-                    self.assertEqual(urllib.parse.parse_qs(parsed.query)["query.field"], [resolution + ":" + field])
+    def test_query_parameters_are_preserved_in_both_http_query_routes(self):
+        response = json.dumps({"status": "success", "data": {"resultType": "matrix", "result": [
+            {"metric": {"__name__": "probe"}, "values": [[1, "2"]]}]}}).encode()
+        combinations = [(resolution, feature) for resolution in ("5m", "1h")
+                        for feature in ("last", "sum", "count", "min", "max")]
+        combinations.append(("16s", None))
+        for server_type in (Server, MultiServer):
+            # 只测试请求构造和路由，不分配端口或启动进程。
+            server = server_type.__new__(server_type)
+            server.root, server.cluster = self.root, self.runtime
+            for range_query in (False, True):
+                path = "/api/v1/query_range" if range_query else "/api/v1/query"
+                for resolution, feature in combinations:
+                    with self.subTest(server=server_type.__name__, path=path, resolution=resolution, feature=feature):
+                        with mock.patch("urllib.request.urlopen", return_value=Response(response)) as request:
+                            if server_type is Server:
+                                server.query("request", "probe", 0, 1000, resolution, feature, range_query)
+                            else:
+                                server.query_many("request", "probe", "probe", 0, 1000, resolution, feature, range_query)
+                        url = request.call_args.args[0]
+                        parsed = urllib.parse.urlparse(url if isinstance(url, str) else url.full_url)
+                        self.assertEqual(parsed.path, "/select/11:17/prometheus" + path)
+                        parameters = urllib.parse.parse_qs(parsed.query)
+                        self.assertNotIn("query.field", parameters)
+                        if feature is None:
+                            self.assertNotIn("query.resolution", parameters)
+                            self.assertNotIn("query.feature", parameters)
+                        else:
+                            self.assertEqual(parameters["query.resolution"], [resolution])
+                            self.assertEqual(parameters["query.feature"], [feature])
 
     def test_import_count_advances_only_after_success(self):
         payload = json.dumps({"metric": {"__name__": "probe"}, "timestamps": [1, 2], "values": [3, 4]}).encode()
@@ -119,7 +142,7 @@ class CompatibilityAssertionTests(unittest.TestCase):
         self.server.name = "new-select-old-storage"
         self.server.root = pathlib.Path(self.directory.name)
         self.server.url.return_value = "http://localhost/select/31:47/prometheus/api/v1/query"
-        self.params = {"query.field": "5m:sum"}
+        self.params = {"query.resolution": "5m", "query.feature": "sum"}
         self.log = self.server.root / "vmstorage.log"
         self.log.write_text("先前的启动日志\n")
 
@@ -137,7 +160,7 @@ class CompatibilityAssertionTests(unittest.TestCase):
             raise error
 
         self.server.request.side_effect = reject
-        result = assert_field_rejected(self.server, "/api/v1/query", self.params, "rejected")
+        result = assert_downsample_query_rejected(self.server, "/api/v1/query", self.params, "rejected")
         self.assertEqual(result["http_status"], 422)
         evidence = json.loads((self.server.root / "rejected.json").read_text())
         self.assertEqual(evidence["params"], self.params)
@@ -156,20 +179,20 @@ class CompatibilityAssertionTests(unittest.TestCase):
         self.addCleanup(error.close)
         self.server.request.side_effect = error
         with self.assertRaisesRegex(AssertionError, "本次请求未产生"):
-            assert_field_rejected(self.server, "/api/v1/query", self.params, "connection-failure")
+            assert_downsample_query_rejected(self.server, "/api/v1/query", self.params, "connection-failure")
         excerpt = self.server.root / "connection-failure-vmstorage.log"
         self.assertEqual(excerpt.read_bytes(), b"")
 
     def test_empty_success_or_unrelated_error_cannot_pass(self):
         self.server.request.return_value = json.dumps({"status": "success", "data": {"result": []}})
         with self.assertRaises(AssertionError):
-            assert_field_rejected(self.server, "/api/v1/query", self.params, "success")
+            assert_downsample_query_rejected(self.server, "/api/v1/query", self.params, "success")
         error = urllib.error.HTTPError(
             "http://localhost", 500, "", {}, io.BytesIO(b'{"status":"error","error":"unrelated"}'))
         self.addCleanup(error.close)
         self.server.request.side_effect = error
         with self.assertRaises(AssertionError):
-            assert_field_rejected(self.server, "/api/v1/query", self.params, "unrelated")
+            assert_downsample_query_rejected(self.server, "/api/v1/query", self.params, "unrelated")
 
 
 if __name__ == "__main__":

@@ -211,8 +211,8 @@ def inspect(name, series, tenants, coverage=()):
                         "--output", path, "--expected-series", series]
     for tenant in tenants:
         command += ["--expected-tenant", tenant]
-    for field in coverage:
-        command += ["--require", field]
+    for requirement in coverage:
+        command += ["--require", requirement]
     run_step("inspect-" + name, command)
     report = read_result(path)
     manifest["results"][name]["inspection"] = {key: report[key] for key in

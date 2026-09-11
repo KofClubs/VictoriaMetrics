@@ -16,7 +16,7 @@ import urllib.request
 
 sys.dont_write_bytecode = True
 
-from downsampling_compare import (FIELDS, INPUT_STEPS_MS, RESOLUTIONS, Server, binary_manifest,
+from downsampling_compare import (FEATURES, INPUT_STEPS_MS, RESOLUTIONS, Server, binary_manifest,
                                   metric_value, range_expected, request, sample_timestamps, write_json)
 
 
@@ -97,7 +97,7 @@ class MultiServer(Server):
             time.sleep(0.2)
         raise AssertionError(self.name + " 未能使每个 partition 仅保留一个 file part")
 
-    def query_many(self, stage, case, selector, start, end, resolution=None, field=None, range_query=False):
+    def query_many(self, stage, case, selector, start, end, resolution=None, feature=None, range_query=False):
         params = {"nocache": "1"}
         if range_query:
             path = "/api/v1/query_range"
@@ -106,9 +106,9 @@ class MultiServer(Server):
         else:
             path = "/api/v1/query"
             params.update({"query": selector + "[" + str(end - start + 1) + "ms]", "time": end / 1000})
-        if field is not None:
-            params["query.field"] = resolution + ":" + field
-        name = "-".join(filter(None, (stage, case, resolution, field, "range" if range_query else "matrix")))
+        if feature is not None:
+            params.update({"query.resolution": resolution, "query.feature": feature})
+        name = "-".join(filter(None, (stage, case, resolution, feature, "range" if range_query else "matrix")))
         write_json(self.root / (name + "-request.json"), {"path": path, "url": self.url(path), "params": params})
         url = self.url(path) + "?" + urllib.parse.urlencode(params)
         # 响应首先流式落盘，避免网络读取额外持有一份完整字符串。
@@ -218,12 +218,12 @@ def aggregate_map(raw, resolution):
     return result
 
 
-def filter_points(data, start, end, selected=None, field=None):
+def filter_points(data, start, end, selected=None, feature_index=None):
     result = {}
     for labels, rows in data.items():
         if selected is not None and dict(labels)["series_id"] not in selected:
             continue
-        points = [(timestamp, values if field is None else values[field])
+        points = [(timestamp, values if feature_index is None else values[feature_index])
                   for timestamp, values in rows if start <= timestamp <= end]
         if points:
             result[labels] = points
@@ -296,12 +296,12 @@ def verify_stage(stage, servers, inputs, base, active_days, root, summary):
         parts = json.loads((server.root / (stage + "-parts.json")).read_text())
         expected_rows = sum(len(points) for points in baseline.values())
         if server.downsampling:
-            expected_rows = sum(len(points) * len(FIELDS) for data in aggregate.values() for points in data.values())
+            expected_rows = sum(len(points) * len(FEATURES) for data in aggregate.values() for points in data.values())
         expected_months = physical_rows_by_month(baseline, 1)
         if server.downsampling:
             expected_months = {}
             for data in aggregate.values():
-                for month, rows in physical_rows_by_month(data, len(FIELDS)).items():
+                for month, rows in physical_rows_by_month(data, len(FEATURES)).items():
                     expected_months[month] = expected_months.get(month, 0) + rows
         got_months = {part["partition"]: part["metadata"]["RowsCount"] for part in parts}
         assert got_months == expected_months, (stage, server.name, "partition 集合及物理行数", got_months, expected_months)
@@ -331,11 +331,11 @@ def verify_stage(stage, servers, inputs, base, active_days, root, summary):
             expected = filter_points(baseline, start, finish, selected)
             summary["checks"].append(assert_maps(actual, expected, "original:" + name, servers[0].root / (name + "-expected.json")))
         for resolution in RESOLUTIONS:
-            for field_index, field in enumerate(FIELDS):
-                actual, name = servers[1].query_many(stage, case, selector, start, finish, resolution, field)
-                expected = filter_points(aggregate[resolution], start, finish, selected, field_index)
+            for feature_index, feature in enumerate(FEATURES):
+                actual, name = servers[1].query_many(stage, case, selector, start, finish, resolution, feature)
+                expected = filter_points(aggregate[resolution], start, finish, selected, feature_index)
                 summary["checks"].append(assert_maps(actual, expected, "candidate:" + name, servers[1].root / (name + "-expected.json")))
-        print(stage + ": " + case + " 的全部标签及十种分辨率/字段查询一致", flush=True)
+        print(stage + ": " + case + " 的全部标签及十种分辨率与特征组合的查询结果一致", flush=True)
         write_json(root / "summary.json", summary)
     # 裸线 query_range 使用独立的标准回看窗口参考值，在固定格子末点网格上求值。
     dense_id = all_ids[0]
@@ -346,9 +346,9 @@ def verify_stage(stage, servers, inputs, base, active_days, root, summary):
         actual, name = servers[0].query_many(stage, "bare-line", selector, start, end, resolution, range_query=True)
         expected = {dense_labels: range_expected(baseline[dense_labels], start, end, duration)}
         summary["checks"].append(assert_maps(actual, expected, "original:" + name, servers[0].root / (name + "-expected.json")))
-        for field_index, field in enumerate(FIELDS):
-            actual, name = servers[1].query_many(stage, "bare-line", selector, start, end, resolution, field, True)
-            selected_points = [(timestamp, values[field_index]) for timestamp, values in aggregate[resolution][dense_labels]]
+        for feature_index, feature in enumerate(FEATURES):
+            actual, name = servers[1].query_many(stage, "bare-line", selector, start, end, resolution, feature, True)
+            selected_points = [(timestamp, values[feature_index]) for timestamp, values in aggregate[resolution][dense_labels]]
             expected = {dense_labels: range_expected(selected_points, start, end, duration)}
             summary["checks"].append(assert_maps(actual, expected, "candidate:" + name, servers[1].root / (name + "-expected.json")))
     # 全量多线 range 查询覆盖完整历史；子集查询使用末 48h，空窗口不返回空 series。
@@ -364,17 +364,17 @@ def verify_stage(stage, servers, inputs, base, active_days, root, summary):
                     expected[metric_labels] = values
             actual, name = servers[0].query_many(stage, case, range_selector, start, end, resolution, range_query=True)
             summary["checks"].append(assert_maps(actual, expected, "original:" + name, servers[0].root / (name + "-expected.json")))
-            for field_index, field in enumerate(FIELDS):
+            for feature_index, feature in enumerate(FEATURES):
                 expected = {}
                 for metric_labels, points in aggregate[resolution].items():
                     if selected is not None and dict(metric_labels)["series_id"] not in selected:
                         continue
-                    values = range_expected([(timestamp, features[field_index]) for timestamp, features in points], start, end, duration)
+                    values = range_expected([(timestamp, features[feature_index]) for timestamp, features in points], start, end, duration)
                     if values:
                         expected[metric_labels] = values
-                actual, name = servers[1].query_many(stage, case, range_selector, start, end, resolution, field, True)
+                actual, name = servers[1].query_many(stage, case, range_selector, start, end, resolution, feature, True)
                 summary["checks"].append(assert_maps(actual, expected, "candidate:" + name, servers[1].root / (name + "-expected.json")))
-        print(stage + ": " + case + " 的全部标签及十种分辨率/字段查询一致", flush=True)
+        print(stage + ": " + case + " 的全部标签及十种分辨率与特征组合的查询结果一致", flush=True)
     summary["stages"].append({"name": stage, "days": active_days, "raw_series": len(baseline),
                               "raw_rows": sum(len(points) for points in baseline.values()),
                               "input_rows": sum(len(points) for points in inputs.values()),
