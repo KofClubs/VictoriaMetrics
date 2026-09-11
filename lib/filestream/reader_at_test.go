@@ -105,12 +105,6 @@ func TestReaderAtOffsetsAndCursor(t *testing.T) {
 	if n, err := r.ReadAt(buf, 0); n != 1 || err != nil || buf[0] != data[0] {
 		t.Fatalf("EOF prevented later reads: n=%d data=%q err=%v", n, buf, err)
 	}
-	r.MustReadAt(buf, 3)
-	if buf[0] != data[3] {
-		t.Fatal("MustReadAt did not use the requested offset")
-	}
-	r.MustClose()
-	r.MustClose()
 }
 
 func TestReaderAtConcurrentReads(t *testing.T) {

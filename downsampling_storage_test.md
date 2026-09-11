@@ -20,6 +20,14 @@ python3 -B -E -W error::ResourceWarning -m unittest discover -s lib/storage/test
 
 # 降采样及相关 I/O 的并发与静态检查
 DISABLE_FSYNC_FOR_TESTING=false go test -race ./lib/filestream ./lib/storage -run '^Test(Spill|ReaderAt|Downsample|Downsampling|UnmarshalDownsample|CheckDownsampling|MustOpenStorageDownsampling|EstimateDownsample|ReserveDownsample|Block)' -count=1 -timeout=5m
+
+# 查询文件读取、索引缓存及关闭回归；分别使用默认 mmap 配置和显式禁用 mmap 配置。
+go test ./lib/storage -run '^TestDownsampleQueryIndexAccess$' -count=1 -timeout=3m
+go test ./lib/storage -run '^TestDownsampleQueryIndexAccess$' -count=1 -timeout=3m -fs.disableMmap=true
+
+# 并发查询跨越归并发布，检查旧 part 引用、读取及删除时机。
+DISABLE_FSYNC_FOR_TESTING=false go test -race ./lib/storage -run '^TestDownsamplePartitionConcurrentQueryMerge$' -count=1 -timeout=2m
+
 go vet ./lib/filestream ./lib/storage ./lib/vmselectapi ./app/vmstorage ./app/vmselect/netstorage ./app/vmselect/promql ./app/vmselect/prometheus
 ```
 
@@ -33,7 +41,7 @@ Go 单元测试、race 和 vet 均以退出码 0 为通过条件；Python 单元
 
 ## storage 单元测试
 
-降采样生产代码分为 8 个文件；测试文件均位于 `lib/storage`，使用 `package storage`，按生产文件归类为 8 个同名 `_test.go`，另有 `downsample_supplement_test.go`。这 9 个文件共包含 102 个顶层测试和 4 个基准测试。测试使用独立的原始输入参考值或原生编码器校验结果；实际文件布局另有按固定字节偏移解析的检查。
+降采样生产代码分为 8 个文件；测试文件均位于 `lib/storage`，使用 `package storage`，按生产文件归类为 8 个同名 `_test.go`，另有 `downsample_supplement_test.go`。测试使用独立的原始输入参考值或原生编码器校验结果；实际文件布局另有按固定字节偏移解析的检查。下文按对应生产逻辑列出测试及覆盖范围。
 
 ### 样本与解码 block
 
@@ -80,25 +88,23 @@ Go 单元测试、race 和 vet 均以退出码 0 为通过条件；Python 单元
 | 测试 | 验证内容 |
 |---|---|
 | `TestDownsampleFileRoundtrip` | 多 TSID、两个分辨率、五特征及 NaN 的完整写入和读回；物理统计与格式识别。 |
-| `TestDownsampleFileConstantAndFilter` | 常量 count 列使用零负载；时间过滤保留完整相交 block，TSID 过滤和没有数据的分辨率返回正确结果。 |
+| `TestDownsampleFileConstantAndSeekTSID` | 常量 count 列使用零负载；完整扫描与 `SeekTSID` 均能读取目标 TSID 的首个 block，缺失 TSID 和没有数据的分辨率返回正确结果。 |
 | `TestDownsampleReaderRawInmemory` | 读取原始内存 part，展开五特征；普通值和 StaleNaN 各贡献一次 count。 |
 | `TestDownsampleFileAllConstantPayloads` | 单行数据的时间列和全部特征列均为零负载，空文件仍可识别格式并完整读回。 |
 | `TestDownsampleReaderReadErrors` | values 文件在打开后被截断时，读取必须返回错误。 |
 | `TestDownsampleCodecRowCountAndDecodeLimit` | 拒绝单行二阶差分编码，以及解压后超过声明行数所允许大小的列负载；检查 `checkDownsampleExtent` 对负载偏移溢出的拒绝。 |
 | `TestDownsampleReaderLargeRawBlock` | 完整读取原始链路允许的双倍行数 block，五特征展开不截断。 |
-| `TestDownsampleReaderSeekResolutionAndSharedTSID` | 直接定位分辨率范围；同一 TSID 跨相邻 index 时不遗漏，按时间过滤；缺失 TSID 二分跳过无关 index。 |
+| `TestDownsampleReaderSeekResolutionAndSharedTSID` | 按分辨率扫描及 `SeekTSID` 定位均不遗漏同一 TSID 跨相邻 index 的 block；缺失 TSID 返回正确结果。 |
 | `TestDownsampleReaderRawSeekEqualBoundaryAndReuse` | 在原始 metaindex 中定位 TSID；目标与某行首个 TSID 相等时，保留前一个 index，避免遗漏跨 index 的同 TSID 重叠 block。同一源重新初始化时复用文件句柄。 |
-| `TestDownsampleClusterTenantIndexBoundaries` | 按完整 TSID 过滤 AccountID、ProjectID 和相邻 index 的首尾项；复用 reader 时完整读取该 TSID 的两个 block，不混入其他租户。 |
-| `TestDownsampleIterationReaderReuse` | 多次切换分辨率、TSID 过滤条件及缺失 TSID 后，归并 reader 的五特征结果不遗漏或重复。 |
+| `TestDownsampleClusterTenantIndexBoundaries` | 按完整 TSID 定位 AccountID、ProjectID 和相邻 index 的首尾项；复用 reader 时完整读取该 TSID 的两个 block，不混入其他租户。 |
+| `TestDownsampleIterationReaderReuse` | 多次切换分辨率、定位 TSID 及缺失 TSID 后，归并 reader 的五特征结果不遗漏或重复。 |
 | `TestDownsampleReaderCrossIndexOffsets` | 拒绝跨 index 的非法偏移和负载范围。 |
-| `TestDownsampleReaderCrossIndexFilterAndReset` | 跨 index 过滤及二分定位正确，Close 清除上一次索引边界状态，允许跳过不相交 index。 |
-| `TestDownsampleReaderCrossIndexSkippedCorruption` | 过滤读取不补读已跳过的损坏 index；全量扫描及正常打开 part 的校验均须读取并拒绝该损坏。 |
+| `TestDownsampleReaderCrossIndexSeekAndReset` | 跨 index 的 TSID 定位和顺序读取正确，Close 清除上一次索引边界状态，重新初始化后可再次完整读取。 |
 | `TestDownsampleLayoutIndexTenantCorruption` | 打开 part 及逐 header 读取均拒绝 index 内混入其他租户。 |
 | `TestDownsampleReaderDuplicateBatchKey` | 拒绝降采样 block 的重复键，包括跨 index 边界的重复。 |
 | `TestDownsampleReaderRawDuplicateBoundaryAllowed` | 允许原始 block 具有相同时间边界，并完整读取各自的样本。 |
-| `TestDownsampleReaderCloseOwnFiles` | 通过测试 reader 注入关闭错误，验证释放 reader 及特征 reader 自行打开的全部文件并保留错误；重复 Close 不再关闭文件。 |
-| `TestDownsampleReaderCloseBorrowedFiles` | 归还特征 reader 并清除引用，但不关闭借用的降采样 part 文件。 |
-| `TestDownsampleReaderSetFilterReleasesPeers` | 切换过滤条件时归还全部特征 reader，保留父 reader 文件；关闭失败可见，后续过滤和关闭不重复归还。 |
+| `TestDownsampleReaderCloseFiles` | 通过测试 reader 注入关闭错误，验证关闭全部自有文件并保留错误；重复 Close 不再关闭文件。 |
+| `TestDownsampleReaderFilesIndependentFromQueries` | 降采样 reader 自有三个文件，重新定位 TSID 后仍能读取五特征。Close 恰好关闭各文件一次，part 的三个 `*fs.ReaderAt` 查询对象仍可读取。 |
 | `TestDownsampleReaderInitFailureReleasesPartialSource` | 新源初始化中途失败时释放已打开的文件，清除状态后可重新初始化。 |
 | `TestDownsampleReaderInitCloseFailure` | 换源时旧句柄关闭失败，保留实际错误，不继续打开新源。 |
 | `TestDownsampleReaderSharedTimestampsValuesOnly` | 首列解码后关闭独立时间戳句柄，后四列仍只解码 values 并复用同一时间戳缓冲；下一次多特征读取必须重新读时间戳；独立单列读取仍由原生 Block 完成。 |
@@ -168,6 +174,7 @@ Go 单元测试、race 和 vet 均以退出码 0 为通过条件；Python 单元
 | `TestCheckDownsamplingOpenDisabledPreservesDedup` | 未启用降采样时，启动检查不改变原有去重配置与存储文件。 |
 | `TestDownsamplePartitionInmemoryAndFailedOutput` | 内存 part 之间合并后仍保持原始格式；降采样输出失败时不替换源 part。 |
 | `TestDownsamplePartitionSmallBigMerge` | 分别生成 small 与 big 源，再合并为单个 big 目标，验证源列表变化和结果。 |
+| `TestDownsamplePartitionConcurrentQueryMerge` | 原始磁盘及降采样磁盘源各由十个查询持有旧 part 快照，贯穿归并和新 part 发布；发布后旧 BlockRef 仍能读取，最后一个查询结束才删除旧 part，新 part 的两分辨率、五特征结果正确。降采样源包含同一 TSID 跨 index 的情况。 |
 | `TestDownsamplePartitionFilePartExpired` | 启用降采样时，原始 part 与降采样 part 均按最粗分辨率区间的右端点判定过期；关闭降采样后保留原始格式的过期边界。 |
 | `TestDownsamplePartitionFileOutput` | 单个内存 part 首次落盘及多个内存 part 合并落盘，均通过正常分区入口生成单个降采样 part，结果与原始输入参考一致。 |
 | `TestDownsampleRecoveryKeepsCommittedTargetAfterPanic` | 清单提交后在旧源回收处注入 panic；已提交目标仍可独立打开，存储重新打开后数据不变。 |
@@ -185,7 +192,7 @@ Go 单元测试、race 和 vet 均以退出码 0 为通过条件；Python 单元
 | `TestDownsampleQueryBlockRef` | 两分辨率、五特征及多 TSID 筛选；同 MetricID 的不同 JobID 和租户按完整 TSID 区分，指定分组仅返回该组，缺失分组为空。另以 40 行不规则时间戳与小数值检查共享精度 64。各场景均经原生 header 序列化及 BlockRef 解码，检查未指定降采样选择及范围外查询为空。 |
 | `TestDownsampleQueryRawIsolationAndReset` | 降采样查询不读取原始 part；同一 partSearch 恢复原始查询后仍能读取原始样本。 |
 | `TestDownsampleSearchProtocolValidation` | 设置降采样选择不改变原生负载；扩展编码保留原生前缀，拒绝截断及非法分辨率或特征；原生解码清除残留选择，并保留扩展尾部供 RPC 严格拒绝。 |
-| `TestDownsampleQueryIndexAccess` | 十种分辨率与特征组合均只读取选定列的 index；读取错误、短读及错误标识必须保留原因并终止迭代，后续调用不再次读取。 |
+| `TestDownsampleQueryIndexAccess` | 十种分辨率与特征组合均只读取选定列的 index；三个查询文件使用实际 `*fs.ReaderAt`，首次读取和关闭核验 mmap 资源的建立及释放，重复查询命中原有 `ibCache`。支持默认 mmap 配置及 `fs.disableMmap=true`；损坏索引的解码错误保留原因并终止迭代，后续调用不再次读取。 |
 | `TestDownsampleQuerySearchPropagation` | 在非零租户写入并归并后，从 Search 入口验证两分辨率、五特征及共享时间戳；同一 Search 对象再次执行原始查询时，不保留上次的降采样选择。 |
 
 ### 跨模块验证与共享测试工具

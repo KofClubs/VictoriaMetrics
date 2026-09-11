@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -16,6 +15,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 )
 
 func TestDownsampleFileRoundtrip(t *testing.T) {
@@ -76,7 +76,7 @@ func TestDownsampleFileRoundtrip(t *testing.T) {
 	}
 }
 
-func TestDownsampleFileConstantAndFilter(t *testing.T) {
+func TestDownsampleFileConstantAndSeekTSID(t *testing.T) {
 	b := fileTestDownsampleBlock(1, 300000)
 	path := writeFileTestDownsamplePart(t, b)
 	p, err := openDownsamplePart(path)
@@ -89,11 +89,10 @@ func TestDownsampleFileConstantAndFilter(t *testing.T) {
 	if err := r.Init(p, 300000); err != nil {
 		t.Fatal(err)
 	}
-	r.SetFilter(&b.tsid, b.timestamps[1], b.timestamps[1])
-	if !r.NextHeader() {
-		t.Fatalf("丢失相交 block: %v", r.Error())
+	if !r.SeekTSID(b.tsid) {
+		t.Fatalf("丢失目标 TSID 的首个 block: %v", r.Error())
 	}
-	h, err := r.featureHeader(downsampleFeatureCount)
+	h, err := r.readFeatureHeader(downsampleFeatureCount)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,12 +104,11 @@ func TestDownsampleFileConstantAndFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got.timestamps) != 2 {
-		t.Fatal("reader 提前裁剪了 block")
+		t.Fatal("未完整读取目标 TSID 的首个 block")
 	}
 	other := TSID{MetricID: 2}
-	r.SetFilter(&other, minUnixMilli, maxUnixMilli)
-	if r.NextHeader() || r.Error() != nil {
-		t.Fatal("错误 TSID 过滤")
+	if r.SeekTSID(other) || r.Error() != nil {
+		t.Fatal("定位不存在的 TSID 返回了数据")
 	}
 	if err := r.Init(p, 3600000); err != nil {
 		t.Fatal(err)
@@ -303,19 +301,12 @@ func TestDownsampleReaderSeekResolutionAndSharedTSID(t *testing.T) {
 		if err := r.Init(p, res); err != nil {
 			t.Fatal(err)
 		}
-		if r.metaPos != resIdx*15 || r.metaEnd != resIdx*15+3 {
-			t.Fatalf("未直接定位分辨率范围: %d..%d", r.metaPos, r.metaEnd)
+		if r.featureIndexes[downsampleFeatureLast].metaPos != resIdx*15 || r.featureIndexes[downsampleFeatureLast].metaEnd != resIdx*15+3 {
+			t.Fatalf("未直接定位分辨率范围: %d..%d", r.featureIndexes[downsampleFeatureLast].metaPos, r.featureIndexes[downsampleFeatureLast].metaEnd)
 		}
 		tsid := TSID{MetricID: 10}
-		r.SetFilter(&tsid, minUnixMilli, maxUnixMilli)
-		if r.metaPos != resIdx*15 {
-			t.Fatal("遗漏含目标 TSID 的首个 index")
-		}
 		count := 0
-		for r.NextHeader() {
-			if r.Header().TSID != tsid {
-				t.Fatal("返回其他 TSID")
-			}
+		for ok := r.SeekTSID(tsid); ok && r.Header().TSID == tsid; ok = r.NextHeader() {
 			count++
 		}
 		if err := r.Error(); err != nil {
@@ -324,25 +315,10 @@ func TestDownsampleReaderSeekResolutionAndSharedTSID(t *testing.T) {
 		if count != 3 {
 			t.Fatalf("跨 index 的相同 TSID 丢失: %d", count)
 		}
-		r.SetFilter(&tsid, minUnixMilli+3*res, minUnixMilli+3*res+10)
-		count = 0
-		for r.NextHeader() {
-			count++
-		}
-		if count != 1 || r.Error() != nil {
-			t.Fatalf("重叠 metaindex 时间范围过滤失败: %d %v", count, r.Error())
-		}
 		for _, missing := range []uint64{0, 15, 40} {
 			tsid.MetricID = missing
-			r.SetFilter(&tsid, minUnixMilli, maxUnixMilli)
-			if missing == 15 && r.metaPos != resIdx*15+2 {
-				t.Fatal("未二分跳过较小 LastTSID")
-			}
-			if r.NextHeader() || r.Error() != nil {
-				t.Fatalf("稀疏 TSID 过滤失败: %d %v", missing, r.Error())
-			}
-			if len(r.indexData) != 0 {
-				t.Fatal("不存在的 TSID 不应解码候选范围外的 index")
+			if r.SeekTSID(tsid) || r.Error() != nil {
+				t.Fatalf("不存在的 TSID 定位失败: %d %v", missing, r.Error())
 			}
 		}
 	}
@@ -377,16 +353,12 @@ func TestDownsampleReaderRawSeekEqualBoundaryAndReuse(t *testing.T) {
 	}
 	timestampsReader, valuesReader, indexReader := r.timestampsReader, r.valuesReader, r.indexReader
 	tsid := TSID{MetricID: 10}
-	r.SetFilter(&tsid, minUnixMilli+50, minUnixMilli+55)
-	if r.metaPos != 0 {
-		t.Fatal("原始相等边界没有保留前一个 index")
-	}
 	count := 0
-	for r.NextHeader() {
+	for ok := r.SeekTSID(tsid); ok && r.Header().TSID == tsid; ok = r.NextHeader() {
 		count++
 	}
 	if count != 3 || r.Error() != nil {
-		t.Fatalf("原始跨 index 重叠 block 丢失: %d %v", count, r.Error())
+		t.Fatalf("原始相等边界前一 index 中的 block 丢失: %d %v", count, r.Error())
 	}
 	if err := r.Init(p, 3600000); err != nil {
 		t.Fatal(err)
@@ -395,12 +367,14 @@ func TestDownsampleReaderRawSeekEqualBoundaryAndReuse(t *testing.T) {
 		t.Fatal("同一原始源重复 Init 重开了文件")
 	}
 	tsid.MetricID = 20
-	r.SetFilter(&tsid, minUnixMilli, maxUnixMilli)
-	if r.metaPos != 1 {
-		t.Fatalf("原始 lower-bound-1 位置错误: %d", r.metaPos)
+	if !r.SeekTSID(tsid) || r.Header().TSID != tsid || r.Error() != nil {
+		t.Fatalf("原始 TSID 二分后未定位首个 block: %v", r.Error())
 	}
-	if !r.NextHeader() || r.Header().TSID != tsid || r.NextHeader() || r.Error() != nil {
-		t.Fatal("原始 TSID 二分后读取失败")
+	if r.NextHeader() && r.Header().TSID == tsid {
+		t.Fatal("原始 TSID 二分后返回了重复 block")
+	}
+	if err := r.Error(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -408,7 +382,6 @@ func TestDownsampleIterationReaderReuse(t *testing.T) {
 	p := newDownsampleIterationPart(t)
 	r := getDownsampleReader()
 	defer putDownsampleReader(r)
-	full := TimeRange{MinTimestamp: minUnixMilli, MaxTimestamp: maxUnixMilli}
 	// 先后选择 index 边界、缺失序列、末尾和开头，防止游标沿用前一次的位置。
 	for pass, resolution := range []int64{300000, 3600000, 300000} {
 		if err := r.Init(p, resolution); err != nil {
@@ -426,21 +399,14 @@ func TestDownsampleIterationReaderReuse(t *testing.T) {
 			missingBeforeFirst.MetricID -= 5
 			filters := []TSID{wide, missingAfterWide, last, missingAfterLast, missingBeforeFirst, first, downsampleIterationTSID(132), downsampleIterationTSID(9), downsampleIterationTSID(10), downsampleIterationTSID(19), downsampleIterationTSID(20), downsampleIterationTSID(59), downsampleIterationTSID(60)}
 			for _, filter := range filters {
-				t.Run(fmt.Sprintf("筛选复用/%d/%d/%d", pass, feature, filter.MetricID), func(t *testing.T) {
-					checkDownsampleIterationReader(t, r, p, resolution, feature, &filter, full)
+				t.Run(fmt.Sprintf("定位复用/%d/%d/%d", pass, feature, filter.MetricID), func(t *testing.T) {
+					checkDownsampleIterationReader(t, r, p, resolution, feature, &filter)
 				})
 			}
-			t.Run(fmt.Sprintf("移除筛选/%d/%d", pass, feature), func(t *testing.T) {
-				checkDownsampleIterationReader(t, r, p, resolution, feature, nil, full)
+			t.Run(fmt.Sprintf("整列扫描/%d/%d", pass, feature), func(t *testing.T) {
+				checkDownsampleIterationReader(t, r, p, resolution, feature, nil)
 			})
 		}
-		// 错误状态必须能由后续 SetFilter 和同一 part 的 Init 清除。
-		r.SetFilter(nil, 2, 1)
-		if r.Error() == nil || r.NextHeader() {
-			t.Fatal("无效时间范围未进入错误状态")
-		}
-		first := downsampleIterationTSID(0)
-		checkDownsampleIterationReader(t, r, p, resolution, 2, &first, full)
 		if err := r.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -451,7 +417,7 @@ func TestDownsampleIterationReaderReuse(t *testing.T) {
 			t.Fatal(err)
 		}
 		last := downsampleIterationTSID(downsampleIterationSeries - 1)
-		checkDownsampleIterationReader(t, r, p, resolution, 4, &last, full)
+		checkDownsampleIterationReader(t, r, p, resolution, 4, &last)
 	}
 }
 
@@ -505,7 +471,7 @@ func TestDownsampleReaderCrossIndexOffsets(t *testing.T) {
 	}
 }
 
-func TestDownsampleReaderCrossIndexFilterAndReset(t *testing.T) {
+func TestDownsampleReaderCrossIndexSeekAndReset(t *testing.T) {
 	path := writeDownsampleCrossIndexPart(t)
 	p, err := openDownsamplePart(path)
 	if err != nil {
@@ -520,59 +486,30 @@ func TestDownsampleReaderCrossIndexFilterAndReset(t *testing.T) {
 		}
 		checkDownsampleCrossIndexStateCleared(t, r)
 		checkDownsampleCrossIndexRows(t, r, []uint64{1, 2, 3, 4})
-		if !r.hasPreviousIndex {
+		if !r.featureIndexes[downsampleFeatureLast].hasPreviousIndex {
 			t.Fatal("扫描后没有保存 index 边界")
 		}
-		// 第二个 index 的时间范围在窗口外；第三、第四个仍应正常读取。
-		r.SetFilter(nil, minUnixMilli, minUnixMilli+4*resolution)
-		checkDownsampleCrossIndexStateCleared(t, r)
-		checkDownsampleCrossIndexRows(t, r, []uint64{1, 3, 4})
+		// 定位当前 TSID 必须清除上一轮的跨 index 校验状态。
+		tsid := TSID{MetricID: 3}
+		if !r.SeekTSID(tsid) || r.Header().TSID != tsid || r.Error() != nil {
+			t.Fatalf("未定位当前 TSID 的首个 block: %v", r.Error())
+		}
+		if r.NextHeader() && r.Header().TSID == tsid {
+			t.Fatal("定位后重复返回当前 TSID 的 block")
+		}
+		if err := r.Error(); err != nil {
+			t.Fatal(err)
+		}
 		if err := r.Init(p, resolution); err != nil {
 			t.Fatal(err)
 		}
 		checkDownsampleCrossIndexStateCleared(t, r)
-		tsid := TSID{MetricID: 3}
-		r.SetFilter(&tsid, minUnixMilli, maxUnixMilli)
-		checkDownsampleCrossIndexStateCleared(t, r)
-		wantMetaPos := 2
-		if resolution == 3600000 {
-			wantMetaPos += 4 * countOfDownsampleFeatures
-		}
-		if r.metaPos != wantMetaPos {
-			t.Fatalf("二分定位未跳过先前 index: got=%d, want=%d", r.metaPos, wantMetaPos)
-		}
-		checkDownsampleCrossIndexRows(t, r, []uint64{3})
+		checkDownsampleCrossIndexRows(t, r, []uint64{1, 2, 3, 4})
 	}
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
 	checkDownsampleCrossIndexStateCleared(t, r)
-}
-
-func TestDownsampleReaderCrossIndexSkippedCorruption(t *testing.T) {
-	path := writeDownsampleCrossIndexPart(t)
-	// feature 已上移到 metaindex；在不相交的原生 header 中制造非法精度。
-	// 窗口读取不应补读跳过的 index，全量扫描则必须拒绝它。
-	rewriteDownsampleCrossIndexFile(t, path, 1, func(data []byte) {
-		data[88] = 0
-	})
-	assertDownsampleLayoutOpenRejected(t, path, "precisionBits")
-	p := openDownsampleLayoutReaderFixture(t, path)
-	r := getDownsampleReader()
-	defer putDownsampleReader(r)
-	if err := r.Init(p, 300000); err != nil {
-		t.Fatal(err)
-	}
-	r.SetFilter(nil, minUnixMilli, minUnixMilli+4*300000)
-	checkDownsampleCrossIndexRows(t, r, []uint64{1, 3, 4})
-	r.SetFilter(nil, minUnixMilli, maxUnixMilli)
-	count := 0
-	for r.NextHeader() {
-		count++
-	}
-	if count != 1 || r.Error() == nil {
-		t.Fatalf("全量扫描未读取并拒绝损坏的 index: count=%d, err=%v", count, r.Error())
-	}
 }
 
 func TestDownsampleLayoutIndexTenantCorruption(t *testing.T) {
@@ -743,12 +680,10 @@ func TestDownsampleReaderRawDuplicateBoundaryAllowed(t *testing.T) {
 	}
 }
 
-func TestDownsampleReaderCloseOwnFiles(t *testing.T) {
+func TestDownsampleReaderCloseFiles(t *testing.T) {
 	r := newDownsampleCloseTestReader(t)
-	peer := newDownsampleCloseTestReader(t)
-	r.peers[downsampleFeatureSum] = peer
-	files := []filestream.ReadAtCloser{r.timestampsReader, r.valuesReader, r.indexReader, peer.timestampsReader, peer.valuesReader, peer.indexReader}
-	failedFiles := []filestream.ReadAtCloser{r.timestampsReader, peer.indexReader}
+	files := []filestream.ReadAtCloser{r.timestampsReader, r.valuesReader, r.indexReader}
+	failedFiles := []filestream.ReadAtCloser{r.timestampsReader, r.indexReader}
 	for _, f := range failedFiles {
 		f.(*downsampleCloseTestFile).closeErr = os.ErrClosed
 	}
@@ -762,21 +697,16 @@ func TestDownsampleReaderCloseOwnFiles(t *testing.T) {
 		}
 	}
 	assertDownsampleFilesClosed(t, files)
-	if r.p != nil || r.ownFiles || r.timestampsReader != nil || r.valuesReader != nil || r.indexReader != nil {
-		t.Fatal("Close retained part or file ownership")
-	}
-	for _, peer := range r.peers {
-		if peer != nil {
-			t.Fatal("Close retained a returned peer")
-		}
+	if r.p != nil || r.timestampsReader != nil || r.valuesReader != nil || r.indexReader != nil {
+		t.Fatal("Close retained part or file handles")
 	}
 	if err := r.Close(); err != nil {
-		t.Fatalf("Close attempted the same files or peers again: %v", err)
+		t.Fatalf("Close attempted the same files again: %v", err)
 	}
 	assertDownsampleFilesClosed(t, files)
 }
 
-func TestDownsampleReaderCloseBorrowedFiles(t *testing.T) {
+func TestDownsampleReaderFilesIndependentFromQueries(t *testing.T) {
 	path := writeFileTestDownsamplePart(t, fileTestDownsampleBlock(1, downsampleResolution5m))
 	p, err := openDownsamplePart(path)
 	if err != nil {
@@ -784,75 +714,53 @@ func TestDownsampleReaderCloseBorrowedFiles(t *testing.T) {
 	}
 	defer p.MustClose()
 	var r downsampleReader
+	defer r.Close()
 	if err := r.Init(p, downsampleResolution5m); err != nil {
 		t.Fatal(err)
+	}
+	var files []filestream.ReadAtCloser
+	for _, reader := range []*filestream.ReadAtCloser{&r.timestampsReader, &r.valuesReader, &r.indexReader} {
+		*reader = &downsampleCloseTestFile{ReadAtCloser: *reader}
+		files = append(files, *reader)
 	}
 	if !r.NextHeader() {
 		t.Fatalf("missing header: %v", r.Error())
 	}
-	if _, err := r.featureHeader(downsampleFeatureSum); err != nil {
+	if _, err := r.readFeatureHeader(downsampleFeatureSum); err != nil {
 		t.Fatal(err)
 	}
-	if r.peers[downsampleFeatureSum] == nil {
-		t.Fatal("test did not create a feature reader")
+	// 切换当前 TSID 只重置索引状态，复用本次 merge 自己打开的文件。
+	if !r.SeekTSID(r.Header().TSID) {
+		t.Fatalf("cannot seek current TSID: %v", r.Error())
+	}
+	for _, f := range files {
+		if f.(*downsampleCloseTestFile).closes != 0 {
+			t.Fatalf("TSID seek closed merge file %q", f.Path())
+		}
+	}
+	var decoded downsampleDecodedResolutionFeaturesBlock
+	if err := r.ReadBlock(&decoded); err != nil {
+		t.Fatal(err)
 	}
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []filestream.ReadAtCloser{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
-		wantN, wantErr := 1, error(nil)
-		if f.Size() == 0 {
-			wantN, wantErr = 0, io.EOF
+	assertDownsampleFilesClosed(t, files)
+	for _, f := range []fs.MustReadAtCloser{p.timestampsFile, p.valuesFile, p.indexFile} {
+		if _, ok := f.(*fs.ReaderAt); !ok {
+			t.Fatalf("query file %q has reader type %T; want *fs.ReaderAt", f.Path(), f)
 		}
-		if n, err := f.ReadAt(make([]byte, 1), 0); n != wantN || !errors.Is(err, wantErr) {
-			t.Fatalf("reader closed borrowed file %q: n=%d, err=%v", f.Path(), n, err)
+		want, err := os.ReadFile(f.Path())
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len(want))
+		f.MustReadAt(got, 0)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("merge reader cleanup affected query file %q", f.Path())
 		}
 	}
-	for _, peer := range r.peers {
-		if peer != nil {
-			t.Fatal("Close retained a feature reader")
-		}
-	}
-}
 
-// A filter change returns feature readers without closing the parent's source.
-// A failed peer close remains observable until the next filter is installed.
-func TestDownsampleReaderSetFilterReleasesPeers(t *testing.T) {
-	r := newDownsampleCloseTestReader(t)
-	defer r.Close()
-	parentFiles := []filestream.ReadAtCloser{r.timestampsReader, r.valuesReader, r.indexReader}
-	var peerFiles []filestream.ReadAtCloser
-	for feature := uint8(1); feature < countOfDownsampleFeatures; feature++ {
-		peer := newDownsampleCloseTestReader(t)
-		r.peers[feature] = peer
-		peerFiles = append(peerFiles, peer.timestampsReader, peer.valuesReader, peer.indexReader)
-	}
-	peerFiles[0].(*downsampleCloseTestFile).closeErr = os.ErrClosed
-	tsid := TSID{MetricID: 7}
-	r.SetFilter(&tsid, minUnixMilli, maxUnixMilli)
-	if !errors.Is(r.Error(), os.ErrClosed) || r.NextHeader() {
-		t.Fatalf("filter change hid peer cleanup failure: %v", r.Error())
-	}
-	assertDownsampleFilesClosed(t, peerFiles)
-	for _, peer := range r.peers {
-		if peer != nil {
-			t.Fatal("filter change retained a returned peer")
-		}
-	}
-	for _, f := range parentFiles {
-		if n, err := f.ReadAt(make([]byte, 1), 0); err != nil || n != 1 {
-			t.Fatalf("filter change closed parent file %q: n=%d, err=%v", f.Path(), n, err)
-		}
-	}
-	r.SetFilter(nil, minUnixMilli, maxUnixMilli)
-	if r.Error() != nil || r.hasFilter || r.filterTSID != (TSID{}) {
-		t.Fatalf("the next filter retried peer cleanup or retained stale state: %v", r.Error())
-	}
-	if err := r.Close(); err != nil {
-		t.Fatalf("Close tried to close already returned peers: %v", err)
-	}
-	assertDownsampleFilesClosed(t, parentFiles)
-	assertDownsampleFilesClosed(t, peerFiles)
 }
 
 func TestDownsampleReaderInitFailureReleasesPartialSource(t *testing.T) {
@@ -868,7 +776,7 @@ func TestDownsampleReaderInitFailureReleasesPartialSource(t *testing.T) {
 	if !errors.Is(err, os.ErrNotExist) || !strings.HasPrefix(err.Error(), "[downsampling] cannot open reader file ") {
 		t.Fatalf("Init lost the missing values file error: %v", err)
 	}
-	if r.p != nil || r.ownFiles || r.timestampsReader != nil || r.valuesReader != nil || r.indexReader != nil {
+	if r.p != nil || r.timestampsReader != nil || r.valuesReader != nil || r.indexReader != nil {
 		t.Fatal("failed Init retained partial source ownership")
 	}
 	// The same reader can initialize a complete source after the failed attempt.
@@ -885,7 +793,7 @@ func TestDownsampleReaderInitFailureReleasesPartialSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertDownsampleFilesClosed(t, files)
-	if r.feature != 0 || r.resolution != 0 {
+	if r.resolution != 0 {
 		t.Fatal("Close retained source selection state")
 	}
 }
@@ -942,7 +850,7 @@ func TestDownsampleReaderSharedTimestampsValuesOnly(t *testing.T) {
 			var columns [countOfDownsampleFeatures]blockHeader
 			var expected [countOfDownsampleFeatures]Block
 			for feature := range columns {
-				columns[feature], err = r.featureHeader(uint8(feature))
+				columns[feature], err = r.readFeatureHeader(uint8(feature))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -950,13 +858,8 @@ func TestDownsampleReaderSharedTimestampsValuesOnly(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			// 使用独立句柄，关闭后不影响 part 的引用生命周期和其它 reader。
-			f, err := filestream.OpenReadAt(filepath.Join(path, timestampsFilename))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer f.Close()
-			r.timestampsReader = f
+			// 主 reader 自有句柄，关闭后不影响 part 查询和其它 reader。
+			f := r.timestampsReader
 			var got Block
 			if err := readDownsampleFeatureBlockForTest(&r, &got, downsampleFeatureLast); err != nil {
 				t.Fatal(err)
@@ -1082,7 +985,7 @@ func TestDownsampleReaderSharedTimestampsValidation(t *testing.T) {
 		t.Fatalf("cannot position reader: %v / %v", err, r.Error())
 	}
 	shared := *r.Header()
-	column, err := r.featureHeader(downsampleFeatureSum)
+	column, err := r.readFeatureHeader(downsampleFeatureSum)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1115,12 +1018,12 @@ func TestDownsampleReaderSharedTimestampsValidation(t *testing.T) {
 			h := column
 			mutate(&h)
 			assertInvalidValues(t, &h)
-			// featureHeader validates cached peer headers before merge values decoding.
-			peer := r.peers[downsampleFeatureSum]
-			peer.current = h
-			defer func() { peer.current = column }()
-			if _, err := r.featureHeader(downsampleFeatureSum); err == nil {
-				t.Fatal("featureHeader accepted a peer with different shared timestamps")
+			// readFeatureHeader validates the current feature cursor before decoding values.
+			cursor := &r.featureIndexes[downsampleFeatureSum]
+			cursor.current = h
+			defer func() { cursor.current = column }()
+			if _, err := r.readFeatureHeader(downsampleFeatureSum); err == nil {
+				t.Fatal("readFeatureHeader accepted a cursor with different shared timestamps")
 			}
 		})
 	}
@@ -1146,7 +1049,7 @@ func TestDownsampleReaderSharedTimestampsValidation(t *testing.T) {
 		})
 	}
 	// 完整多特征读取仍检查每一列的共享描述，而不是只检查第一列。
-	r.peers[downsampleFeatureSum].current.TimestampsBlockOffset++
+	r.featureIndexes[downsampleFeatureSum].current.TimestampsBlockOffset++
 	var got downsampleDecodedResolutionFeaturesBlock
 	if err := r.ReadBlock(&got); err == nil {
 		t.Fatal("ReadBlock accepted a later feature with different shared timestamps")
@@ -1171,14 +1074,13 @@ func TestDownsampleClusterTenantIndexBoundaries(t *testing.T) {
 		if err := r.Init(p, resolution); err != nil {
 			t.Fatal(err)
 		}
-		// 覆盖 account、project 的首末边界和相邻 index 首末项，后续查询复用同一个 reader。
+		// 覆盖 account、project 的首末边界和相邻 index 首末项，逐个 TSID 复用 merge reader。
 		for _, offset := range []int{0, 64, 66, 130, 132, 196, 198, 262, 264, 328} {
 			first := batches[resolutionIndex*330+offset]
-			r.SetFilter(&first.tsid, minUnixMilli, maxUnixMilli)
 			count := 0
-			for r.NextHeader() {
+			for ok := r.SeekTSID(first.tsid); ok && r.Header().TSID == first.tsid; ok = r.NextHeader() {
 				if count >= 2 {
-					t.Fatal("租户边界筛选返回其他序列的 Block")
+					t.Fatal("租户边界定位返回其他序列的 Block")
 				}
 				want := batches[resolutionIndex*330+offset+count]
 				if err := r.ReadBlock(&got); err != nil {

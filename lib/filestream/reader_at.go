@@ -7,20 +7,16 @@ import (
 	"math"
 	"os"
 	"time"
-
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
 // ReadAtCloser provides error-returning access to a regular file without a
-// sequential cursor. The Must methods support existing query and part owners;
-// operations that return failures to their caller use ReadAt and Close.
+// sequential cursor. It is used by downsampling merges and part validation;
+// queries use fs.ReaderAt and its mmap support.
 type ReadAtCloser interface {
 	Path() string
 	Size() uint64
 	ReadAt(p []byte, off int64) (int, error)
 	Close() error
-	MustReadAt(p []byte, off int64)
-	MustClose()
 }
 
 // ReaderAt reads directly into the caller's buffer at the requested offset.
@@ -107,23 +103,6 @@ func (r *ReaderAt) Close() error {
 	}
 	readersCount.Dec()
 	return r.closeErr
-}
-
-// MustReadAt reads all of p or panics, for existing query owners that require
-// the MustReadAtCloser contract. Recoverable merges use ReadAt instead.
-func (r *ReaderAt) MustReadAt(p []byte, off int64) {
-	n, err := r.ReadAt(p, off)
-	if err != nil && !(n == len(p) && err == io.EOF) {
-		logger.Panicf("[downsampling] cannot read input file %q at offset %d: %s", r.path, off, err)
-	}
-}
-
-// MustClose implements the existing query and part ownership contract.
-// Recoverable merges use Close instead.
-func (r *ReaderAt) MustClose() {
-	if err := r.Close(); err != nil {
-		logger.Panicf("[downsampling] cannot close input reader %q: %s", r.path, err)
-	}
 }
 
 func newReaderAt(path string, f readerAtFile) (_ *ReaderAt, err error) {

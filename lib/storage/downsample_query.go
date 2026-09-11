@@ -134,16 +134,12 @@ func (ps *partSearch) readDownsampleIndexBlock(mr *downsampleMetaindexRow) (*ind
 	} else {
 		ps.compressedIndexBuf = ps.compressedIndexBuf[:mr.IndexBlockSize]
 	}
-	n, err := ps.p.dsIndexFile.ReadAt(ps.compressedIndexBuf, int64(mr.IndexBlockOffset))
-	if err != nil {
-		return nil, err
-	}
-	if n != len(ps.compressedIndexBuf) {
-		return nil, io.ErrUnexpectedEOF
-	}
+	// 与 raw 查询共用 part 的 fs.ReaderAt，保留 mmap、页状态判断及读取统计。
+	ps.p.indexFile.MustReadAt(ps.compressedIndexBuf, int64(mr.IndexBlockOffset))
 	if len(ps.compressedIndexBuf) < len(downsampleIndexMagic) || string(ps.compressedIndexBuf[:len(downsampleIndexMagic)]) != downsampleIndexMagic {
 		return nil, fmt.Errorf("[downsampling] invalid index magic")
 	}
+	var err error
 	ps.indexBuf, err = encoding.DecompressZSTDLimited(ps.indexBuf[:0], ps.compressedIndexBuf[len(downsampleIndexMagic):], maxBlockSize)
 	if err != nil {
 		return nil, fmt.Errorf("[downsampling] cannot decompress index block: %w", err)

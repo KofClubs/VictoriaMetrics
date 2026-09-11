@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -922,6 +923,291 @@ func TestDownsampleRecoveryDiscardsUnpublishedPart(t *testing.T) {
 		t.Fatalf("orphan recovery changed the active manifest: before=%s; after=%s; error=%v", before, after, err)
 	}
 	assertDownsampleTestStorageRows(t, reopened, referenceDownsampleTestRows(rows, nil, 0))
+}
+
+func TestDownsamplePartitionConcurrentQueryMerge(t *testing.T) {
+	for _, downsampled := range []bool{false, true} {
+		name := "raw-file"
+		if downsampled {
+			name = "downsample-file"
+		}
+		t.Run(name, func(t *testing.T) {
+			pt, _ := newDownsampleFailurePartition(t)
+			base := pt.tr.MinTimestamp
+			var tsids []TSID
+			var rows []rawRow
+			for series := 0; series < 3; series++ {
+				tsid := TSID{AccountID: 11, ProjectID: 17, MetricID: uint64(series + 1)}
+				tsids = append(tsids, tsid)
+				for row := 0; row < 12; row++ {
+					rows = append(rows, rawRow{TSID: tsid, Timestamp: base + int64(row)*30*60*1000 + 1234,
+						Value: float64(series*100 + row + 1), PrecisionBits: 64})
+				}
+			}
+			wantDownsampled := referenceDownsampleTestRows(rows, nil, 0)
+			sourcePath := pt.getDstPartPath(partSmall, pt.nextMergeIdx())
+			if downsampled {
+				w := getDownsampleWriter()
+				func() {
+					defer putDownsampleWriter(w)
+					if err := w.Init(sourcePath, 1); err != nil {
+						t.Fatal(err)
+					}
+					// 每个 index 最多两个 header；同一 TSID 必须跨 index 继续读取。
+					w.indexLimit = 2 * marshaledBlockHeaderSize
+					for _, resolution := range downsampleResolutions {
+						for _, tsid := range tsids {
+							for timestamp := base; timestamp < base+6*60*60*1000; timestamp += resolution {
+								sample, ok := wantDownsampled[downsampleTestKey{tsid, resolution, timestamp / resolution}]
+								if !ok {
+									continue
+								}
+								if err := w.WriteSamples(&tsid, resolution, []downsampleSample{sample}, nil); err != nil {
+									t.Fatal(err)
+								}
+							}
+						}
+					}
+					if _, err := w.Finish(); err != nil {
+						t.Fatal(err)
+					}
+				}()
+			} else {
+				mp := getInmemoryPart()
+				mp.InitFromRows(append([]rawRow(nil), rows...))
+				mp.MustStoreToDisk(sourcePath)
+				putInmemoryPart(mp)
+			}
+			source := &partWrapper{p: mustOpenFilePart(sourcePath), isInMerge: true}
+			source.incRef()
+			pt.smallParts = append(pt.smallParts, source)
+			mustWritePartNames(pt.smallParts, pt.bigParts, pt.smallPartsPath)
+			for _, file := range []vmfs.MustReadAtCloser{source.p.timestampsFile, source.p.valuesFile, source.p.indexFile} {
+				if _, ok := file.(*vmfs.ReaderAt); !ok {
+					t.Fatalf("query file %q must use the shared mmap-capable reader; got %T", file.Path(), file)
+				}
+			}
+
+			type sampleKey struct {
+				tsid      TSID
+				timestamp int64
+			}
+			wantSamples := func(query *DownsampleQuery) map[sampleKey]float64 {
+				want := make(map[sampleKey]float64)
+				if query == nil {
+					for _, row := range rows {
+						want[sampleKey{row.TSID, row.Timestamp}] = row.Value
+					}
+				} else {
+					for key, sample := range wantDownsampled {
+						if key.resolution == query.ResolutionMs {
+							want[sampleKey{key.tsid, sample.timestamp}] = sample.values[query.Feature]
+						}
+					}
+				}
+				return want
+			}
+			tr := TimeRange{MinTimestamp: base, MaxTimestamp: base + 6*60*60*1000}
+			checkBlocks := func(refs []BlockRef, want map[sampleKey]float64) error {
+				got := make(map[sampleKey]float64)
+				var b Block
+				for _, ref := range refs {
+					ref.MustReadBlock(&b)
+					if err := b.UnmarshalData(); err != nil {
+						return err
+					}
+					timestamps, values := b.AppendRowsWithTimeRangeFilter(nil, nil, tr)
+					for i, timestamp := range timestamps {
+						key := sampleKey{ref.bh.TSID, timestamp}
+						if _, exists := got[key]; exists {
+							return fmt.Errorf("duplicate query sample %+v", key)
+						}
+						got[key] = values[i]
+					}
+				}
+				if !reflect.DeepEqual(got, want) {
+					return fmt.Errorf("unexpected query samples: got %v; want %v", got, want)
+				}
+				return nil
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			start := make(chan struct{})
+			beforeOpen := make(chan struct{})
+			allowPublication := make(chan struct{})
+			published := make(chan struct{})
+			releaseQueries := make(chan struct{})
+			wait := func(ch <-chan struct{}) error {
+				select {
+				case <-ch:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			pt.downsampleTestHook = func(stage, _ string) error {
+				if stage == "before-open" {
+					close(beforeOpen)
+					return wait(allowPublication)
+				}
+				return nil
+			}
+			type queryEvent struct {
+				stage string
+				err   error
+			}
+			queriesCount := len(downsampleResolutions) * countOfDownsampleFeatures
+			events := make(chan queryEvent, queriesCount*4)
+			mergeDone := make(chan error, 1)
+			var wg sync.WaitGroup
+			wg.Add(queriesCount + 1)
+			for _, resolution := range downsampleResolutions {
+				for feature := uint8(0); feature < countOfDownsampleFeatures; feature++ {
+					go func() {
+						defer wg.Done()
+						err := func() (err error) {
+							defer func() {
+								if p := recover(); p != nil {
+									err = fmt.Errorf("query panicked: %v", p)
+								}
+							}()
+							var query *DownsampleQuery
+							if downsampled {
+								query = &DownsampleQuery{ResolutionMs: resolution, Feature: feature}
+							}
+							var search partitionSearch
+							search.Init(pt, append([]TSID(nil), tsids...), tr, query)
+							defer search.MustClose()
+							if err := search.Error(); err != nil {
+								return err
+							}
+							events <- queryEvent{stage: "ready"}
+							if err := wait(start); err != nil {
+								return err
+							}
+							var refs []BlockRef
+							for search.NextBlock() {
+								refs = append(refs, *search.BlockRef)
+							}
+							if err := search.Error(); err != nil {
+								return err
+							}
+							want := wantSamples(query)
+							if err := checkBlocks(refs, want); err != nil {
+								return err
+							}
+							events <- queryEvent{stage: "read"}
+							if err := wait(published); err != nil {
+								return err
+							}
+							// 新 part 已发布；旧查询仍必须能读取原来的文件和 block。
+							if err := checkBlocks(refs, want); err != nil {
+								return err
+							}
+							events <- queryEvent{stage: "reread"}
+							return wait(releaseQueries)
+						}()
+						events <- queryEvent{stage: "closed", err: err}
+					}()
+				}
+			}
+			go func() {
+				defer wg.Done()
+				if err := wait(start); err != nil {
+					mergeDone <- err
+					return
+				}
+				mergeDone <- pt.mergeParts([]*partWrapper{source}, ctx.Done(), true, false)
+			}()
+			allDone := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(allDone)
+			}()
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case <-allDone:
+				case <-time.After(5 * time.Second):
+					t.Error("query or merge goroutines did not exit after cancellation")
+				}
+			})
+			waitQueries := func(stage string) {
+				t.Helper()
+				for i := 0; i < queriesCount; i++ {
+					select {
+					case event := <-events:
+						if event.stage != stage || event.err != nil {
+							t.Fatalf("query stage %q: got %+v", stage, event)
+						}
+					case <-ctx.Done():
+						t.Fatalf("query stage %q timed out: %v", stage, ctx.Err())
+					}
+				}
+			}
+			waitQueries("ready")
+			close(start)
+			waitQueries("read")
+			select {
+			case <-beforeOpen:
+			case err := <-mergeDone:
+				t.Fatalf("merge stopped before publication barrier: %v", err)
+			case <-ctx.Done():
+				t.Fatal("merge did not reach publication barrier")
+			}
+			if got := source.refCount.Load(); got != int32(queriesCount+1) {
+				t.Fatalf("unexpected source references before publication: %d", got)
+			}
+			close(allowPublication)
+			select {
+			case err := <-mergeDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal("merge did not finish publication")
+			}
+			if !source.mustDrop.Load() || source.refCount.Load() != int32(queriesCount) || source.p == nil {
+				t.Fatal("publication closed the source held by existing queries")
+			}
+			if _, err := os.Stat(sourcePath); err != nil {
+				t.Fatalf("publication removed the source held by existing queries: %v", err)
+			}
+			close(published)
+			waitQueries("reread")
+			close(releaseQueries)
+			waitQueries("closed")
+			if source.refCount.Load() != 0 || source.p != nil {
+				t.Fatal("the final query did not close the retired source")
+			}
+			if _, err := os.Stat(sourcePath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the retired source was not removed after the final query: %v", err)
+			}
+			for _, resolution := range downsampleResolutions {
+				for feature := uint8(0); feature < countOfDownsampleFeatures; feature++ {
+					query := &DownsampleQuery{ResolutionMs: resolution, Feature: feature}
+					func() {
+						var search partitionSearch
+						search.Init(pt, append([]TSID(nil), tsids...), tr, query)
+						defer search.MustClose()
+						var refs []BlockRef
+						for search.NextBlock() {
+							if search.BlockRef.p.dsMetadata == nil || search.BlockRef.p.path == sourcePath {
+								t.Fatal("new query did not select the published downsample part")
+							}
+							refs = append(refs, *search.BlockRef)
+						}
+						if err := search.Error(); err != nil {
+							t.Fatal(err)
+						}
+						if err := checkBlocks(refs, wantSamples(query)); err != nil {
+							t.Fatal(err)
+						}
+					}()
+				}
+			}
+		})
+	}
 }
 
 func TestReserveDownsampleSpaceConcurrentAndCachedFreeSpace(t *testing.T) {

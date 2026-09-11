@@ -169,7 +169,7 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 					t.Fatalf("特征 %d 未通过原生 Block 完成解码", feature)
 				}
 				// 查询用 header 直接进入既有 BlockRef，验证扩展格式不需要专用查询 decoder。
-				bh, err := r.featureHeader(uint8(feature))
+				bh, err := r.readFeatureHeader(uint8(feature))
 				if err != nil || bh.PrecisionBits != precision {
 					t.Fatalf("查询未保留共享精度: %+v / %v", bh, err)
 				}

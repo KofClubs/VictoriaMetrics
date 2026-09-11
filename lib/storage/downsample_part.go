@@ -13,6 +13,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 )
 
 const (
@@ -165,22 +166,34 @@ func openDownsamplePart(path string) (_ *part, err error) {
 		return nil, fmt.Errorf("[downsampling] invalid metaindex length")
 	}
 	p := &part{path: path, ph: m.partHeader, dsMetadata: m}
-	defer func() {
-		if err != nil {
-			for _, f := range []filestream.ReadAtCloser{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
-				if f != nil {
-					err = errors.Join(err, f.Close())
+	// 打开校验使用可返回错误的独立句柄，校验结束后即关闭。
+	// 查询文件只交给与 raw part 相同的 fs.ReaderAt 管理，不与合并 reader 共享。
+	var timestampsReader, valuesReader, indexReader filestream.ReadAtCloser
+	closeValidationFiles := func() error {
+		var closeErr error
+		for _, reader := range []*filestream.ReadAtCloser{&timestampsReader, &valuesReader, &indexReader} {
+			f := *reader
+			*reader = nil
+			if f != nil {
+				if err := f.Close(); err != nil {
+					closeErr = errors.Join(closeErr, fmt.Errorf("[downsampling] cannot close validation file %q: %w", f.Path(), err))
 				}
 			}
 		}
+		return closeErr
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, closeValidationFiles())
+		}
 	}()
-	if err := openDownsamplePartDataFile(path, timestampsFilename, &p.dsTimestampsFile, &p.dsTimestampsSize); err != nil {
+	if err := openDownsamplePartDataFile(path, timestampsFilename, &timestampsReader, &p.dsTimestampsSize); err != nil {
 		return nil, err
 	}
-	if err := openDownsamplePartDataFile(path, valuesFilename, &p.dsValuesFile, &p.dsValuesSize); err != nil {
+	if err := openDownsamplePartDataFile(path, valuesFilename, &valuesReader, &p.dsValuesSize); err != nil {
 		return nil, err
 	}
-	if err := openDownsamplePartDataFile(path, indexFilename, &p.dsIndexFile, &p.dsIndexSize); err != nil {
+	if err := openDownsamplePartDataFile(path, indexFilename, &indexReader, &p.dsIndexSize); err != nil {
 		return nil, err
 	}
 	p.size = p.dsTimestampsSize + p.dsValuesSize + p.dsIndexSize + uint64(len(b))
@@ -220,13 +233,17 @@ func openDownsamplePart(path string) (_ *part, err error) {
 	if rows != p.ph.RowsCount || blocks != p.ph.BlocksCount || minTime != p.ph.MinTimestamp || maxTime != p.ph.MaxTimestamp || nextOffset != p.dsIndexSize {
 		return nil, fmt.Errorf("[downsampling] metaindex statistics do not match part statistics")
 	}
-	if err := validateDownsamplePartIndexes(p); err != nil {
+	if err := validateDownsamplePartIndexes(p, indexReader); err != nil {
 		return nil, fmt.Errorf("[downsampling] cannot validate part %q: %w", path, err)
 	}
+	if err := closeValidationFiles(); err != nil {
+		return nil, err
+	}
 	p.metaindexSizeBytes = uint64(cap(p.dsMetaindex)) * uint64(unsafe.Sizeof(downsampleMetaindexRow{}))
-	p.timestampsFile = p.dsTimestampsFile
-	p.valuesFile = p.dsValuesFile
-	p.indexFile = p.dsIndexFile
+	// MustOpenReaderAt 此处仅构造读取对象；文件及 mmap 与 raw 查询一样在首次读取时打开。
+	p.timestampsFile = fs.MustOpenReaderAt(filepath.Join(path, timestampsFilename))
+	p.valuesFile = fs.MustOpenReaderAt(filepath.Join(path, valuesFilename))
+	p.indexFile = fs.MustOpenReaderAt(filepath.Join(path, indexFilename))
 	return p, nil
 }
 
@@ -237,7 +254,7 @@ func checkDownsampleExtent(offset uint64, size uint32, fileSize uint64) error {
 	return nil
 }
 
-// 普通文件校验与打开失败清理由 filestream 负责；成功后交给 part 或 reader 持有。
+// 普通文件校验与打开失败清理由 filestream 负责；调用方持有并关闭成功返回的句柄。
 func openDownsamplePartDataFile(path, name string, dst *filestream.ReadAtCloser, size *uint64) error {
 	filePath := filepath.Join(path, name)
 	f, err := filestream.OpenReadAt(filePath)
@@ -251,7 +268,7 @@ func openDownsamplePartDataFile(path, name string, dst *filestream.ReadAtCloser,
 
 // 五路只保留各自当前 index block，不建立随 part 大小增长的 header/offset 集合。
 // 打开校验仅读取索引，不借用合并 reader，也不解码 timestamps.bin 或 values.bin。
-func validateDownsamplePartIndexes(p *part) error {
+func validateDownsamplePartIndexes(p *part, indexReader filestream.ReadAtCloser) error {
 	var cursors [countOfDownsampleFeatures]downsamplePartIndexCursor
 	var timestampEnd, valuesEnd uint64
 	metaPos := 0
@@ -271,7 +288,7 @@ func validateDownsamplePartIndexes(p *part) error {
 		for {
 			var headers [countOfDownsampleFeatures]*blockHeader
 			for feature := range cursors {
-				h, err := cursors[feature].nextHeader(p)
+				h, err := cursors[feature].nextHeader(p, indexReader)
 				if err != nil {
 					return err
 				}
@@ -325,7 +342,7 @@ func validateDownsamplePartIndexes(p *part) error {
 }
 
 // downsamplePartIndexCursor 只用于打开校验；各特征独立推进，允许其 index 分块边界不同。
-// 文件由 part 持有，游标只管理当前 index 的解码工作区，没有文件或对象池所有权。
+// 文件由打开校验过程持有，游标只管理当前 index 的解码工作区，没有文件或对象池所有权。
 type downsamplePartIndexCursor struct {
 	rows       []downsampleMetaindexRow // 当前分辨率、特征尚未读取的索引行。
 	headers    []blockHeader            // 当前 index 的原生 header，下一次读取时复用容量。
@@ -334,7 +351,7 @@ type downsamplePartIndexCursor struct {
 	indexData  []byte                   // 单个 index 的限长解压缓冲。
 }
 
-func (c *downsamplePartIndexCursor) nextHeader(p *part) (*blockHeader, error) {
+func (c *downsamplePartIndexCursor) nextHeader(p *part, indexReader filestream.ReadAtCloser) (*blockHeader, error) {
 	if c.headerPos == len(c.headers) {
 		if len(c.rows) == 0 {
 			return nil, nil
@@ -352,7 +369,7 @@ func (c *downsamplePartIndexCursor) nextHeader(p *part) (*blockHeader, error) {
 		} else {
 			c.compressed = c.compressed[:m.IndexBlockSize]
 		}
-		n, err := p.dsIndexFile.ReadAt(c.compressed, int64(m.IndexBlockOffset))
+		n, err := indexReader.ReadAt(c.compressed, int64(m.IndexBlockOffset))
 		if err != nil {
 			return nil, fmt.Errorf("[downsampling] cannot read index block: %w", err)
 		}

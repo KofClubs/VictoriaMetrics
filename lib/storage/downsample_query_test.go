@@ -2,16 +2,18 @@ package storage
 
 import (
 	"bytes"
-	"errors"
+	"flag"
 	"fmt"
-	"io"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/VictoriaMetrics/metrics"
+
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 )
 
 func TestDownsampleIterationMultiTSID(t *testing.T) {
@@ -289,61 +291,111 @@ func TestDownsampleSearchProtocolValidation(t *testing.T) {
 }
 
 func TestDownsampleQueryIndexAccess(t *testing.T) {
-	path := writeFileTestDownsamplePart(t, fileTestDownsampleBlock(10, downsampleResolution5m), fileTestDownsampleBlock(10, downsampleResolution1h))
-	tr := TimeRange{MinTimestamp: minUnixMilli, MaxTimestamp: maxUnixMilli}
+	var blocks []*downsampleDecodedResolutionFeaturesBlock
 	for _, resolution := range downsampleResolutions {
+		b := fileTestDownsampleBlock(10, resolution)
+		b.timestamps = b.timestamps[:0]
+		for feature := range b.values {
+			b.values[feature] = b.values[feature][:0]
+		}
+		// 非等间隔时间戳和非恒定数值确保三个文件都有实际负载。
+		for row := 0; row < 40; row++ {
+			b.timestamps = append(b.timestamps, minUnixMilli+1+int64(row)*resolution+int64(row*row))
+			for feature := range b.values {
+				b.values[feature] = append(b.values[feature], float64(feature*100+row*row+1))
+			}
+		}
+		blocks = append(blocks, b)
+	}
+	path := writeFileTestDownsamplePart(t, blocks...)
+	tr := TimeRange{MinTimestamp: minUnixMilli, MaxTimestamp: maxUnixMilli}
+	mappedFiles := metrics.GetOrCreateCounter("vm_mmapped_files")
+	cacheWarmupReads := max(0, flag.Lookup("blockcache.missesBeforeCaching").Value.(flag.Getter).Get().(int)) + 1
+	for resolutionIndex, resolution := range downsampleResolutions {
 		for feature := uint8(0); feature < countOfDownsampleFeatures; feature++ {
 			t.Run(fmt.Sprintf("%d/%d", resolution, feature), func(t *testing.T) {
+				beforeMappings := mappedFiles.Get()
 				p, err := openDownsamplePart(path)
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer p.MustClose()
-				indexFile := p.dsIndexFile
+				defer func() {
+					if p != nil {
+						p.MustClose()
+					}
+				}()
+				for _, f := range []fs.MustReadAtCloser{p.timestampsFile, p.valuesFile, p.indexFile} {
+					if _, ok := f.(*fs.ReaderAt); !ok {
+						t.Fatalf("query file %q uses %T instead of the raw fs.ReaderAt", f.Path(), f)
+					}
+				}
+				if got := mappedFiles.Get(); got != beforeMappings {
+					t.Fatalf("part validation eagerly mapped query files: got %d; want %d", got, beforeMappings)
+				}
+				indexFile := p.indexFile
 				reads := 0
-				p.dsIndexFile = &downsampleQueryIndexTestFile{ReadAtCloser: indexFile, read: func(dst []byte, offset int64) (int, error) {
+				p.indexFile = &downsampleQueryIndexTestFile{MustReadAtCloser: indexFile, read: func(dst []byte, offset int64) {
 					reads++
 					for _, mr := range p.dsMetaindex {
 						if int64(mr.IndexBlockOffset) == offset && int(mr.IndexBlockSize) == len(dst) && mr.ResolutionMs == resolution && mr.feature == feature {
-							return indexFile.ReadAt(dst, offset)
+							indexFile.MustReadAt(dst, offset)
+							return
 						}
 					}
 					t.Fatalf("query read an index outside its resolution/feature: offset=%d size=%d", offset, len(dst))
-					return 0, io.ErrUnexpectedEOF
 				}}
 				var ps partSearch
-				ps.Init(p, []TSID{{MetricID: 10}}, tr, &DownsampleQuery{ResolutionMs: resolution, Feature: feature})
 				defer ps.reset()
-				if !ps.NextBlock() || ps.Error() != nil || ps.BlockRef.bh.TSID.MetricID != 10 {
-					t.Fatalf("cannot locate the selected native block: %v", ps.Error())
+				for attempt := 0; attempt <= cacheWarmupReads; attempt++ {
+					ps.Init(p, []TSID{{MetricID: 10}}, tr, &DownsampleQuery{ResolutionMs: resolution, Feature: feature})
+					if !ps.NextBlock() || ps.Error() != nil || ps.BlockRef.bh.TSID.MetricID != 10 {
+						t.Fatalf("cannot locate the selected native block: %v", ps.Error())
+					}
+					var b Block
+					ps.BlockRef.MustReadBlock(&b)
+					if err := b.UnmarshalData(); err != nil {
+						t.Fatal(err)
+					}
+					timestamps, values := b.AppendRowsWithTimeRangeFilter(nil, nil, tr)
+					want := blocks[resolutionIndex]
+					if !reflect.DeepEqual(timestamps, want.timestamps) || !reflect.DeepEqual(values, want.values[feature]) {
+						t.Fatalf("query returned incorrect data: timestamps=%v values=%v", timestamps, values)
+					}
+					if ps.NextBlock() || ps.Error() != nil || reads != min(attempt+1, cacheWarmupReads) {
+						t.Fatalf("unexpected extra block or cache miss: attempt=%d reads=%d err=%v", attempt, reads, ps.Error())
+					}
+					wantMappings := beforeMappings
+					if flag.Lookup("fs.disableMmap").Value.String() == "false" {
+						wantMappings += 3
+					}
+					if got := mappedFiles.Get(); got != wantMappings {
+						t.Fatalf("query did not use the shared mmap setting: got %d; want %d", got, wantMappings)
+					}
 				}
-				if ps.NextBlock() || ps.Error() != nil || reads != 1 {
-					t.Fatalf("unexpected extra block or index reads: reads=%d err=%v", reads, ps.Error())
+				p.MustClose()
+				p = nil
+				if got := mappedFiles.Get(); got != beforeMappings {
+					t.Fatalf("part close retained mmap files: got %d; want %d", got, beforeMappings)
 				}
 			})
 		}
 	}
 
-	readErr := errors.New("injected index read failure")
-	for _, scenario := range []string{"read_error", "short_read", "bad_magic"} {
+	// 文件读取沿用 raw 的 MustReadAt 契约；这里只检查降采样索引自身的损坏处理。
+	for _, scenario := range []string{"bad_magic", "bad_compression"} {
 		t.Run(scenario, func(t *testing.T) {
 			p, err := openDownsamplePart(path)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer p.MustClose()
-			indexFile := p.dsIndexFile
+			indexFile := p.indexFile
 			reads := 0
-			p.dsIndexFile = &downsampleQueryIndexTestFile{ReadAtCloser: indexFile, read: func(dst []byte, offset int64) (int, error) {
+			p.indexFile = &downsampleQueryIndexTestFile{MustReadAtCloser: indexFile, read: func(dst []byte, offset int64) {
 				reads++
-				switch scenario {
-				case "read_error":
-					return 0, readErr
-				case "short_read":
-					return len(dst) - 1, nil
-				default:
-					clear(dst)
-					return len(dst), nil
+				clear(dst)
+				if scenario == "bad_compression" {
+					copy(dst, downsampleIndexMagic)
 				}
 			}}
 			var ps partSearch
@@ -351,9 +403,6 @@ func TestDownsampleQueryIndexAccess(t *testing.T) {
 			defer ps.reset()
 			if ps.NextBlock() || ps.Error() == nil || !strings.HasPrefix(ps.Error().Error(), "[downsampling] ") {
 				t.Fatalf("invalid index read succeeded: %v", ps.Error())
-			}
-			if scenario == "read_error" && !errors.Is(ps.Error(), readErr) || scenario == "short_read" && !errors.Is(ps.Error(), io.ErrUnexpectedEOF) {
-				t.Fatalf("index read lost its error cause: %v", ps.Error())
 			}
 			if ps.NextBlock() || reads != 1 {
 				t.Fatal("query continued reading after an index failure")

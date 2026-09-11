@@ -360,17 +360,8 @@ func (pt *partition) mergeDownsampleParts(pws []*partWrapper, dstPartType partTy
 		pwNew.incRef()
 		defer func() {
 			if !published {
-				var cleanupErr error
-				for _, f := range []filestream.ReadAtCloser{p.dsTimestampsFile, p.dsValuesFile, p.dsIndexFile} {
-					if f != nil {
-						cleanupErr = errors.Join(cleanupErr, f.Close())
-					}
-				}
-				ibCache.RemoveBlocksForPart(p)
-				if cleanupErr != nil {
-					downsampleMergeLogger.Warnf("[downsampling] cannot close unpublished downsampling part %q: %s", dstPartPath, cleanupErr)
-				}
-				err = errors.Join(err, cleanupErr)
+				// 尚未发布的 part 没有查询使用；其惰性读取对象尚未打开文件或 mmap。
+				pwNew.decRef()
 			}
 		}()
 	}

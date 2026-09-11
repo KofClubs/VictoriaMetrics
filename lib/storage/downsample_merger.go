@@ -242,8 +242,7 @@ func (m *downsampleMerger) readSource(sourcePart *part, currentTSID *TSID, curre
 	if err := m.currentSourceReader.Init(sourcePart, currentResolution); err != nil {
 		return err
 	}
-	m.currentSourceReader.SetFilter(currentTSID, currentTSIDTimeRange.MinTimestamp, currentTSIDTimeRange.MaxTimestamp)
-	for m.currentSourceReader.NextHeader() {
+	for ok := m.currentSourceReader.SeekTSID(*currentTSID); ok && m.currentSourceReader.Header().TSID == *currentTSID; ok = m.currentSourceReader.NextHeader() {
 		if err := m.checkStopped(); err != nil {
 			return err
 		}

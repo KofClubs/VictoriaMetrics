@@ -218,7 +218,7 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 `currentTSIDBucketSamples` 按该范围设置长度，包含中间空 bucket；容量不足才分配，否则清空有效范围后复用。31 天在 5m 和 1h 分辨率下分别最多需要 8928 和 744 个槽。`downsampleMaxPooledBuckets=8928*2` 只控制 `reset` 时保留的池缓存容量，不限制本次计算的槽数。
 
-随后，`currentSourceReader` 重新定位这些源的当前 TSID，读取 payload 并累加到对应槽位。索引扫描与数据读取使用不同 reader，避免数据读取改变堆中已推进的索引位置。所有源贡献完成后，样本切片直接交给 writer，之后再处理下一个 TSID。
+随后，`currentSourceReader` 通过 `SeekTSID` 重新定位这些源的当前 TSID，读取 payload 并累加到对应槽位；merger 在遇到下一个 TSID 时结束该源的回读。索引扫描与数据读取使用不同 reader，避免数据读取改变堆中已推进的索引位置。所有源贡献完成后，样本切片直接交给 writer，之后再处理下一个 TSID。
 
 已删除的 MetricID 对应整条 TSID 跳过处理，并累计删除的源物理行。
 
@@ -226,9 +226,9 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 ### 4.2 多特征解码
 
-`ReadBlock` 返回 `downsampleDecodedResolutionFeaturesBlock`。主 reader 默认定位 last，其余四个 feature 的 reader 按需创建，只负责各列索引的推进与对齐。
+`ReadBlock` 返回 `downsampleDecodedResolutionFeaturesBlock`，固定对齐同一分辨率的五个特征。reader 内嵌五个轻量索引游标，每个游标保存对应特征的索引位置、当前 header 和工作缓冲，不持有文件，不单独进入对象池。索引与 payload 均由外层 reader 持有的三个文件读取对象访问。
 
-`Init` 绑定源 part 和分辨率，主游标固定为 last；其余特征只由内部 reader 对齐。`SetFilter` 设置目标 TSID 和时间范围；对于降采样 part，先在 metaindex 中二分定位分辨率和特征区段，再利用 `LastTSID` 定位可能包含目标 TSID 的首个 index。迭代时继续筛选时间范围相交的 index 和 Block。
+`Init(p, resolution)` 绑定源 part 和分辨率，准备完整索引扫描；降采样源的 `NextHeader` 按该分辨率的 last 列推进，原始源沿原生索引推进。`SeekTSID(tsid)` 定位指定 TSID 的起点，供 merger 在完成时间范围扫描后回读实际数据；返回成功时，当前 `Header` 已是首条匹配 header，可直接调用 `ReadBlock`。降采样源在 metaindex 中按分辨率、特征和 `LastTSID` 定位候选 index；原始源定位时保留可能包含同 TSID 的前一个 index。reader 不接收任意时间窗口，也不为查询选择单个特征；目标 TSID 的结束边界由 merger 判断。
 
 首列通过原生 `Block.UnmarshalData` 完整解码时间戳和值；后四列验证共享时间戳描述后，由 `downsampleReader.readNativeValues` 仅读取各自 values，并直接调用原有 `encoding.UnmarshalValues` 解码，复用该原生 Block 中的时间戳。reader 负责清除上一列的值、校验时间戳与数值行数一致，并清理编码缓冲和重置读取位置；共享的 `block.go` 保持原有实现。时间戳在本次多特征批次内只读取、解码一次，下一批次重新读取；查询单列读取也独立解码。
 
@@ -244,9 +244,11 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 | `metaindex.bin` | 打开 part 时载入 `dsMetaindex` | `metaindexWriter`，整体输出 |
 | `metadata.json` | 格式检测及打开 part 时解析为 `dsMetadata` | `Finish` 最后直接创建、写入、同步并关闭 |
 
-当前 reader 通过 `filestream.ReadAtCloser` 按 header 中的 offset/size 读取。`filestream.ReaderAt` 封装文件打开、普通文件检查、偏移读取和关闭，直接写入调用方缓冲，不持有顺序游标，也不缓存整个文件；原有顺序读取接口 `filestream.ReadCloser` 保持不变。时间列和值列采用串行读取和可复用缓冲，文件整体读取顺序不是连续顺序扫描。
+归并专属的 `downsampleReader` 通过 `filestream.ReadAtCloser` 按 header 中的 offset/size 读取。`filestream.ReaderAt` 封装文件打开、普通文件检查、偏移读取和关闭，直接写入调用方缓冲，不持有顺序游标，也不缓存整个文件。其接口只有 `Path`、`Size`、`ReadAt` 和 `Close`，读取和关闭错误通过返回值处理；不提供 `MustReadAt`、`MustClose`，不能作为查询的 `fs.MustReadAtCloser` 使用。原有顺序读取接口 `filestream.ReadCloser` 保持不变。时间列和值列采用串行读取和可复用缓冲，文件整体读取顺序不是连续顺序扫描。
 
-磁盘降采样 part 持有 `dsTimestampsFile`、`dsValuesFile`、`dsIndexFile` 三个长期句柄，reader 借用这些句柄。reader 为磁盘原始源自行打开三个文件，并负责关闭；内存源读取已有缓冲。调用方必须在 reader 使用期间持有源 part 引用。不同查询、打开校验和归并任务分别使用独立 reader 实例。
+磁盘 part 的查询读取对象统一由原有 `timestampsFile`、`valuesFile`、`indexFile` 三个 `fs.MustReadAtCloser` 字段持有，实际类型均为 `*fs.ReaderAt`。原始与降采样查询共用 mmap、页驻留状态检查、系统调用回退、读取统计和索引缓存；`fs.disableMmap`、`fs.disableMincore` 的含义及实现保持不变。文件按原有机制延迟打开，不额外保存一组降采样查询句柄。
+
+归并 reader 为原始磁盘和降采样磁盘源均自行打开三个文件，并负责关闭，不借用 part 的查询读取对象。内存源读取已有缓冲。part 打开校验使用独立的临时偏移读取对象，在返回前关闭，不将校验句柄交给查询。调用方在归并 reader 使用期间持有源 part 引用；查询也沿用原有引用计数，旧 part 退出活动集合后，仍须等待最后一个引用释放才关闭及删除。归并调度沿用 `isInMerge`，不新增查询与归并之间的共享锁。
 
 ## 5. 写出与临时存储
 
@@ -288,7 +290,7 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 ### 6.1 打开校验
 
-`openDownsamplePart` 有界读取 metadata 和 metaindex，核验版本、语义字段、行长度、排序、租户及物理统计，再由 part 层为每个分辨率维护五个索引游标，遍历全部 index header；不创建 `downsampleReader`。
+`openDownsamplePart` 有界读取 metadata 和 metaindex，核验版本、语义字段、行长度、排序、租户及物理统计，再由 part 层为每个分辨率维护五个索引游标，遍历全部 index header；不创建 `downsampleReader`。校验使用能返回错误的临时 `filestream.ReadAtCloser`，在成功和失败路径上均关闭并合并关闭错误；通过校验的 part 使用原有 `fs.ReaderAt` 建立查询读取对象。
 
 校验包括：
 
@@ -315,7 +317,7 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 | metadata 文件 | 64 KiB |
 | 单个 spill 的内存缓冲容量 | 默认 16 MiB，由 downsampling.spillMaxMemorySize 配置；按需分配，关闭后不保留到池中 |
 
-索引 reader 各自只保留当前 index block，源 part 的 metaindex 整体驻留内存。merger 的聚合状态按当前 TSID 的时间范围分配。writer 保留当前批次及其编码缓冲、当前分辨率的五个 spill 缓冲、临时文件读回缓冲、当前未输出的 index，以及整个目标 part 尚未压缩的 metaindex；压缩时复用压缩缓冲。默认配置下，五个 spill 当前持有的缓冲容量合计最多 80 MiB，不含扩容过程中尚待 GC 的旧分配及其他工作缓冲。
+reader 的各特征索引游标只保留当前 index block，源 part 的 metaindex 整体驻留内存。merger 的聚合状态按当前 TSID 的时间范围分配。writer 保留当前批次及其编码缓冲、当前分辨率的五个 spill 缓冲、临时文件读回缓冲、当前未输出的 index，以及整个目标 part 尚未压缩的 metaindex；压缩时复用压缩缓冲。默认配置下，五个 spill 当前持有的缓冲容量合计最多 80 MiB，不含扩容过程中尚待 GC 的旧分配及其他工作缓冲。
 
 这些是单项边界，不是进程内存的统一额度。总占用还受源 part 数量、并发任务、对象池保留容量和系统页缓存影响。`reset` 清除 `currentResolutionReaders`、`currentResolutionReaderHeap` 和 `currentTSIDReaders` 中的全部源引用，将切片长度归零，保留底层数组用于复用；reader 指针切片不设容量丢弃阈值。bucket 切片仍以 `downsampleMaxPooledBuckets = 17856` 控制 `reset` 后保留的池缓存容量，该阈值不限制任务的 bucket 数量。
 
@@ -355,9 +357,9 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 |---|---|
 | 提交前 | 保留源 part、旧清单和活动集合，关闭目标句柄，删除未发布目标、spill 和临时清单 |
 | 提交后返回错误 | 目标已经发布，内存活动集合与新清单保持一致，保留旧磁盘源文件，禁止 Abort 已发布目标；实际目录同步仍遵守共享 Must 语义 |
-| 正常提交完成 | 按引用计数回收已替换的源 part |
+| 正常提交完成 | 将已替换源标记为可删除并释放引用；引用归零后依次执行 `decRef → part.MustClose → fs.MustRemoveDir`，原始及降采样磁盘源采用相同流程 |
 
-writer 自身验证、spill 读回及接口返回的写入错误会阻止发布，并触发 Abort；后续写入继续返回已记录的错误。Abort 通过原有 MustClose 关闭最终文件，再删除未发布目录；只有 spill 可以直接丢弃尚未写出的缓冲。reader 会尝试关闭所有自有句柄并聚合关闭错误，借用的降采样句柄仍由 part 管理。清理失败同样返回错误；只有实际删除成功，才能认为目标已清理。
+writer 自身验证、spill 读回及接口返回的写入错误会阻止发布，并触发 Abort；后续写入继续返回已记录的错误。Abort 通过原有 MustClose 关闭最终文件，再删除未发布目录；只有 spill 可以直接丢弃尚未写出的缓冲。归并 reader 会尝试关闭所有自有句柄并聚合关闭错误，不关闭 part 的查询读取对象；后者由原有 part 引用生命周期管理。清理失败同样返回错误；只有实际删除成功，才能认为目标已清理。
 
 `Merge` 返回前归还全部 reader 和多特征解码对象，统计按值返回。对象归还或句柄关闭后清除引用，后续重置不重复释放该资源。writer 的 `reset` 只清理内存状态；`Abort` 负责未发布目标的资源清理，目录删除失败时保留路径及已有错误，后续仅重试尚未完成的删除。降采样专属错误和日志均使用英文，并以 `[downsampling]` 开头。
 
@@ -384,6 +386,6 @@ HTTP 使用两个独立参数：`query.resolution` 指定 `5m` 或 `1h`，`query
 
 降采样 RPC 为 `search_downsampling_v2`。它保留原有租户、时间范围和筛选条件的组织方式，在查询负载后追加 8 字节分辨率和 1 字节特征编号；编号与磁盘格式相同。响应继续使用原生 MetricBlock。降采样请求要求全部目标存储节点成功，节点不支持该协议时返回错误，不接受部分结果。降采样查询禁用结果缓存及为缓存进行的时间范围对齐。
 
-`partSearch` 直接按分辨率和特征筛选 metaindex，读取目标列的 index，并复用原有索引缓存、TSID 与时间范围筛选以及 `BlockRef` 构造流程。定位到原生 `blockHeader` 后，由 `BlockRef` 和原生 `Block` 按偏移读取并解码 payload；查询不读取其余四个特征的 index 和 payload。`downsampleReader` 仅供归并使用，查询不创建或借用该 reader。
+`partSearch` 直接按分辨率和特征筛选 metaindex，读取目标列的 index，并复用原有 `ibCache`、TSID 与时间范围筛选以及 `BlockRef` 构造流程。索引未命中缓存时，通过 `p.indexFile.MustReadAt` 读取；定位到原生 `blockHeader` 后，由 `BlockRef` 和原生 `Block` 经 `p.timestampsFile`、`p.valuesFile` 按偏移读取并解码 payload。这三个查询读取对象均为原有 `fs.ReaderAt`，文件读取方式及 mmap 优化与原始查询一致，I/O 故障沿用原有 `Must` 语义。查询不读取其余四个特征的 index 和 payload。`downsampleReader` 仅供归并使用，查询不创建或借用该 reader。
 
 存储层按共享时间戳选择记录，不恢复或重新裁剪 bucket 内原始贡献；HTTP 查询继续遵循 PromQL 的回看窗口和求值网格。vmselect 与 vmstorage 的去重配置独立生效，需要保留全部降采样记录时，两端都应设置 `dedup.minScrapeInterval=0`。当前降采样接口不聚合尚未合并的跨 part 记录，不组合原始与降采样结果，也不提供自定义分辨率或任意时间区间的精确原始聚合。

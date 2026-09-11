@@ -49,10 +49,8 @@ type part struct {
 	dsMetadata  *downsamplePartMetadata
 	dsMetaindex []downsampleMetaindexRow
 
-	dsTimestampsFile filestream.ReadAtCloser // timestamps.bin；part 持有，降采样 reader 借用。
-	dsValuesFile     filestream.ReadAtCloser // values.bin；所有权与 timestamps.bin 一致。
-	dsIndexFile      filestream.ReadAtCloser // index.bin；所有权与 timestamps.bin 一致。
-
+	// 降采样查询与 raw 查询共用上面的文件读取对象、mmap 和缓存机制。
+	// 文件大小仅用于降采样索引与 payload 的边界校验。
 	dsTimestampsSize uint64
 	dsValuesSize     uint64
 	dsIndexSize      uint64
