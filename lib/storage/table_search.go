@@ -27,6 +27,9 @@ type tableSearch struct {
 
 	nextBlockNoop bool
 	needClosing   bool
+
+	// downsampleQuery 仅保存当前 TSID 的跨 part、跨 partition 聚合状态；原生源读取仍由现有堆完成。
+	downsampleQuery *downsampleQueryState
 }
 
 func (ts *tableSearch) reset() {
@@ -51,15 +54,23 @@ func (ts *tableSearch) reset() {
 	ts.err = nil
 	ts.nextBlockNoop = false
 	ts.needClosing = false
+	if q := ts.downsampleQuery; q != nil && q.bucketMemoryReserved > 0 {
+		q.currentTSIDBuckets = nil
+		q.currentTSIDBucketIDs = nil
+		q.bucketMemoryLimiter.Put(q.bucketMemoryReserved)
+		q.bucketMemoryReserved = 0
+	}
+	ts.downsampleQuery = nil
 }
 
 // Init initializes the ts.
+// downsampleQuery is passed through to each partition search.
 //
 // tsids must be sorted.
 // tsids cannot be modified after the Init call, since it is owned by ts.
 //
 // MustClose must be called then the tableSearch is done.
-func (ts *tableSearch) Init(tb *table, tsids []TSID, tr TimeRange) {
+func (ts *tableSearch) Init(tb *table, tsids []TSID, tr TimeRange, downsampleQuery *DownsampleQuery) {
 	if ts.needClosing {
 		logger.Panicf("BUG: missing MustClose call before the next call to Init")
 	}
@@ -68,13 +79,24 @@ func (ts *tableSearch) Init(tb *table, tsids []TSID, tr TimeRange) {
 	// than the tb retention.
 	now := int64(fasttime.UnixTimestamp() * 1000)
 	minTimestamp := now - tb.s.retentionMsecs
-	if tr.MinTimestamp < minTimestamp {
+	if downsampleQuery == nil && tr.MinTimestamp < minTimestamp {
 		tr.MinTimestamp = minTimestamp
 	}
 
 	ts.reset()
 	ts.tb = tb
 	ts.needClosing = true
+	if downsampleQuery != nil {
+		outputTimeRange := tr
+		outputTimeRange.MinTimestamp = max(outputTimeRange.MinTimestamp, minTimestamp)
+		ts.downsampleQuery = &downsampleQueryState{selector: *downsampleQuery, outputTimeRange: outputTimeRange}
+		var err error
+		tr, err = downsampleQuery.SourceTimeRange(tr)
+		if err != nil {
+			ts.err = err
+			return
+		}
+	}
 
 	if len(tsids) == 0 {
 		// Fast path - zero tsids.
@@ -87,7 +109,7 @@ func (ts *tableSearch) Init(tb *table, tsids []TSID, tr TimeRange) {
 	// Initialize the ptsPool.
 	ts.ptsPool = slicesutil.SetLength(ts.ptsPool, len(ts.ptws))
 	for i, ptw := range ts.ptws {
-		ts.ptsPool[i].Init(ptw.pt, tsids, tr)
+		ts.ptsPool[i].Init(ptw.pt, tsids, tr, downsampleQuery)
 	}
 
 	// Initialize the ptsHeap.
@@ -118,6 +140,14 @@ func (ts *tableSearch) Init(tb *table, tsids []TSID, tr TimeRange) {
 // The blocks are sorted by (TSID, MinTimestamp). Two subsequent blocks
 // for the same TSID may contain overlapped time ranges.
 func (ts *tableSearch) NextBlock() bool {
+	if ts.downsampleQuery != nil {
+		return ts.downsampleQuery.nextBlock(ts)
+	}
+	return ts.nextSourceBlock()
+}
+
+// nextSourceBlock 保持原有跨 partition 的原生 BlockRef 遍历；降采样聚合只消费此接口。
+func (ts *tableSearch) nextSourceBlock() bool {
 	if ts.err != nil {
 		return false
 	}

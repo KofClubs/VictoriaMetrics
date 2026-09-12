@@ -44,11 +44,32 @@ type part struct {
 
 	metaindex          []metaindexRow
 	metaindexSizeBytes uint64
+
+	// 降采样格式仅扩展磁盘 part，原始 inmemory 的缓冲与序列化保持不变。
+	dsMetadata  *downsamplePartMetadata
+	dsMetaindex []downsampleMetaindexRow
+
+	// 降采样查询与 raw 查询共用上面的文件读取对象、mmap 和缓存机制。
+	// 文件大小仅用于降采样索引与 payload 的边界校验。
+	dsTimestampsSize uint64
+	dsValuesSize     uint64
+	dsIndexSize      uint64
 }
 
 // mustOpenFilePart opens file-based part from the given path.
 func mustOpenFilePart(path string) *part {
 	path = filepath.Clean(path)
+	isDownsample, err := detectDownsampleFormat(path)
+	if err != nil {
+		logger.Panicf("FATAL: cannot detect part format at %q: %s", path, err)
+	}
+	if isDownsample {
+		p, err := openDownsamplePart(path, nil)
+		if err != nil {
+			logger.Panicf("[downsampling] FATAL: cannot open downsample part at %q: %s", path, err)
+		}
+		return p
+	}
 
 	var ph partHeader
 	ph.MustReadMetadata(path)

@@ -1263,7 +1263,7 @@ func TestLegacyStorageRotateIndexDB_Search(t *testing.T) {
 
 	testLegacyRotateIndexDB(t, accountID, projectID, mrs, func(s *Storage) {
 		var search Search
-		search.Init(nil, s, tfss, tr, 1e5, noDeadline)
+		search.Init(nil, s, tfss, tr, 1e5, noDeadline, nil)
 		for search.NextMetricBlock() {
 			var b Block
 			search.MetricBlockRef.BlockRef.MustReadBlock(&b)

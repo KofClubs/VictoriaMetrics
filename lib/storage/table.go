@@ -461,7 +461,7 @@ func (tb *table) retentionWatcher() {
 		tb.ptwsLock.Lock()
 		dst := tb.ptws[:0]
 		for _, ptw := range tb.ptws {
-			if ptw.pt.tr.MaxTimestamp < minTimestamp || ptw.pt.tr.MinTimestamp > maxTimestamp {
+			if ptw.pt.retentionExpired(minTimestamp) || ptw.pt.tr.MinTimestamp > maxTimestamp {
 				ptwsDrop = append(ptwsDrop, ptw)
 			} else {
 				dst = append(dst, ptw)

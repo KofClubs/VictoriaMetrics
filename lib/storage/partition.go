@@ -88,6 +88,9 @@ type partition struct {
 	// the path to directory with IndexDB parts.
 	indexDBPartsPath string
 
+	// 仅测试使用；每个 partition 独立注入发布前后故障，不影响其他作业。
+	downsampleTestHook func(stage, path string) error
+
 	// The parent storage.
 	// TODO(@rtm0): Do not depend on Storage, pass only what is required.
 	s *Storage
@@ -556,7 +559,7 @@ func (pt *partition) inmemoryPartsMerger() {
 			// Try merging additional parts.
 			continue
 		}
-		if errors.Is(err, errForciblyStopped) {
+		if errors.Is(err, errForciblyStopped) || errors.Is(err, errDownsampleMergeFailed) {
 			// Nothing to do - finish the merger.
 			return
 		}
@@ -573,7 +576,7 @@ func (pt *partition) smallPartsMerger() {
 		maxOutBytes := pt.getMaxBigPartSize()
 
 		pt.partsLock.Lock()
-		pws := getPartsToMerge(pt.smallParts, maxOutBytes)
+		pws := pt.getFilePartsToMerge(pt.smallParts, maxOutBytes)
 		pt.partsLock.Unlock()
 
 		if len(pws) == 0 {
@@ -581,7 +584,16 @@ func (pt *partition) smallPartsMerger() {
 			return
 		}
 
-		smallPartsConcurrencyCh <- struct{}{}
+		if pt.s.downsamplingEnabled {
+			select {
+			case smallPartsConcurrencyCh <- struct{}{}:
+			case <-pt.stopCh:
+				pt.releasePartsToMerge(pws)
+				return
+			}
+		} else {
+			smallPartsConcurrencyCh <- struct{}{}
+		}
 		err := pt.mergeParts(pws, pt.stopCh, false, false)
 		<-smallPartsConcurrencyCh
 
@@ -589,7 +601,7 @@ func (pt *partition) smallPartsMerger() {
 			// Try merging additional parts.
 			continue
 		}
-		if errors.Is(err, errForciblyStopped) {
+		if errors.Is(err, errForciblyStopped) || errors.Is(err, errDownsampleMergeFailed) {
 			// Nothing to do - finish the merger.
 			return
 		}
@@ -606,7 +618,7 @@ func (pt *partition) bigPartsMerger() {
 		maxOutBytes := pt.getMaxBigPartSize()
 
 		pt.partsLock.Lock()
-		pws := getPartsToMerge(pt.bigParts, maxOutBytes)
+		pws := pt.getFilePartsToMerge(pt.bigParts, maxOutBytes)
 		pt.partsLock.Unlock()
 
 		if len(pws) == 0 {
@@ -614,7 +626,16 @@ func (pt *partition) bigPartsMerger() {
 			return
 		}
 
-		bigPartsConcurrencyCh <- struct{}{}
+		if pt.s.downsamplingEnabled {
+			select {
+			case bigPartsConcurrencyCh <- struct{}{}:
+			case <-pt.stopCh:
+				pt.releasePartsToMerge(pws)
+				return
+			}
+		} else {
+			bigPartsConcurrencyCh <- struct{}{}
+		}
 		err := pt.mergeParts(pws, pt.stopCh, false, false)
 		<-bigPartsConcurrencyCh
 
@@ -622,7 +643,7 @@ func (pt *partition) bigPartsMerger() {
 			// Try merging additional parts.
 			continue
 		}
-		if errors.Is(err, errForciblyStopped) {
+		if errors.Is(err, errForciblyStopped) || errors.Is(err, errDownsampleMergeFailed) {
 			// Nothing to do - finish the merger.
 			return
 		}
@@ -1029,6 +1050,43 @@ func (pt *partition) flushInmemoryRowsToFiles() {
 }
 
 func (pt *partition) flushInmemoryPartsToFiles(isFinal bool) {
+	err := pt.flushInmemoryPartsToFilesWithDownsampling(isFinal, pt.s.downsamplingEnabled)
+	if errors.Is(err, errDownsampleMergeFailed) {
+		if !isFinal {
+			// 保留全部失败源，结束本轮周期 flush。
+			return
+		}
+		// 关闭和 snapshot 必须保全待落盘样本。降采样作业已退出；
+		// 对仍在内存的源执行独立的原始落盘，不改变共享降采样配置。
+		downsampleMergeLogger.Warnf("[downsampling] falling back to raw final flush for partition %q after merge failure: %s", pt.name, err)
+		err = pt.flushInmemoryPartsToFilesWithDownsampling(true, false)
+	}
+	if err != nil {
+		if pt.s.downsamplingEnabled {
+			logger.Panicf("[downsampling] FATAL: cannot complete final in-memory part flush: %s", err)
+		}
+		logger.Panicf("FATAL: cannot merge in-memory parts: %s", err)
+	}
+	if isFinal && pt.s.downsamplingEnabled {
+		// rename 后的目录同步失败可能已移除了全部内存源。最终持久化
+		// 不能以“没有剩余源”判断成功，必须重新确保当前 manifest 已落盘。
+		func() {
+			pt.partsLock.Lock()
+			defer pt.partsLock.Unlock()
+			if pt.downsampleTestHook != nil {
+				err = pt.downsampleTestHook("sync-final-dir", pt.smallPartsPath)
+			}
+			if err == nil {
+				fs.MustSyncPath(pt.smallPartsPath)
+			}
+		}()
+		if err != nil {
+			logger.Panicf("[downsampling] FATAL: cannot sync final part manifest for %q: %s", pt.name, err)
+		}
+	}
+}
+
+func (pt *partition) flushInmemoryPartsToFilesWithDownsampling(isFinal, downsampling bool) error {
 	currentTime := time.Now()
 	var pws []*partWrapper
 
@@ -1041,23 +1099,49 @@ func (pt *partition) flushInmemoryPartsToFiles(isFinal bool) {
 	}
 	pt.partsLock.Unlock()
 
-	if err := pt.mergePartsToFiles(pws, nil, inmemoryPartsConcurrencyCh, false); err != nil {
-		logger.Panicf("FATAL: cannot merge in-memory parts: %s", err)
-	}
+	return pt.mergePartsToFilesWithDownsampling(pws, nil, inmemoryPartsConcurrencyCh, false, downsampling)
 }
 
 func (pt *partition) mergePartsToFiles(pws []*partWrapper, stopCh <-chan struct{}, concurrencyCh chan struct{}, useSparseCache bool) error {
+	return pt.mergePartsToFilesWithDownsampling(pws, stopCh, concurrencyCh, useSparseCache, pt.s.downsamplingEnabled)
+}
+
+func (pt *partition) mergePartsToFilesWithDownsampling(pws []*partWrapper, stopCh <-chan struct{}, concurrencyCh chan struct{}, useSparseCache, downsampling bool) error {
 	pwsLen := len(pws)
 
 	var errGlobal error
 	var errGlobalLock sync.Mutex
 	wg := getWaitGroup()
+mergeLoop:
 	for len(pws) > 0 {
 		pwsToMerge, pwsRemaining := getPartsForOptimalMerge(pws)
-		concurrencyCh <- struct{}{}
+		if downsampling {
+			select {
+			case concurrencyCh <- struct{}{}:
+			case <-stopCh:
+				pt.releasePartsToMerge(pws)
+				errGlobalLock.Lock()
+				if errGlobal == nil {
+					errGlobal = errForciblyStopped
+				}
+				errGlobalLock.Unlock()
+				break mergeLoop
+			}
+			errGlobalLock.Lock()
+			failed := errGlobal != nil
+			errGlobalLock.Unlock()
+			if failed {
+				<-concurrencyCh
+				pt.releasePartsToMerge(pwsToMerge)
+				pt.releasePartsToMerge(pwsRemaining)
+				break
+			}
+		} else {
+			concurrencyCh <- struct{}{}
+		}
 
 		wg.Go(func() {
-			if err := pt.mergeParts(pwsToMerge, stopCh, true, useSparseCache); err != nil && !errors.Is(err, errForciblyStopped) {
+			if err := pt.mergePartsWithDownsampling(pwsToMerge, stopCh, true, useSparseCache, downsampling); err != nil && (downsampling || !errors.Is(err, errForciblyStopped)) {
 				errGlobalLock.Lock()
 				if errGlobal == nil {
 					errGlobal = err
@@ -1073,6 +1157,9 @@ func (pt *partition) mergePartsToFiles(pws []*partWrapper, stopCh <-chan struct{
 	putWaitGroup(wg)
 
 	if errGlobal != nil {
+		if downsampling {
+			return fmt.Errorf("[downsampling] cannot merge %d parts optimally: %w", pwsLen, errGlobal)
+		}
 		return fmt.Errorf("cannot merge %d parts optimally: %w", pwsLen, errGlobal)
 	}
 	return nil
@@ -1088,10 +1175,17 @@ func (pt *partition) ForceMergeAllParts(stopCh <-chan struct{}) error {
 
 	// Check whether there is enough disk space for merging pws.
 	newPartSize := getPartsSize(pws)
+	if pt.s.downsamplingEnabled {
+		newPartSize = estimateDownsamplePartSize(pws, pt.s.getDownsamplingConfig())
+	}
 	maxOutBytes := fs.MustGetFreeSpace(pt.bigPartsPath)
 	if newPartSize > maxOutBytes {
 		freeSpaceNeededBytes := newPartSize - maxOutBytes
-		forceMergeLogger.Warnf("cannot initiate force merge for the partition %s; additional space needed: %d bytes", pt.name, freeSpaceNeededBytes)
+		if pt.s.downsamplingEnabled {
+			forceMergeLogger.Warnf("[downsampling] cannot initiate force merge for partition %q; additional space needed: %d bytes", pt.name, freeSpaceNeededBytes)
+		} else {
+			forceMergeLogger.Warnf("cannot initiate force merge for the partition %s; additional space needed: %d bytes", pt.name, freeSpaceNeededBytes)
+		}
 		pt.releasePartsToMerge(pws)
 		return nil
 	}
@@ -1100,6 +1194,9 @@ func (pt *partition) ForceMergeAllParts(stopCh <-chan struct{}) error {
 	// This allows applying the configured retention, removing the deleted series
 	// and performing de-duplication if needed.
 	if err := pt.mergePartsToFiles(pws, stopCh, bigPartsConcurrencyCh, true); err != nil {
+		if pt.s.downsamplingEnabled {
+			return fmt.Errorf("[downsampling] cannot force merge %d parts from partition %q: %w", len(pws), pt.name, err)
+		}
 		return fmt.Errorf("cannot force merge %d parts from partition %q: %w", len(pws), pt.name, err)
 	}
 
@@ -1232,6 +1329,10 @@ func getMinDedupInterval(pws []*partWrapper) int64 {
 // All the parts inside pws must have isInMerge field set to true.
 // The isInMerge field inside pws parts is set to false before returning from the function.
 func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isFinal, useSparseCache bool) error {
+	return pt.mergePartsWithDownsampling(pws, stopCh, isFinal, useSparseCache, pt.s.downsamplingEnabled)
+}
+
+func (pt *partition) mergePartsWithDownsampling(pws []*partWrapper, stopCh <-chan struct{}, isFinal, useSparseCache, downsampling bool) error {
 	if len(pws) == 0 {
 		logger.Panicf("BUG: empty pws cannot be passed to mergeParts()")
 	}
@@ -1242,9 +1343,19 @@ func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isFi
 	startTime := time.Now()
 
 	// Initialize destination paths.
-	dstPartType := pt.getDstPartType(pws, isFinal)
+	var dstPartType partType
+	if downsampling {
+		dstPartType = pt.getDstPartType(pws, isFinal)
+	} else {
+		dstPartType = pt.getRawDstPartType(pws, isFinal)
+	}
 	mergeIdx := pt.nextMergeIdx()
 	dstPartPath := pt.getDstPartPath(dstPartType, mergeIdx)
+
+	// 在所有文件输出入口之前分派，包含单个 inmemory part 的直接 dump。
+	if downsampling && dstPartType != partInmemory {
+		return pt.mergeDownsampleParts(pws, dstPartType, dstPartPath, stopCh, startTime)
+	}
 
 	if !isDedupEnabled() && isFinal && len(pws) == 1 && pws[0].mp != nil {
 		// Fast path: flush a single in-memory part to disk.
@@ -1351,6 +1462,15 @@ var (
 )
 
 func (pt *partition) getDstPartType(pws []*partWrapper, isFinal bool) partType {
+	dstPartType := pt.getRawDstPartType(pws, isFinal)
+	// 原始内存目标选择保持不变，仅复核文件目标的降采样空间上界。
+	if pt.s != nil && pt.s.downsamplingEnabled && dstPartType == partSmall && estimateDownsamplePartSize(pws, pt.s.getDownsamplingConfig()) > pt.getMaxSmallPartSize() {
+		return partBig
+	}
+	return dstPartType
+}
+
+func (pt *partition) getRawDstPartType(pws []*partWrapper, isFinal bool) partType {
 	dstPartSize := getPartsSize(pws)
 	if dstPartSize > pt.getMaxSmallPartSize() {
 		return partBig
@@ -1425,6 +1545,10 @@ func (pt *partition) mergePartsInternal(dstPartPath string, bsw *blockStreamWrit
 		logger.Panicf("BUG: unknown partType=%d", dstPartType)
 	}
 	retentionDeadline := currentTimestamp - pt.s.retentionMsecs
+	if pt.s.downsamplingEnabled {
+		// 内存输出保持原生格式，但必须保留后续降采样所需的完整 bucket 前缀。
+		retentionDeadline = downsampleRetentionStart(pt.s.getDownsamplingConfig(), retentionDeadline)
+	}
 	activeMerges.Add(1)
 	_ = useSparseCache // unused in OSS version.
 	dmis := pt.idb.getDeletedMetricIDs()
@@ -1587,21 +1711,21 @@ func (pt *partition) removeStaleParts() {
 	var pws []*partWrapper
 	pt.partsLock.Lock()
 	for _, pw := range pt.inmemoryParts {
-		if !pw.isInMerge && pw.p.ph.MaxTimestamp < retentionDeadline {
+		if !pw.isInMerge && pt.partExpired(pw.p, retentionDeadline) {
 			pt.inmemoryRowsDeleted.Add(pw.p.ph.RowsCount)
 			pw.isInMerge = true
 			pws = append(pws, pw)
 		}
 	}
 	for _, pw := range pt.smallParts {
-		if !pw.isInMerge && pw.p.ph.MaxTimestamp < retentionDeadline {
+		if !pw.isInMerge && pt.partExpired(pw.p, retentionDeadline) {
 			pt.smallRowsDeleted.Add(pw.p.ph.RowsCount)
 			pw.isInMerge = true
 			pws = append(pws, pw)
 		}
 	}
 	for _, pw := range pt.bigParts {
-		if !pw.isInMerge && pw.p.ph.MaxTimestamp < retentionDeadline {
+		if !pw.isInMerge && pt.partExpired(pw.p, retentionDeadline) {
 			pt.bigRowsDeleted.Add(pw.p.ph.RowsCount)
 			pw.isInMerge = true
 			pws = append(pws, pw)

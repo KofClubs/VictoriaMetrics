@@ -28,7 +28,7 @@ func benchmarkSearchData(b *testing.B, s *Storage, tr TimeRange, mrs []MetricRow
 	for b.Loop() {
 		mbs = mbs[:0]
 		var search Search
-		search.Init(nil, s, []*TagFilters{tfss}, tr, 1e9, noDeadline)
+		search.Init(nil, s, []*TagFilters{tfss}, tr, 1e9, noDeadline, nil)
 		for search.NextMetricBlock() {
 			var (
 				block Block

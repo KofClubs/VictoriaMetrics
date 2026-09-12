@@ -230,7 +230,7 @@ func testPartitionSearchSerial(pt *partition, tsids []TSID, tr TimeRange, rbsExp
 
 	bs := []Block{}
 	var pts partitionSearch
-	pts.Init(pt, tsids, tr)
+	pts.Init(pt, tsids, tr, nil)
 	for pts.NextBlock() {
 		var b Block
 		pts.BlockRef.MustReadBlock(&b)
@@ -254,7 +254,7 @@ func testPartitionSearchSerial(pt *partition, tsids []TSID, tr TimeRange, rbsExp
 	}
 
 	// verify that empty tsids returns empty result
-	pts.Init(pt, []TSID{}, tr)
+	pts.Init(pt, []TSID{}, tr, nil)
 	if pts.NextBlock() {
 		return fmt.Errorf("unexpected block got for an empty tsids list: %+v", pts.BlockRef)
 	}

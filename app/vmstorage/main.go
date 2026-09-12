@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -63,10 +64,11 @@ var (
 		"when -search.maxConcurrentRequests limit is reached")
 	vmselectDisableRPCCompression = flag.Bool("rpc.disableCompression", false, "Whether to disable compression of the data sent from vmstorage to vmselect. "+
 		"This reduces CPU usage at the cost of higher network bandwidth usage")
-	snapshotAuthKey   = flagutil.NewPassword("snapshotAuthKey", "authKey, which must be passed in query string to /snapshot* pages. It overrides -httpAuth.*")
-	forceMergeAuthKey = flagutil.NewPassword("forceMergeAuthKey", "authKey, which must be passed in query string to /internal/force_merge pages. It overrides -httpAuth.*")
-	forceFlushAuthKey = flagutil.NewPassword("forceFlushAuthKey", "authKey, which must be passed in query string to /internal/force_flush pages. It overrides -httpAuth.*")
-	_                 = flag.Duration("snapshotCreateTimeout", 0, "Deprecated: this flag does nothing")
+	snapshotAuthKey           = flagutil.NewPassword("snapshotAuthKey", "authKey, which must be passed in query string to /snapshot* pages. It overrides -httpAuth.*")
+	forceMergeAuthKey         = flagutil.NewPassword("forceMergeAuthKey", "authKey, which must be passed in query string to /internal/force_merge pages. It overrides -httpAuth.*")
+	forceFlushAuthKey         = flagutil.NewPassword("forceFlushAuthKey", "authKey, which must be passed in query string to /internal/force_flush pages. It overrides -httpAuth.*")
+	downsamplingConfigAuthKey = flagutil.NewPassword("downsamplingConfigAuthKey", "Additional authKey required for /internal/downsampling/config; global -httpAuth.* authentication also applies")
+	_                         = flag.Duration("snapshotCreateTimeout", 0, "Deprecated: this flag does nothing")
 
 	_ = flag.Duration("finalMergeDelay", 0, "Deprecated: this flag does nothing")
 	_ = flag.Int("bigMergeConcurrency", 0, "Deprecated: this flag does nothing")
@@ -77,6 +79,8 @@ var (
 		"If set to 2h, then the indexdb rotation is performed at 4am EET time (the timezone with +2h offset)")
 	minScrapeInterval = flag.Duration("dedup.minScrapeInterval", 0, "Leave only the last sample in every time series per each discrete interval "+
 		"equal to -dedup.minScrapeInterval > 0. See also -streamAggr.dedupInterval and https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#deduplication")
+	downsamplingEnabled       = flag.Bool("storage.downsampling.enabled", false, "Enable file downsampling with last, sum, count, min and max; requires -dedup.minScrapeInterval=0")
+	downsamplingConfigJSON    = flag.String("storage.downsampling.config", "", "Inline JSON with base_resolution and tenant_resolutions; default is a 5m base only. Runtime tenant updates apply until restart")
 	inmemoryDataFlushInterval = flag.Duration("inmemoryDataFlushInterval", 5*time.Second, "The interval for guaranteed saving of in-memory data to disk. "+
 		"The saved data survives unclean shutdowns such as OOM crash, hardware reset, SIGKILL, etc. "+
 		"Bigger intervals may help increase the lifetime of flash storage with limited write cycles (e.g. Raspberry PI). "+
@@ -155,6 +159,17 @@ func main() {
 	logger.Init()
 
 	storage.SetDedupInterval(*minScrapeInterval)
+	var downsamplingConfig *storage.DownsamplingConfig
+	if *downsamplingConfigJSON != "" {
+		var err error
+		downsamplingConfig, err = storage.ParseDownsamplingConfig([]byte(*downsamplingConfigJSON))
+		if err != nil {
+			logger.Fatalf("[downsampling] invalid -storage.downsampling.config: %s", err)
+		}
+	}
+	if *downsamplingEnabled && storage.GetDedupInterval() != 0 {
+		logger.Fatalf("[downsampling] -storage.downsampling.enabled requires -dedup.minScrapeInterval=0; got %s", *minScrapeInterval)
+	}
 	storage.SetDataFlushInterval(*inmemoryDataFlushInterval)
 	storage.LegacySetRetentionTimezoneOffset(*retentionTimezoneOffset)
 	storage.SetFreeDiskSpaceLimit(minFreeDiskSpaceBytes.N)
@@ -196,6 +211,8 @@ func main() {
 		TrackMetricNamesStats:       *trackMetricNamesStats,
 		IDBPrefillStart:             *idbPrefillStart,
 		LogNewSeries:                *logNewSeries,
+		DownsamplingEnabled:         *downsamplingEnabled,
+		DownsamplingConfig:          downsamplingConfig,
 	}
 	strg := storage.MustOpenStorage(*storageDataPath, opts)
 	vmStorage := newVMStorage(strg, *vmselectMaxConcurrentRequests)
@@ -306,6 +323,42 @@ func (vms *VMStorage) requestHandler(w http.ResponseWriter, r *http.Request) boo
 			}
 			logger.Infof("forced merge for partition_prefix=%q has been successfully finished in %.3f seconds", partitionNamePrefix, time.Since(startTime).Seconds())
 		}()
+		return true
+	}
+	if path == "/internal/downsampling/config" {
+		if !httpserver.CheckAuthFlag(w, r, downsamplingConfigAuthKey) {
+			return true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+		case http.MethodPut:
+			data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+			if err != nil {
+				err = fmt.Errorf("[downsampling] cannot read configuration request body: %w", err)
+			}
+			var config *storage.DownsamplingConfig
+			if err == nil {
+				config, err = storage.ParseDownsamplingConfig(data)
+			}
+			if err == nil {
+				err = vms.s.UpdateDownsamplingConfig(config)
+			}
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprintf(w, `{"status":"error","msg":%s}`, stringsutil.JSONString(err.Error()))
+				return true
+			}
+		default:
+			w.Header().Set("Allow", "GET, PUT")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			fmt.Fprint(w, `{"status":"error","msg":"[downsampling] only GET and PUT are supported"}`)
+			return true
+		}
+		_ = json.NewEncoder(w).Encode(struct {
+			Status string                      `json:"status"`
+			Data   *storage.DownsamplingConfig `json:"data"`
+		}{Status: "success", Data: vms.s.GetDownsamplingConfig()})
 		return true
 	}
 	if path == "/internal/force_flush" {

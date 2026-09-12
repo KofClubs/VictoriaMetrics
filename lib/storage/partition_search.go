@@ -55,12 +55,13 @@ func (pts *partitionSearch) reset() {
 }
 
 // Init initializes the search in the given partition for the given tsid and tr.
+// downsampleQuery is passed through to each part search.
 //
 // tsids must be sorted.
 // tsids cannot be modified after the Init call, since it is owned by pts.
 //
 // MustClose must be called when partition search is done.
-func (pts *partitionSearch) Init(pt *partition, tsids []TSID, tr TimeRange) {
+func (pts *partitionSearch) Init(pt *partition, tsids []TSID, tr TimeRange, downsampleQuery *DownsampleQuery) {
 	if pts.needClosing {
 		logger.Panicf("BUG: missing partitionSearch.MustClose call before the next call to Init")
 	}
@@ -103,7 +104,7 @@ func (pts *partitionSearch) Init(pt *partition, tsids []TSID, tr TimeRange) {
 	// Initialize psPool.
 	pts.psPool = slicesutil.SetLength(pts.psPool, len(pts.pws))
 	for i, pw := range pts.pws {
-		pts.psPool[i].Init(pw.p, filteredTSIDs, tr)
+		pts.psPool[i].Init(pw.p, filteredTSIDs, tr, downsampleQuery)
 	}
 
 	// Initialize the psHeap.

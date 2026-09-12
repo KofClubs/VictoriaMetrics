@@ -243,7 +243,7 @@ func testTableSearchSerial(tb *table, tsids []TSID, tr TimeRange, rbsExpected []
 
 	bs := []Block{}
 	var ts tableSearch
-	ts.Init(tb, tsids, tr)
+	ts.Init(tb, tsids, tr, nil)
 	for ts.NextBlock() {
 		var b Block
 		ts.BlockRef.MustReadBlock(&b)
@@ -267,7 +267,7 @@ func testTableSearchSerial(tb *table, tsids []TSID, tr TimeRange, rbsExpected []
 	}
 
 	// verify that empty tsids returns empty result
-	ts.Init(tb, []TSID{}, tr)
+	ts.Init(tb, []TSID{}, tr, nil)
 	if ts.NextBlock() {
 		return fmt.Errorf("unexpected block got for an empty tsids list: %+v", ts.BlockRef)
 	}

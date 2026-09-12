@@ -577,7 +577,7 @@ func TestStorageDeletePendingSeries(t *testing.T) {
 		var search Search
 		defer search.MustClose()
 
-		search.Init(nil, s, []*TagFilters{tfs}, TimeRange{start.UnixMilli(), math.MaxInt64}, 1e5, noDeadline)
+		search.Init(nil, s, []*TagFilters{tfs}, TimeRange{start.UnixMilli(), math.MaxInt64}, 1e5, noDeadline, nil)
 		n := 0
 		for search.NextMetricBlock() {
 			var b Block
@@ -732,7 +732,7 @@ func testStorageDeleteSeriesForWorker(workerNum int, s *Storage, tr TimeRange) e
 
 	countMetricBlocks := func(tfs *TagFilters) (int, error) {
 		var sr Search
-		sr.Init(nil, s, []*TagFilters{tfs}, tr, 1e5, noDeadline)
+		sr.Init(nil, s, []*TagFilters{tfs}, tr, 1e5, noDeadline, nil)
 		defer sr.MustClose()
 		n := 0
 		for sr.NextMetricBlock() {
@@ -4466,7 +4466,7 @@ func TestStorageMetricTracker(t *testing.T) {
 		t.Fatalf("unexpected error at tfs add: %s", err)
 	}
 
-	sr.Init(nil, s, []*TagFilters{tfs}, tr, 1e5, noDeadline)
+	sr.Init(nil, s, []*TagFilters{tfs}, tr, 1e5, noDeadline, nil)
 	for sr.NextMetricBlock() {
 	}
 	sr.MustClose()

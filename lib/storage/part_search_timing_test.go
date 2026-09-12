@@ -45,7 +45,7 @@ func benchmarkPartSearch(b *testing.B, p *part, tsids []TSID, tr TimeRange, spar
 		var ps partSearch
 		for pb.Next() {
 			blocksRead := 0
-			ps.Init(p, tsids, tr)
+			ps.Init(p, tsids, tr, nil)
 			for ps.NextBlock() {
 				blocksRead++
 			}

@@ -39,9 +39,16 @@ type partSearch struct {
 	indexBuf           []byte
 
 	err error
+
+	// 当前查询分辨率和特征对应的剩余 metaindex；不持有 merge reader 或额外文件句柄。
+	dsMetaindex []downsampleMetaindexRow
+	// dsMetaindexRanges 按租户 TSID 顺序保存后续索引区间，各租户只选择一个已持久化的源分辨率。
+	dsMetaindexRanges [][]downsampleMetaindexRow
 }
 
 func (ps *partSearch) reset() {
+	ps.dsMetaindex = nil
+	ps.dsMetaindexRanges = nil
 	ps.BlockRef.reset()
 	ps.p = nil
 	ps.tsids = nil
@@ -58,10 +65,11 @@ var isInTest = func() bool {
 }()
 
 // Init initializes the ps with the given p, tsids and tr.
+// downsampleQuery selects a stored resolution and feature; nil searches raw data.
 //
 // tsids must be sorted.
 // tsids cannot be modified after the Init call, since it is owned by ps.
-func (ps *partSearch) Init(p *part, tsids []TSID, tr TimeRange) {
+func (ps *partSearch) Init(p *part, tsids []TSID, tr TimeRange, downsampleQuery *DownsampleQuery) {
 	ps.reset()
 	ps.p = p
 
@@ -74,6 +82,24 @@ func (ps *partSearch) Init(p *part, tsids []TSID, tr TimeRange) {
 	}
 	ps.tr = tr
 	ps.metaindex = p.metaindex
+	if downsampleQuery != nil {
+		if !downsampleQuery.valid() {
+			ps.err = fmt.Errorf("[downsampling] invalid query resolution or feature")
+			return
+		}
+		// 指定分辨率和特征时只查询对应的降采样数据，原始值不能作为 sum 或 count 返回。
+		if p.dsMetadata == nil {
+			ps.err = io.EOF
+			return
+		}
+		if err := ps.initDownsampleQuery(downsampleQuery); err != nil {
+			ps.err = err
+			return
+		}
+	} else if p.dsMetadata != nil {
+		ps.err = io.EOF
+		return
+	}
 
 	// Advance to the first tsid. There is no need in checking
 	// the returned result, since it will be checked in NextBlock.
@@ -148,6 +174,9 @@ func (ps *partSearch) skipTSIDsSmallerThan(tsid *TSID) bool {
 }
 
 func (ps *partSearch) nextBHS() bool {
+	if ps.p.dsMetadata != nil {
+		return ps.nextDownsampleBHS()
+	}
 	for len(ps.metaindex) > 0 {
 		// Optimization: skip tsid values smaller than the minimum value from ps.metaindex.
 		if !ps.skipTSIDsSmallerThan(&ps.metaindex[0].TSID) {
@@ -270,7 +299,7 @@ func (ps *partSearch) searchBHS() bool {
 
 		// Invariant: tsid <= bh.TSID
 
-		if bh.TSID.MetricID != tsid.MetricID {
+		if bh.TSID.MetricID != tsid.MetricID || (ps.p.dsMetadata != nil && bh.TSID != *tsid) {
 			// tsid < bh.TSID: no more blocks with the given tsid.
 			// Proceed to the next (bigger) tsid.
 			if !ps.skipTSIDsSmallerThan(&bh.TSID) {

@@ -2487,13 +2487,13 @@ func (sn *storageNode) processSearchMetricNames(qt *querytracer.Tracer, requestD
 	return metricNames, nil
 }
 
-func (sn *storageNode) processSearchQuery(qt *querytracer.Tracer, requestData []byte, processBlock func(rawBlock []byte, workerID uint) error,
+func (sn *storageNode) processSearchQuery(qt *querytracer.Tracer, rpcName string, requestData []byte, processBlock func(rawBlock []byte, workerID uint) error,
 	workerID uint, deadline searchutil.Deadline,
 ) error {
 	f := func(bc *handshake.BufferedConn) error {
 		return sn.processSearchQueryOnConn(bc, requestData, processBlock, workerID)
 	}
-	return sn.execOnConnWithPossibleRetry(qt, "search_v7", f, deadline)
+	return sn.execOnConnWithPossibleRetry(qt, rpcName, f, deadline)
 }
 
 func (sn *storageNode) execOnConnWithPossibleRetry(qt *querytracer.Tracer, funcName string, f func(bc *handshake.BufferedConn) error, deadline searchutil.Deadline) error {
@@ -3386,13 +3386,23 @@ func execSearchQueryRequest(qt *querytracer.Tracer, sq *storage.SearchQuery, wor
 
 	for i := range sq.TenantTokens {
 		requestData = sq.TenantTokens[i].Marshal(requestData)
-		requestData = sq.MarshalWithoutTenant(requestData)
+		rpcName := "search_v7"
+		if sq.DownsampleQuery == nil {
+			requestData = sq.MarshalWithoutTenant(requestData)
+		} else {
+			rpcName = "search_downsampling_v2"
+			var err error
+			requestData, err = sq.MarshalDownsampleWithoutTenant(requestData)
+			if err != nil {
+				return err
+			}
+		}
 		qtL := qt
 		if sq.IsMultiTenant && qt.Enabled() {
 			qtL = qt.NewChild("query for tenant: %s", sq.TenantTokens[i].String())
 		}
 		sn.searchRequests.Inc()
-		if err := sn.processSearchQuery(qtL, requestData, f, workerID, deadline); err != nil {
+		if err := sn.processSearchQuery(qtL, rpcName, requestData, f, workerID, deadline); err != nil {
 			sn.searchErrors.Inc()
 			if sq.IsMultiTenant {
 				qtL.Done()
