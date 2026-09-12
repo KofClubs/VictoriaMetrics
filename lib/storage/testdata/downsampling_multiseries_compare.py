@@ -16,6 +16,8 @@ import urllib.request
 
 sys.dont_write_bytecode = True
 
+from downsampling_inspect import validate_metadata
+
 from downsampling_compare import (FEATURES, INPUT_STEPS_MS, RESOLUTIONS, Server, binary_manifest,
                                   metric_value, range_expected, request, sample_timestamps, write_json)
 
@@ -35,8 +37,8 @@ def labels_key(labels):
 
 
 class MultiServer(Server):
-    def __init__(self, name, binary, root, downsampling, mode="single", tenant="0:0"):
-        super().__init__(name, binary, root, downsampling, mode, tenant)
+    def __init__(self, name, binary, root, downsampling, mode="single", tenant="0:0", downsampling_config=None):
+        super().__init__(name, binary, root, downsampling, mode, tenant, downsampling_config)
         if self.cluster is not None:
             self.cluster.large_queries()
             return
@@ -55,13 +57,7 @@ class MultiServer(Server):
                 for name in manifest.get(kind) or []:
                     path = self.storage / "data" / kind.lower() / partition / name
                     metadata = json.loads((path / "metadata.json").read_text())
-                    if self.downsampling:
-                        assert metadata.get("Mode") == "downsampling", metadata
-                        assert metadata.get("FormatVersion") == 2, metadata
-                        assert metadata.get("SemanticsVersion") == 2, metadata
-                        assert metadata.get("NumericCodec") == "decimal-values", metadata
-                    else:
-                        assert metadata.get("Mode") != "downsampling", metadata
+                    assert validate_metadata(metadata) == self.downsampling, metadata
                     partitions[partition] = partitions.get(partition, 0) + 1
                     parts.append({"partition": partition, "path": str(path), "metadata": metadata,
                                   "files": {item.name: item.stat().st_size for item in path.iterdir()
@@ -107,7 +103,7 @@ class MultiServer(Server):
             path = "/api/v1/query"
             params.update({"query": selector + "[" + str(end - start + 1) + "ms]", "time": end / 1000})
         if feature is not None:
-            params.update({"query.resolution": resolution, "query.feature": feature})
+            params.update({"resolution": resolution, "feature": feature})
         name = "-".join(filter(None, (stage, case, resolution, feature, "range" if range_query else "matrix")))
         write_json(self.root / (name + "-request.json"), {"path": path, "url": self.url(path), "params": params})
         url = self.url(path) + "?" + urllib.parse.urlencode(params)

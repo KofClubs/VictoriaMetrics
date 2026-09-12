@@ -22,6 +22,56 @@ import (
 	"time"
 )
 
+const (
+	downsampleResolution5m int64 = 300000
+	downsampleResolution1h int64 = 3600000
+)
+
+var downsampleResolutions = [2]int64{downsampleResolution5m, downsampleResolution1h}
+
+// downsampleTestConfig 显式保留旧测试的 5m/1h 输入，生产默认配置仅包含 base。
+func downsampleTestConfig(t testing.TB, tenants ...TenantToken) *DownsamplingConfig {
+	t.Helper()
+	wire := downsamplingConfigJSON{BaseResolution: "5m", TenantResolutions: []downsamplingTenantConfigJSON{}}
+	seen := make(map[TenantToken]bool)
+	for _, tenant := range append([]TenantToken{{}}, tenants...) {
+		if !seen[tenant] {
+			seen[tenant] = true
+			wire.TenantResolutions = append(wire.TenantResolutions, downsamplingTenantConfigJSON{Tenant: fmt.Sprintf("%d:%d", tenant.AccountID, tenant.ProjectID), Resolutions: []string{"1h"}})
+		}
+	}
+	data, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := ParseDownsamplingConfig(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return config
+}
+
+func downsampleTestConfigForParts(t testing.TB, parts []*partWrapper) *DownsamplingConfig {
+	t.Helper()
+	var tenants []TenantToken
+	for _, source := range parts {
+		reader := getDownsampleReader()
+		if err := reader.Init(source.p, downsampleResolution5m); err != nil {
+			t.Fatal(err)
+		}
+		for reader.NextHeader() {
+			tsid := reader.Header().TSID
+			tenants = append(tenants, TenantToken{AccountID: tsid.AccountID, ProjectID: tsid.ProjectID})
+		}
+		err := reader.Error()
+		err = errors.Join(err, putDownsampleReader(reader))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return downsampleTestConfig(t, tenants...)
+}
+
 func TestDownsampleClusterTenantIsolation(t *testing.T) {
 	const base int64 = 1704067200000
 	tsids := []TSID{
@@ -136,6 +186,7 @@ func TestDownsampleStorageLifecycle(t *testing.T) {
 
 	// 启用后读取合法 raw 格式；尚未参与 merge 的 raw 文件无需预先迁移。
 	opts.DownsamplingEnabled = true
+	opts.DownsamplingConfig = downsampleTestConfig(t)
 	s = MustOpenStorage(path, opts)
 	assertDownsampleTestStorageFormats(t, s, true, false)
 	late := []MetricRow{
@@ -197,7 +248,11 @@ func writeFileTestDownsamplePart(t *testing.T, blocks ...*downsampleDecodedResol
 	path := filepath.Join(t.TempDir(), "part")
 	w := getDownsampleWriter()
 	defer putDownsampleWriter(w)
-	if err := w.Init(path, 1); err != nil {
+	var tenants []TenantToken
+	for _, block := range blocks {
+		tenants = append(tenants, TenantToken{AccountID: block.tsid.AccountID, ProjectID: block.tsid.ProjectID})
+	}
+	if err := w.Init(path, 1, downsampleTestConfig(t, tenants...)); err != nil {
 		t.Fatal(err)
 	}
 	for _, b := range blocks {
@@ -205,7 +260,7 @@ func writeFileTestDownsamplePart(t *testing.T, blocks ...*downsampleDecodedResol
 			t.Fatal(err)
 		}
 	}
-	if _, err := w.Finish(); err != nil {
+	if _, err := w.Finish(nil); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -214,7 +269,7 @@ func writeFileTestDownsamplePart(t *testing.T, blocks ...*downsampleDecodedResol
 // 使用真实 Storage/IndexDB 和源文件，但作业集合独立于后台 partition。
 func newDownsampleFailurePartition(t *testing.T) (*partition, int64) {
 	t.Helper()
-	s := MustOpenStorage(t.TempDir(), OpenOptions{DownsamplingEnabled: true})
+	s := MustOpenStorage(t.TempDir(), OpenOptions{DownsamplingEnabled: true, DownsamplingConfig: downsampleTestConfig(t, TenantToken{AccountID: 11, ProjectID: 17})})
 	t.Cleanup(s.MustClose)
 	base := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour).UnixMilli()
 	ptw := s.tb.MustGetPartition(base)
@@ -348,7 +403,12 @@ func newDownsampleIterationPart(t *testing.T) *part {
 	path := filepath.Join(t.TempDir(), "part")
 	w := getDownsampleWriter()
 	defer putDownsampleWriter(w)
-	if err := w.Init(path, 1); err != nil {
+	var tenants []TenantToken
+	for series := 0; series < downsampleIterationSeries; series++ {
+		tsid := downsampleIterationTSID(series)
+		tenants = append(tenants, TenantToken{AccountID: tsid.AccountID, ProjectID: tsid.ProjectID})
+	}
+	if err := w.Init(path, 1, downsampleTestConfig(t, tenants...)); err != nil {
 		t.Fatal(err)
 	}
 	w.maxIndexBlockSize = (downsampleIterationWideSeries + 1) * marshaledBlockHeaderSize
@@ -376,10 +436,10 @@ func newDownsampleIterationPart(t *testing.T) *part {
 			}
 		}
 	}
-	if _, err := w.Finish(); err != nil {
+	if _, err := w.Finish(nil); err != nil {
 		t.Fatal(err)
 	}
-	p, err := openDownsamplePart(path)
+	p, err := openDownsamplePart(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +578,7 @@ func checkDownsampleIterationReader(t *testing.T, r *downsampleReader, p *part, 
 
 func assertDownsampleLayoutOpenRejected(t *testing.T, path, message string) {
 	t.Helper()
-	p, err := openDownsamplePart(path)
+	p, err := openDownsamplePart(path, nil)
 	if err == nil {
 		p.MustClose()
 		t.Fatal("打开时未拒绝损坏的 index")
@@ -601,7 +661,7 @@ func writeDownsampleCrossIndexPart(t *testing.T) string {
 	path := filepath.Join(t.TempDir(), "part")
 	w := getDownsampleWriter()
 	defer putDownsampleWriter(w)
-	if err := w.Init(path, 1); err != nil {
+	if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 		t.Fatal(err)
 	}
 	// WriteSamples 暂存各 feature，实际切 index 发生在 flushResolution。
@@ -624,7 +684,7 @@ func writeDownsampleCrossIndexPart(t *testing.T) string {
 			}
 		}
 	}
-	if _, err := w.Finish(); err != nil {
+	if _, err := w.Finish(nil); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -803,23 +863,13 @@ func assertDownsampleTestHeaderPrecision(t *testing.T, r *downsampleReader, want
 	}
 }
 
-type downsampleStateObserverWriter struct {
-	filestream.WriteCloser
-	observe func()
-}
-
-func (w *downsampleStateObserverWriter) Write(b []byte) (int, error) {
-	w.observe()
-	return w.WriteCloser.Write(b)
-}
-
 func roundTripDownsampleTestReferenceBlock(t *testing.T, source *downsampleDecodedResolutionFeaturesBlock) *downsampleDecodedResolutionFeaturesBlock {
 	t.Helper()
 	result := &downsampleDecodedResolutionFeaturesBlock{
 		tsid: source.tsid, resolution: source.resolution,
 		precisionBits: source.precisionBits,
 	}
-	data, marshalType, first := encoding.MarshalTimestamps(nil, source.timestamps, source.precisionBits)
+	data, marshalType, first := encoding.MarshalTimestamps(nil, source.timestamps, 64)
 	var err error
 	result.timestamps, err = encoding.UnmarshalTimestamps(nil, data, marshalType, first, len(source.timestamps))
 	if err != nil {
@@ -887,12 +937,18 @@ func newDownsampleTestOverlappingPart(t *testing.T, blocks [][]rawRow) *partWrap
 	return pw
 }
 
-func runDownsampleTestMerge(t *testing.T, m *downsampleMerger, sources []*partWrapper, deleted *uint64set.Set, deadline int64) (*partWrapper, downsampleMergeStats) {
+func runDownsampleTestMerge(t *testing.T, m *downsampleMerger, sources []*partWrapper, deleted *uint64set.Set, deadline int64, configs ...*DownsamplingConfig) (*partWrapper, downsampleMergeStats) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "part")
 	w := getDownsampleWriter()
 	defer putDownsampleWriter(w)
-	if err := w.Init(path, -5); err != nil {
+	var config *DownsamplingConfig
+	if len(configs) == 0 {
+		config = downsampleTestConfigForParts(t, sources)
+	} else {
+		config = configs[0]
+	}
+	if err := w.Init(path, -5, config); err != nil {
 		t.Fatal(err)
 	}
 	stats, err := m.Merge(sources, w, nil, deleted, deadline)
@@ -900,11 +956,11 @@ func runDownsampleTestMerge(t *testing.T, m *downsampleMerger, sources []*partWr
 		w.Abort()
 		t.Fatalf("cannot merge: %s", err)
 	}
-	if _, err := w.Finish(); err != nil {
+	if _, err := w.Finish(nil); err != nil {
 		w.Abort()
 		t.Fatalf("cannot finish merged part: %s", err)
 	}
-	p, err := openDownsamplePart(path)
+	p, err := openDownsamplePart(path, nil)
 	if err != nil {
 		t.Fatalf("cannot open merged part: %s", err)
 	}
@@ -914,6 +970,17 @@ func runDownsampleTestMerge(t *testing.T, m *downsampleMerger, sources []*partWr
 	return pw, stats
 }
 
+// downsamplePartResolutionsForTest 从有序索引提取实际分辨率，供文件内容断言和测试读回使用。
+func downsamplePartResolutionsForTest(p *part) []int64 {
+	var resolutions []int64
+	for _, row := range p.dsMetaindex {
+		if len(resolutions) == 0 || resolutions[len(resolutions)-1] != row.ResolutionMs {
+			resolutions = append(resolutions, row.ResolutionMs)
+		}
+	}
+	return resolutions
+}
+
 func readDownsampleTestPart(t *testing.T, p *part) map[downsampleTestKey]downsampleSample {
 	t.Helper()
 	result := make(map[downsampleTestKey]downsampleSample)
@@ -921,7 +988,7 @@ func readDownsampleTestPart(t *testing.T, p *part) map[downsampleTestKey]downsam
 	defer putDownsampleReader(r)
 	b := getDownsampleDecodedResolutionFeaturesBlock()
 	defer putDownsampleDecodedResolutionFeaturesBlock(b)
-	for _, resolution := range downsampleResolutions {
+	for _, resolution := range downsamplePartResolutionsForTest(p) {
 		if err := r.Init(p, resolution); err != nil {
 			t.Fatal(err)
 		}
@@ -948,14 +1015,18 @@ func readDownsampleTestPart(t *testing.T, p *part) map[downsampleTestKey]downsam
 	return result
 }
 
-func referenceDownsampleTestRows(rows []rawRow, deleted *uint64set.Set, deadline int64) map[downsampleTestKey]downsampleSample {
+func referenceDownsampleTestRows(rows []rawRow, deleted *uint64set.Set, deadline int64, configs ...*DownsamplingConfig) map[downsampleTestKey]downsampleSample {
 	groups := make(map[downsampleTestKey][]downsampleTestSample)
 	precisions := make(map[downsampleTestKey]uint8)
 	for _, row := range rows {
 		if deleted != nil && deleted.Has(row.TSID.MetricID) {
 			continue
 		}
-		for _, resolution := range downsampleResolutions {
+		resolutions := downsampleResolutions[:]
+		if len(configs) != 0 {
+			resolutions = configs[0].ResolutionsForTenant(row.TSID.AccountID, row.TSID.ProjectID)
+		}
+		for _, resolution := range resolutions {
 			bucket := row.Timestamp / resolution
 			if (bucket+1)*resolution <= deadline {
 				continue
@@ -977,7 +1048,7 @@ func referenceDownsampleTestRows(rows []rawRow, deleted *uint64set.Set, deadline
 func assertDownsampleTestRows(t *testing.T, got, want map[downsampleTestKey]downsampleSample) {
 	t.Helper()
 	if len(got) != len(want) {
-		t.Fatalf("unexpected summary rows; got %d; want %d\ngot: %+v\nwant: %+v", len(got), len(want), got, want)
+		t.Fatalf("unexpected downsample rows; got %d; want %d", len(got), len(want))
 	}
 	for key, expected := range want {
 		actual, ok := got[key]
@@ -1015,7 +1086,7 @@ func createDownsampleOpenTestSummary(t *testing.T, path string) {
 	}
 	w := getDownsampleWriter()
 	defer putDownsampleWriter(w)
-	if err := w.Init(path, 1); err != nil {
+	if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 		t.Fatal(err)
 	}
 	for _, resolution := range downsampleResolutions {
@@ -1030,7 +1101,7 @@ func createDownsampleOpenTestSummary(t *testing.T, path string) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := w.Finish(); err != nil {
+	if _, err := w.Finish(nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1232,18 +1303,6 @@ func assertDownsampleFilesClosed(t *testing.T, files []filestream.ReadAtCloser) 
 	}
 }
 
-type downsampleCloseTestWriter struct {
-	filestream.WriteCloser
-	beforeWrite func() error
-}
-
-func (w *downsampleCloseTestWriter) Write(b []byte) (int, error) {
-	if err := w.beforeWrite(); err != nil {
-		return 0, err
-	}
-	return w.WriteCloser.Write(b)
-}
-
 func sharedTimestampsTestBlock(tsid uint64, resolution, base int64, rows int, precision uint8) *downsampleDecodedResolutionFeaturesBlock {
 	b := &downsampleDecodedResolutionFeaturesBlock{
 		tsid: TSID{MetricID: tsid}, resolution: resolution, precisionBits: precision,
@@ -1267,7 +1326,7 @@ func downsampleSpaceBoundReference(rows, blocks uint64) uint64 {
 	// Final payload: 60 bytes/row; spill values: 50 bytes/row.
 	// Each batch has five independent index frames, metaindex rows and spill headers.
 	const bytesPerBatch = 5 * ((2*89 + 256 + 8) + (2*113 + 256 + 8) + 89)
-	total := new(big.Int).Mul(new(big.Int).SetUint64(rows), big.NewInt(110))
+	total := new(big.Int).Mul(new(big.Int).SetUint64(rows), big.NewInt(120))
 	total.Add(total, new(big.Int).Mul(new(big.Int).SetUint64(blocks), big.NewInt(bytesPerBatch)))
 	total.Add(total, big.NewInt(64<<10))
 	if !total.IsUint64() {
@@ -1416,16 +1475,16 @@ func newDownsampleBenchmarkFile(b *testing.B, sources []*partWrapper, path strin
 	defer putDownsampleMerger(m)
 	w := getDownsampleWriter()
 	defer putDownsampleWriter(w)
-	if err := w.Init(path, -5); err != nil {
+	if err := w.Init(path, -5, downsampleTestConfigForParts(b, sources)); err != nil {
 		b.Fatal(err)
 	}
 	if _, err := m.Merge(sources, w, nil, nil, 0); err != nil {
 		b.Fatal(err)
 	}
-	if _, err := w.Finish(); err != nil {
+	if _, err := w.Finish(nil); err != nil {
 		b.Fatal(err)
 	}
-	p, err := openDownsamplePart(path)
+	p, err := openDownsamplePart(path, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -1492,6 +1551,7 @@ type failingDownsampleFile struct {
 	writeErr   error
 	shortWrite bool
 	closes     int
+	afterWrite func() // 在成功写入后触发实例级观察或取消。
 	afterClose func() // 观察真实文件关闭后的状态，或模拟该时刻进程中断。
 }
 
@@ -1502,7 +1562,11 @@ func (f *failingDownsampleFile) Write(b []byte) (int, error) {
 	if f.shortWrite && len(b) > 0 {
 		return len(b) - 1, nil
 	}
-	return f.WriteCloser.Write(b)
+	n, err := f.WriteCloser.Write(b)
+	if err == nil && f.afterWrite != nil {
+		f.afterWrite()
+	}
+	return n, err
 }
 
 func (f *failingDownsampleFile) MustClose() {
@@ -1524,12 +1588,14 @@ func assertDownsampleWriterAborted(t *testing.T, w *downsampleWriter, path strin
 	if w.timestampsWriter != nil || w.valuesWriter != nil || w.indexWriter != nil || w.metaindexWriter != nil {
 		t.Fatal("failed writer retained a final-file handle")
 	}
-	for _, spill := range w.currentResolutionFeatureSpills {
-		if spill != nil {
-			t.Fatal("failed writer retained a spill")
+	for _, resolution := range w.partResolutionSpills {
+		for _, spill := range resolution.featureSpills {
+			if spill != nil {
+				t.Fatal("failed writer retained a spill")
+			}
 		}
 	}
-	if _, err := w.Finish(); !errors.Is(err, cause) {
+	if _, err := w.Finish(nil); !errors.Is(err, cause) {
 		t.Fatalf("Finish lost the failure or accepted partial output: %v", err)
 	}
 	if err := writeDownsampleTestBlock(w, fileTestDownsampleBlock(2, 300000)); !errors.Is(err, cause) {
@@ -1569,4 +1635,18 @@ type downsampleIndexReadTestFile struct {
 func (f *downsampleIndexReadTestFile) ReadAt(dst []byte, offset int64) (int, error) {
 	f.offsets = append(f.offsets, offset)
 	return f.ReadAtCloser.ReadAt(dst, offset)
+}
+
+// 源派生列不参加新计算；统计只覆盖实际消费的 base 五列。
+func downsampleBasePhysicalRowsForTest(p *part) uint64 {
+	if p.dsMetadata == nil {
+		return p.ph.RowsCount
+	}
+	var rows uint64
+	for _, row := range p.dsMetaindex {
+		if row.ResolutionMs == p.dsMetadata.DownsamplingConfig.BaseResolutionMs() {
+			rows += row.RowsCount
+		}
+	}
+	return rows
 }

@@ -2,11 +2,14 @@ package storage
 
 import (
 	"bytes"
+	"container/heap"
+	"errors"
 	"flag"
 	"fmt"
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,7 +17,136 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
 )
+
+func TestDownsampleQueryMemoryBudget(t *testing.T) {
+	limiter := &memory.Limiter{MaxSize: downsampleQueryMapMemory + 2*downsampleQueryBucketMemory}
+	q := &downsampleQueryState{selector: DownsampleQuery{ResolutionMs: 300000, Feature: downsampleFeatureSum}, bucketMemoryLimiter: limiter}
+	ts := &tableSearch{downsampleQuery: q}
+	defer ts.reset()
+	newSource := func(timestamps ...int64) *BlockRef {
+		values := make([]int64, len(timestamps))
+		for i := range values {
+			values[i] = 1
+		}
+		b := &Block{}
+		b.Init(&TSID{MetricID: 1}, timestamps, values, 0, 64)
+		b.MarshalData(0, 0)
+		return &BlockRef{bh: b.bh, downsampleBlock: b}
+	}
+	start := int64(minUnixMilli + 300000)
+	if err := q.addSourceBlock(newSource(start, start+300000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.addSourceBlock(newSource(start)); err != nil {
+		t.Fatalf("repeated contribution consumed another reservation: %v", err)
+	}
+	if err := q.addSourceBlock(newSource(start + 600000)); err == nil || !strings.HasPrefix(err.Error(), "[downsampling] query aggregation exceeds") {
+		t.Fatalf("expected bounded-memory error; got %v", err)
+	}
+	if len(q.currentTSIDBuckets) != 2 {
+		t.Fatalf("failed allocation inserted a bucket: %d", len(q.currentTSIDBuckets))
+	}
+	// 下一 TSID 复用既有容量，不得再次向共享预算申请相同的容量。
+	clear(q.currentTSIDBuckets)
+	if err := q.addSourceBlock(newSource(start + 600000)); err != nil {
+		t.Fatalf("reused capacity was charged twice: %v", err)
+	}
+	ts.reset()
+	ts.reset()
+	if !limiter.Get(limiter.MaxSize) {
+		t.Fatal("closed query did not return its complete reservation")
+	}
+	limiter.Put(limiter.MaxSize)
+}
+
+func TestDownsampleQueryConcurrentMemoryBudget(t *testing.T) {
+	limiter := &memory.Limiter{MaxSize: downsampleQueryMapMemory + downsampleQueryBucketMemory}
+	b := &Block{}
+	b.Init(&TSID{MetricID: 1}, []int64{minUnixMilli}, []int64{1}, 0, 64)
+	b.MarshalData(0, 0)
+	source := &BlockRef{bh: b.bh, downsampleBlock: b}
+	queries := []*tableSearch{
+		{downsampleQuery: &downsampleQueryState{selector: DownsampleQuery{ResolutionMs: 300000}, bucketMemoryLimiter: limiter}},
+		{downsampleQuery: &downsampleQueryState{selector: DownsampleQuery{ResolutionMs: 300000}, bucketMemoryLimiter: limiter}},
+	}
+	var wg sync.WaitGroup
+	errors := make(chan error, len(queries))
+	for _, ts := range queries {
+		wg.Go(func() { errors <- ts.downsampleQuery.addSourceBlock(source) })
+	}
+	wg.Wait()
+	close(errors)
+	failed := 0
+	for err := range errors {
+		if err != nil {
+			if !strings.HasPrefix(err.Error(), "[downsampling] query aggregation exceeds") {
+				t.Fatal(err)
+			}
+			failed++
+		}
+	}
+	for _, ts := range queries {
+		ts.reset()
+	}
+	if failed != 1 {
+		t.Fatalf("shared budget did not reject exactly one concurrent query: %d", failed)
+	}
+	if !limiter.Get(limiter.MaxSize) {
+		t.Fatal("concurrent queries leaked their reservations")
+	}
+	limiter.Put(limiter.MaxSize)
+}
+
+func TestDownsampleQueryMemoryFailureStopsIteration(t *testing.T) {
+	config, err := ParseDownsamplingConfig([]byte(`{"base_resolution":"5m"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tsid := TSID{MetricID: 1}
+	p := newDownsampleQueryFixture(t, config, []downsampleQueryFixtureBlock{{
+		tsid: tsid, resolution: 300000,
+		samples: []downsampleSample{
+			{timestamp: minUnixMilli, precisionBits: 64},
+			{timestamp: minUnixMilli + 300000, precisionBits: 64},
+		},
+	}})
+	ts := newDownsampleQueryTableFixture(t, []*part{p}, []TSID{tsid}, DownsampleQuery{ResolutionMs: 300000}, TimeRange{minUnixMilli, maxUnixMilli})
+	limiter := &memory.Limiter{MaxSize: downsampleQueryMapMemory + downsampleQueryBucketMemory}
+	ts.downsampleQuery.bucketMemoryLimiter = limiter
+	if ts.NextBlock() || ts.Error() == nil || !strings.HasPrefix(ts.Error().Error(), "[downsampling] query aggregation exceeds") {
+		t.Fatalf("expected iteration to stop before emitting partial buckets: %v", ts.Error())
+	}
+	if ts.NextBlock() || ts.Error() == nil {
+		t.Fatal("iteration resumed after memory budget failure")
+	}
+	ts.reset()
+	if !limiter.Get(limiter.MaxSize) {
+		t.Fatal("failed iteration did not release its reservation on close")
+	}
+	limiter.Put(limiter.MaxSize)
+}
+
+func TestDownsampleQueryOutputDeadline(t *testing.T) {
+	for _, outputRange := range []TimeRange{
+		{MinTimestamp: minUnixMilli, MaxTimestamp: maxUnixMilli},
+		{MinTimestamp: maxUnixMilli, MaxTimestamp: maxUnixMilli},
+	} {
+		q := &downsampleQueryState{
+			deadline: 1, outputTimeRange: outputRange,
+			currentTSIDBuckets:   map[int64]downsampleSample{0: {timestamp: minUnixMilli, precisionBits: 64}},
+			currentTSIDBucketIDs: []int64{0},
+		}
+		ts := &tableSearch{downsampleQuery: q}
+		if q.emitBlock(ts) || !errors.Is(ts.Error(), ErrDeadlineExceeded) {
+			t.Fatalf("output did not stop at deadline: %v", ts.Error())
+		}
+		if ts.NextBlock() || !errors.Is(ts.Error(), ErrDeadlineExceeded) {
+			t.Fatalf("failed query resumed output: %v", ts.Error())
+		}
+	}
+}
 
 func TestDownsampleIterationMultiTSID(t *testing.T) {
 	p := newDownsampleIterationPart(t)
@@ -76,7 +208,7 @@ func TestDownsampleQueryParse(t *testing.T) {
 	for _, resolution := range []struct {
 		name string
 		ms   int64
-	}{{"5m", 300000}, {"1h", 3600000}} {
+	}{{"1m", 60000}, {"5m", 300000}, {"45m", 2700000}, {"1h", 3600000}, {"2h", 7200000}} {
 		for i, name := range []string{"last", "sum", "count", "min", "max"} {
 			q, err := ParseDownsampleQuery(resolution.name, name)
 			if err != nil || q.ResolutionMs != resolution.ms || q.Feature != uint8(i) {
@@ -85,7 +217,7 @@ func TestDownsampleQueryParse(t *testing.T) {
 		}
 	}
 	for _, invalid := range [][2]string{
-		{"5m", ""}, {"", "sum"}, {"1m", "sum"}, {"300000", "sum"},
+		{"5m", ""}, {"", "sum"}, {"0m", "sum"}, {"300000", "sum"},
 		{"5m", "avg"}, {"5m", "sum:count"}, {"5m", "SUM"}, {" 5m", "sum"},
 	} {
 		if q, err := ParseDownsampleQuery(invalid[0], invalid[1]); q != nil || err == nil || !strings.HasPrefix(err.Error(), "[downsampling] ") {
@@ -155,7 +287,7 @@ func TestDownsampleQueryBlockRef(t *testing.T) {
 		{"same-metric-id-missing-group", sharedMetricBlocks, downsampleResolutions[:], []TSID{{AccountID: 1, ProjectID: 2, JobID: 2, MetricID: 10}}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p, err := openDownsamplePart(writeFileTestDownsamplePart(t, tc.blocks...))
+			p, err := openDownsamplePart(writeFileTestDownsamplePart(t, tc.blocks...), nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -272,7 +404,7 @@ func TestDownsampleSearchProtocolValidation(t *testing.T) {
 			t.Fatalf("截断长度 %d 未拒绝或特征未清除: %v", size, err)
 		}
 	}
-	for _, invalid := range []*DownsampleQuery{nil, {ResolutionMs: 0, Feature: 0}, {ResolutionMs: 60000, Feature: 2}, {ResolutionMs: 300000, Feature: 5}, {ResolutionMs: 3600000, Feature: 255}} {
+	for _, invalid := range []*DownsampleQuery{nil, {ResolutionMs: 0, Feature: 0}, {ResolutionMs: -60000, Feature: 2}, {ResolutionMs: 300000, Feature: 5}, {ResolutionMs: 3600000, Feature: 255}} {
 		sq.DownsampleQuery = invalid
 		if _, err := sq.MarshalDownsampleWithoutTenant(nil); err == nil || !strings.HasPrefix(err.Error(), "[downsampling] ") {
 			t.Fatalf("编码无效分辨率或特征未返回降采样错误: %+v: %v", invalid, err)
@@ -315,7 +447,7 @@ func TestDownsampleQueryIndexAccess(t *testing.T) {
 		for feature := uint8(0); feature < countOfDownsampleFeatures; feature++ {
 			t.Run(fmt.Sprintf("%d/%d", resolution, feature), func(t *testing.T) {
 				beforeMappings := mappedFiles.Get()
-				p, err := openDownsamplePart(path)
+				p, err := openDownsamplePart(path, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -384,7 +516,7 @@ func TestDownsampleQueryIndexAccess(t *testing.T) {
 	// 文件读取沿用 raw 的 MustReadAt 契约；这里只检查降采样索引自身的损坏处理。
 	for _, scenario := range []string{"bad_magic", "bad_compression"} {
 		t.Run(scenario, func(t *testing.T) {
-			p, err := openDownsamplePart(path)
+			p, err := openDownsamplePart(path, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -467,4 +599,251 @@ func TestDownsampleQuerySearchPropagation(t *testing.T) {
 	if search.NextMetricBlock() || search.Error() != nil {
 		t.Fatalf("raw query reused a previous resolution/feature: %v", search.Error())
 	}
+}
+
+func TestDownsampleQuerySourceTimeRange(t *testing.T) {
+	q := DownsampleQuery{ResolutionMs: 2 * 3600000, Feature: downsampleFeatureSum}
+	base := int64(minUnixMilli)
+	for _, tc := range []struct{ input, expected TimeRange }{
+		{TimeRange{base + 10*60000, base + 20*60000}, TimeRange{base, base + q.ResolutionMs - 1}},
+		{TimeRange{base + 1, base + q.ResolutionMs}, TimeRange{base, base + 2*q.ResolutionMs - 1}},
+		{TimeRange{0, maxUnixMilli}, TimeRange{minUnixMilli, maxUnixMilli}},
+	} {
+		actual, err := q.SourceTimeRange(tc.input)
+		if err != nil || actual != tc.expected {
+			t.Fatalf("source range mismatch: input=%v actual=%v expected=%v err=%v", tc.input, actual, tc.expected, err)
+		}
+	}
+}
+
+func TestDownsampleQueryLargestStoredDivisor(t *testing.T) {
+	config, err := ParseDownsamplingConfig([]byte(`{"base_resolution":"5m","tenant_resolutions":[{"tenant":"7:11","resolutions":["30m","45m","1h"]},{"tenant":"7:19","resolutions":["30m"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tsids := []TSID{{AccountID: 7, ProjectID: 11, MetricID: 1}, {AccountID: 7, ProjectID: 19, MetricID: 1}, {AccountID: 17, ProjectID: 11, MetricID: 1}}
+	var inputs []downsampleQueryFixtureBlock
+	for _, tsid := range tsids {
+		for _, resolution := range config.resolutionsForTenant(tsid.AccountID, tsid.ProjectID) {
+			sample := downsampleSample{timestamp: minUnixMilli + resolution - 1, precisionBits: 64}
+			for feature := range sample.values {
+				sample.values[feature] = float64(resolution + int64(feature))
+			}
+			inputs = append(inputs, downsampleQueryFixtureBlock{tsid: tsid, resolution: resolution, samples: []downsampleSample{sample}})
+		}
+	}
+	p := newDownsampleQueryFixture(t, config, inputs)
+	for _, tc := range []struct {
+		requested int64
+		expected  []int64
+	}{
+		{2 * 3600000, []int64{3600000, 30 * 60000, 300000}},
+		{90 * 60000, []int64{45 * 60000, 30 * 60000, 300000}},
+		{3600000, []int64{3600000, 30 * 60000, 300000}},
+	} {
+		for feature := uint8(0); feature < countOfDownsampleFeatures; feature++ {
+			var ps partSearch
+			ps.Init(p, tsids, TimeRange{minUnixMilli, maxUnixMilli}, &DownsampleQuery{ResolutionMs: tc.requested, Feature: feature})
+			var values []float64
+			for ps.NextBlock() {
+				var block Block
+				ps.BlockRef.MustReadBlock(&block)
+				if err := block.UnmarshalData(); err != nil {
+					t.Fatal(err)
+				}
+				_, values = block.AppendRowsWithTimeRangeFilter(nil, values, TimeRange{minUnixMilli, maxUnixMilli})
+			}
+			if ps.Error() != nil || len(values) != len(tc.expected) {
+				t.Fatalf("source selection failed: values=%v err=%v", values, ps.Error())
+			}
+			for i, resolution := range tc.expected {
+				if values[i] != float64(resolution+int64(feature)) {
+					t.Fatalf("requested=%d tenant=%v feature=%d: selected=%v expected resolution=%d", tc.requested, tsids[i], feature, values[i], resolution)
+				}
+			}
+			ps.reset()
+		}
+	}
+	for _, resolution := range []int64{60000, 7 * 60000} {
+		var ps partSearch
+		ps.Init(p, tsids, TimeRange{minUnixMilli, maxUnixMilli}, &DownsampleQuery{ResolutionMs: resolution})
+		if ps.NextBlock() || ps.Error() == nil {
+			t.Fatalf("resolution %d incompatible with BASE was accepted", resolution)
+		}
+	}
+}
+
+func TestDownsampleQueryBucketsAcrossPartsAndPartitions(t *testing.T) {
+	baseOnly, err := ParseDownsamplingConfig([]byte(`{"base_resolution":"5m"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	withHour, err := ParseDownsamplingConfig([]byte(`{"base_resolution":"5m","tenant_resolutions":[{"tenant":"7:11","resolutions":["1h"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 用跨月的 7h bucket 验证跨 partition；它可以从 1h 整数合并，也可以从 BASE 合并。
+	monthBoundary := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	resolution := int64(7 * 3600000)
+	base := monthBoundary - monthBoundary%resolution
+	if monthBoundary == base {
+		t.Fatal("fixture must cross a month boundary inside its bucket")
+	}
+	tsid := TSID{AccountID: 7, ProjectID: 11, MetricID: 1}
+	nextTSID := tsid
+	nextTSID.MetricID++
+	sample := func(timestamp int64, last, sum, count, minimum, maximum float64) downsampleSample {
+		return downsampleSample{timestamp: timestamp, precisionBits: 64, values: [countOfDownsampleFeatures]float64{last, sum, count, minimum, maximum}}
+	}
+	// 左侧 BASE 的两块和右侧 1h 的两块全部属于一个目标 bucket；每块单独占一个 index。
+	left := []downsampleSample{sample(base+60000, 2, 2, 1, 2, 2), sample(base+360000, 3, 3, 1, 3, 3)}
+	right := []downsampleSample{sample(monthBoundary+60000, 5, 9, 2, 4, 5), sample(monthBoundary+3600000+60000, 8, 8, 1, 8, 8)}
+	if right[1].timestamp >= base+resolution {
+		t.Fatal("fixture exceeds target bucket")
+	}
+	var leftInputs, rightInputs []downsampleQueryFixtureBlock
+	for _, s := range left {
+		leftInputs = append(leftInputs, downsampleQueryFixtureBlock{tsid, 300000, []downsampleSample{s}})
+	}
+	leftInputs = append(leftInputs, downsampleQueryFixtureBlock{nextTSID, 300000, []downsampleSample{sample(base+60000, 99, 99, 1, 99, 99)}})
+	for _, s := range right {
+		rightInputs = append(rightInputs, downsampleQueryFixtureBlock{tsid, 300000, []downsampleSample{s}}, downsampleQueryFixtureBlock{tsid, 3600000, []downsampleSample{s}})
+	}
+	leftPart := newDownsampleQueryFixture(t, baseOnly, leftInputs)
+	rightPart := newDownsampleQueryFixture(t, withHour, rightInputs)
+	withExact, err := ParseDownsamplingConfig([]byte(`{"base_resolution":"5m","tenant_resolutions":[{"tenant":"7:11","resolutions":["1h","7h"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exactInputs := append([]downsampleQueryFixtureBlock(nil), rightInputs...)
+	exactInputs = append(exactInputs, downsampleQueryFixtureBlock{tsid, resolution, []downsampleSample{sample(right[1].timestamp, 8, 17, 3, 4, 8)}})
+	exactPart := newDownsampleQueryFixture(t, withExact, exactInputs)
+	wantValues := []float64{8, 22, 5, 2, 8}
+	for _, parts := range [][]*part{{leftPart, rightPart}, {leftPart, exactPart}} {
+		for feature := uint8(0); feature < countOfDownsampleFeatures; feature++ {
+			for _, outputRange := range []TimeRange{
+				{base, base + resolution - 1},
+				{right[1].timestamp, right[1].timestamp},
+				{base + 10*60000, base + 20*60000},
+			} {
+				query := DownsampleQuery{ResolutionMs: resolution, Feature: feature}
+				ts := newDownsampleQueryTableFixture(t, parts, []TSID{tsid, nextTSID}, query, outputRange)
+				var saved []BlockRef
+				for ts.NextBlock() {
+					saved = append(saved, *ts.BlockRef)
+				}
+				if ts.Error() != nil {
+					t.Fatal(ts.Error())
+				}
+				ts.reset()
+				var timestamps []int64
+				var values []float64
+				for _, br := range saved {
+					if br.bh.TSID != tsid {
+						continue
+					}
+					var b Block
+					br.MustReadBlock(&b)
+					if err := b.UnmarshalData(); err != nil {
+						t.Fatal(err)
+					}
+					timestamps, values = b.AppendRowsWithTimeRangeFilter(timestamps, values, outputRange)
+				}
+				wantPresent := right[1].timestamp >= outputRange.MinTimestamp && right[1].timestamp <= outputRange.MaxTimestamp
+				if wantPresent {
+					if !reflect.DeepEqual(timestamps, []int64{right[1].timestamp}) || !reflect.DeepEqual(values, []float64{wantValues[feature]}) {
+						t.Fatalf("cross-part bucket mismatch: feature=%d timestamps=%v values=%v", feature, timestamps, values)
+					}
+				} else if len(timestamps) != 0 {
+					t.Fatalf("partial time range created an incomplete bucket: %v %v", timestamps, values)
+				}
+				// 已复制的输出引用由不可变 Block 保活，可在后续迭代和状态回收后并行重读。
+				var wg sync.WaitGroup
+				for _, br := range saved {
+					wg.Add(1)
+					go func(br BlockRef) {
+						defer wg.Done()
+						var b Block
+						for range 10 {
+							br.MustReadBlock(&b)
+							if err := b.UnmarshalData(); err != nil {
+								t.Error(err)
+								return
+							}
+						}
+					}(br)
+				}
+				wg.Wait()
+			}
+		}
+	}
+}
+
+type downsampleQueryFixtureBlock struct {
+	tsid       TSID
+	resolution int64
+	samples    []downsampleSample
+}
+
+func newDownsampleQueryFixture(t *testing.T, config *DownsamplingConfig, inputs []downsampleQueryFixtureBlock) *part {
+	t.Helper()
+	path := t.TempDir() + "/part"
+	w := getDownsampleWriter()
+	defer putDownsampleWriter(w)
+	if err := w.Init(path, 1, config); err != nil {
+		t.Fatal(err)
+	}
+	w.maxIndexBlockSize = marshaledBlockHeaderSize
+	sort.SliceStable(inputs, func(i, j int) bool {
+		if inputs[i].tsid != inputs[j].tsid {
+			return inputs[i].tsid.Less(&inputs[j].tsid)
+		}
+		if inputs[i].resolution != inputs[j].resolution {
+			return inputs[i].resolution < inputs[j].resolution
+		}
+		return inputs[i].samples[0].timestamp < inputs[j].samples[0].timestamp
+	})
+	for _, input := range inputs {
+		if err := w.WriteSamples(&input.tsid, input.resolution, input.samples, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := w.Finish(nil); err != nil {
+		t.Fatal(err)
+	}
+	p, err := openDownsamplePart(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.MustClose)
+	return p
+}
+
+func newDownsampleQueryTableFixture(t *testing.T, parts []*part, tsids []TSID, query DownsampleQuery, outputRange TimeRange) *tableSearch {
+	t.Helper()
+	sourceRange, err := query.SourceTimeRange(outputRange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := &tableSearch{downsampleQuery: &downsampleQueryState{selector: query, outputTimeRange: outputRange}}
+	t.Cleanup(ts.reset)
+	for _, p := range parts {
+		ps := &partSearch{}
+		ps.Init(p, tsids, sourceRange, &query)
+		if !ps.NextBlock() {
+			if err := ps.Error(); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		pts := &partitionSearch{psHeap: partSearchHeap{ps}, BlockRef: &ps.BlockRef}
+		ts.ptsHeap = append(ts.ptsHeap, pts)
+	}
+	if len(ts.ptsHeap) == 0 {
+		t.Fatal("fixture does not contain source data")
+	}
+	heap.Init(&ts.ptsHeap)
+	ts.BlockRef = ts.ptsHeap[0].BlockRef
+	ts.nextBlockNoop = true
+	return ts
 }

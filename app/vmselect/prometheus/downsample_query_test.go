@@ -12,9 +12,9 @@ func TestDownsampleQueryHTTPParameter(t *testing.T) {
 	for _, resolution := range []struct {
 		name         string
 		milliseconds int64
-	}{{"5m", 300000}, {"1h", 3600000}} {
+	}{{"1m", 60000}, {"5m", 300000}, {"45m", 2700000}, {"1h", 3600000}, {"2h", 7200000}} {
 		for featureID, feature := range []string{"last", "sum", "count", "min", "max"} {
-			args := url.Values{"query.resolution": {resolution.name}, "query.feature": {feature}}.Encode()
+			args := url.Values{"resolution": {resolution.name}, "feature": {feature}}.Encode()
 			for _, method := range []string{"GET", "POST"} {
 				r := httptest.NewRequest(method, "/api/v1/query?query=m&"+args, nil)
 				if method == "POST" {
@@ -31,20 +31,20 @@ func TestDownsampleQueryHTTPParameter(t *testing.T) {
 	if q, err := getDownsampleQuery(httptest.NewRequest("GET", "/api/v1/query?query=m", nil)); q != nil || err != nil {
 		t.Fatalf("未指定降采样参数时改变原始路径: %v %v", q, err)
 	}
-	r := httptest.NewRequest("POST", "/api/v1/query?query.resolution=5m", strings.NewReader("query.resolution=5m&query.feature=sum"))
+	r := httptest.NewRequest("POST", "/api/v1/query?resolution=5m", strings.NewReader("resolution=5m&feature=sum"))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	if q, err := getDownsampleQuery(r); q != nil || err == nil || !strings.HasPrefix(err.Error(), "[downsampling] ") {
 		t.Fatalf("请求 URL 与正文中的重复参数未被拒绝: query=%+v err=%v", q, err)
 	}
 	for _, args := range []string{
-		"query.resolution=", "query.feature=", "query.resolution=5m", "query.feature=sum",
-		"query.resolution=&query.feature=sum", "query.resolution=5m&query.feature=",
-		"query.resolution=5m&query.resolution=1h&query.feature=sum",
-		"query.resolution=5m&query.feature=sum&query.feature=max",
-		"query.resolution=1m&query.feature=sum", "query.resolution=5m&query.feature=avg",
+		"resolution=", "feature=", "resolution=5m", "feature=sum",
+		"resolution=&feature=sum", "resolution=5m&feature=",
+		"resolution=5m&resolution=1h&feature=sum",
+		"resolution=5m&feature=sum&feature=max",
+		"resolution=0m&feature=sum", "resolution=5m&feature=avg",
 		"query.field=", "query.field=5m%3Asum",
-		"query.field=5m%3Asum&query.resolution=5m&query.feature=sum",
-		"query.resolution=%zz&query.feature=sum",
+		"query.field=5m%3Asum&resolution=5m&feature=sum",
+		"resolution=%zz&feature=sum",
 	} {
 		for _, handler := range []string{"instant", "range"} {
 			r := httptest.NewRequest("GET", "/api/v1/query?query=m&"+args, nil)
@@ -58,7 +58,7 @@ func TestDownsampleQueryHTTPParameter(t *testing.T) {
 			if err == nil {
 				t.Fatalf("%s 接受了无效降采样参数: %s", handler, args)
 			}
-			if args != "query.resolution=%zz&query.feature=sum" && !strings.HasPrefix(err.Error(), "[downsampling] ") {
+			if args != "resolution=%zz&feature=sum" && !strings.HasPrefix(err.Error(), "[downsampling] ") {
 				t.Fatalf("%s 无效降采样参数错误缺少降采样前缀: %s: %v", handler, args, err)
 			}
 		}

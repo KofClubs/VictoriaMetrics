@@ -49,7 +49,7 @@ func TestDownsampleDecodedBlockCapacity(t *testing.T) {
 }
 
 func TestDownsampleBucket(t *testing.T) {
-	for _, resolution := range downsampleResolutions {
+	for _, resolution := range []int64{1, 5, 300, 60000, downsampleResolution5m, downsampleResolution1h, 7 * downsampleResolution1h} {
 		for _, timestamp := range []int64{
 			minUnixMilli, minUnixMilli + 1,
 			minUnixMilli + resolution - 1, minUnixMilli + resolution,
@@ -80,7 +80,7 @@ func TestDownsampleBucket(t *testing.T) {
 			}
 		}
 	}
-	for _, resolution := range []int64{math.MinInt64, -1, 0, 5, 300, 60000, math.MaxInt64} {
+	for _, resolution := range []int64{math.MinInt64, -1, 0, maxUnixMilli + 1, math.MaxInt64} {
 		if _, err := downsampleBucketID(minUnixMilli, resolution); err == nil {
 			t.Fatalf("expecting error for resolution %d", resolution)
 		}
@@ -374,7 +374,7 @@ func TestDownsampleSampleRandomizedReference(t *testing.T) {
 
 func TestDownsampleHeaderValidation(t *testing.T) {
 	path := writeFileTestDownsamplePart(t, fileTestDownsampleBlock(1, 300000))
-	p, err := openDownsamplePart(path)
+	p, err := openDownsamplePart(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

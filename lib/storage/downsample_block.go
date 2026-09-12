@@ -10,13 +10,6 @@ import (
 )
 
 const (
-	downsampleResolution5m int64 = 300000
-	downsampleResolution1h int64 = 3600000
-)
-
-var downsampleResolutions = [2]int64{downsampleResolution5m, downsampleResolution1h}
-
-const (
 	downsampleFeatureLast = iota
 	downsampleFeatureSum
 	downsampleFeatureCount
@@ -36,7 +29,7 @@ const (
 )
 
 // downsampleSample 保存一个 bucket 的样本，并可直接合并同 bucket 的其他样本。
-// 时间戳和五个特征共用源精度；precisionBits 为 0 表示空槽，合法样本精度为 1..64。
+// 五个特征保留源值精度，时间戳写出时使用无损编码；precisionBits 为 0 表示空槽，合法值为 1..64。
 type downsampleSample struct {
 	// timestamp 是当前 bucket 中最新贡献的时间，用于选择 last，并作为写出时间戳。
 	timestamp int64
@@ -58,7 +51,7 @@ type downsampleDecodedResolutionFeaturesBlock struct {
 	timestamps []int64
 	// values 保存与 timestamps 逐行对齐的五个已解码浮点列；NaN 规范化由 downsampleSample.Merge 负责。
 	values [countOfDownsampleFeatures][]float64
-	// precisionBits 继承源 Block 的精度，时间列和五个特征共用，避免重写时改变精度。
+	// precisionBits 继承源 Block 的值精度，供五个特征共用；降采样时间列始终无损。
 	precisionBits uint8
 }
 
@@ -141,7 +134,7 @@ func (b *downsampleDecodedResolutionFeaturesBlock) Reset() {
 
 // downsampleBucketID 使用毫秒整数除法定位左闭右开的固定分辨率区间。
 func downsampleBucketID(timestamp, resolution int64) (int64, error) {
-	if resolution != downsampleResolution5m && resolution != downsampleResolution1h {
+	if !validDownsampleResolution(resolution) {
 		return 0, fmt.Errorf("[downsampling] unsupported downsampling resolution %d", resolution)
 	}
 	if timestamp < minUnixMilli || timestamp > maxUnixMilli {
@@ -163,7 +156,21 @@ func downsampleBucketEnd(timestamp, resolution int64) (int64, error) {
 	return (bucketID + 1) * resolution, nil
 }
 
-func validDownsampleResolution(r int64) bool { return r == 300000 || r == 3600000 }
+func validDownsampleResolution(r int64) bool { return r > 0 && r <= maxUnixMilli }
+
+// marshalDownsampleBlock 复用原生 Block 的数值编码，并保证分桶时间戳无损。
+// precisionBits 仍描述源数值精度；低精度时间戳不能移动 bucket 或改变最后贡献时间。
+// timestamps 由调用方持有，不能借用 MarshalData 会清理的 Block 时间戳切片。
+func marshalDownsampleBlock(b *Block, timestamps []int64, timestampsOffset, valuesOffset uint64) ([]byte, []byte, []byte) {
+	b.MarshalData(timestampsOffset, valuesOffset)
+	if b.bh.PrecisionBits < 64 {
+		b.timestampsData, b.bh.TimestampsMarshalType, b.bh.MinTimestamp = encoding.MarshalTimestamps(b.timestampsData[:0], timestamps, 64)
+		b.bh.MaxTimestamp = timestamps[len(timestamps)-1]
+		b.bh.TimestampsBlockSize = uint32(len(b.timestampsData))
+		b.headerData = b.bh.Marshal(b.headerData[:0])
+	}
+	return b.headerData, b.timestampsData, b.valuesData
+}
 
 func validateDownsampleHeader(h *blockHeader) error {
 	if err := h.validate(); err != nil {

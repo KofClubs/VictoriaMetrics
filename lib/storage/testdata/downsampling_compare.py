@@ -19,6 +19,8 @@ import urllib.request
 
 sys.dont_write_bytecode = True
 
+from downsampling_inspect import validate_metadata
+
 
 RESOLUTIONS = {"5m": 300_000, "1h": 3_600_000}
 FEATURES = ("last", "sum", "count", "min", "max")
@@ -37,11 +39,11 @@ def unused_port():
         return sock.getsockname()[1]
 
 
-def request(base, path, params=None, data=None):
+def request(base, path, params=None, data=None, method=None):
     url = base + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, data=data)
+    req = urllib.request.Request(url, data=data, method=method)
     with urllib.request.urlopen(req, timeout=30) as response:
         return response.read().decode()
 
@@ -62,7 +64,7 @@ def binary_manifest(binary, mode):
 
 
 class Server:
-    def __init__(self, name, binary, root, downsampling, mode="single", tenant="0:0"):
+    def __init__(self, name, binary, root, downsampling, mode="single", tenant="0:0", downsampling_config=None):
         self.name = name
         self.root = root / name
         self.root.mkdir()
@@ -83,34 +85,40 @@ class Server:
             "-loggerLevel=INFO",
         ]
         if downsampling:
-            self.command.append("-storage.downsampling.enabled=true")
+            if downsampling_config is None:
+                account, _, project = tenant.partition(":")
+                downsampling_config = {"base_resolution": "5m", "tenant_resolutions": [
+                    {"tenant": str(int(account)) + ":" + str(int(project or "0")), "resolutions": ["1h"]}]}
+            self.command.extend(["-storage.downsampling.enabled=true",
+                                 "-storage.downsampling.config=" + json.dumps(downsampling_config, separators=(",", ":"))])
         self.downsampling = downsampling
         self.process = None
         self.log = None
         self.cluster = None
         if mode == "cluster":
             from downsampling_cluster import ClusterRuntime
-            self.cluster = ClusterRuntime(binary, self.root, self.storage, downsampling, tenant, unused_port)
+            self.cluster = ClusterRuntime(binary, self.root, self.storage, downsampling, tenant, unused_port, downsampling_config)
             self.base = self.cluster.http["vmstorage"]
         write_json(self.root / "command.json", self.cluster.commands if self.cluster is not None else self.command)
 
     def url(self, path):
         return self.cluster.url(path) if self.cluster is not None else self.base + path
 
-    def request(self, path, params=None, data=None):
+    def request(self, path, params=None, data=None, method=None):
         if self.cluster is not None:
-            return self.cluster.request(path, params, data)
-        return request(self.base, path, params, data)
+            return self.cluster.request(path, params, data, method)
+        return request(self.base, path, params, data, method)
 
     def wait_ingested(self):
         if self.cluster is not None:
             self.cluster.wait_ingested()
 
-    def request_force_merge(self):
+    def request_force_merge(self, partition_prefix=""):
         # force_merge 异步执行，必须等待本次请求完成，不能仅依赖空闲指标。
         log_path = self.root / ("vmstorage.log" if self.cluster is not None else "server.log")
         offset = log_path.stat().st_size
-        self.request("/internal/force_merge")
+        self.request("/internal/force_merge", {"partition_prefix": partition_prefix})
+        log_prefix = ('partition_prefix="' + partition_prefix + '"').encode()
         deadline = time.monotonic() + 120
         pending = b""
         while time.monotonic() < deadline:
@@ -119,9 +127,9 @@ class Server:
                 source.seek(offset)
                 pending += source.read()
                 offset = source.tell()
-            if b'error in forced merge for partition_prefix=""' in pending:
+            if b"error in forced merge for " + log_prefix in pending:
                 raise AssertionError((self.name, "强制归并失败", pending.decode(errors="replace")))
-            if b'forced merge for partition_prefix="" has been successfully finished' in pending:
+            if b"forced merge for " + log_prefix + b" has been successfully finished" in pending:
                 # appmetrics 的 /metrics 响应缓存 1 秒，等待过期后再读取终态统计。
                 time.sleep(1.05)
                 return
@@ -207,13 +215,7 @@ class Server:
                 for name in manifest.get(kind) or []:
                     path = self.storage / "data" / kind.lower() / manifest_path.parent.name / name
                     metadata = json.loads((path / "metadata.json").read_text())
-                    if self.downsampling:
-                        assert metadata.get("Mode") == "downsampling", metadata
-                        assert metadata.get("FormatVersion") == 2, metadata
-                        assert metadata.get("SemanticsVersion") == 2, metadata
-                        assert metadata.get("NumericCodec") == "decimal-values", metadata
-                    else:
-                        assert metadata.get("Mode") != "downsampling", metadata
+                    assert validate_metadata(metadata) == self.downsampling, metadata
                     parts.append({"path": str(path), "metadata": metadata,
                                   "files": {item.name: item.stat().st_size for item in path.iterdir()
                                             if item.is_file()}})
@@ -234,7 +236,7 @@ class Server:
             path = "/api/v1/query"
             suffix = "matrix"
         if feature is not None:
-            params.update({"query.resolution": resolution, "query.feature": feature})
+            params.update({"resolution": resolution, "feature": feature})
         response = json.loads(self.request(path, params))
         name = "-".join(filter(None, (stage, metric, resolution, feature, suffix)))
         write_json(self.root / (name + ".json"), {"path": path, "url": self.url(path), "params": params, "response": response})
@@ -372,7 +374,7 @@ def main():
     write_json(args.output / "fixture.json", {"base_ms": base, "input_steps_ms": INPUT_STEPS_MS,
                                              "unique_timestamps_per_series": True, "phases": phases})
     summary = {"status": "running", "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-               "base_ms": base, "query_parameters": {"query.resolution": "5m", "query.feature": "last"}, "mode": args.mode, "tenant": args.tenant, "checks": [], "stages": [],
+               "base_ms": base, "query_parameters": {"resolution": "5m", "feature": "last"}, "mode": args.mode, "tenant": args.tenant, "checks": [], "stages": [],
                "input_steps_ms": INPUT_STEPS_MS, "input_rows": sum(map(len, phases)),
                "tolerance": {"relative": 1e-10, "absolute": 1e-9}, "binaries": {},
                "scope": ("真实集群 1+1+1" if args.mode == "cluster" else "单节点") +

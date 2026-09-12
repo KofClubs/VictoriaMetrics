@@ -6,7 +6,33 @@
 
 通过 `-storage.downsampling.enabled=true` 或 `OpenOptions.DownsamplingEnabled=true` 启用文件降采样，默认关闭。启用时要求存储端 `dedup.minScrapeInterval=0`。
 
-分辨率固定为 `5m`（300000 毫秒）和 `1h`（3600000 毫秒），特征固定为 `last`、`sum`、`count`、`min`、`max`。磁盘格式和降采样查询协议统一采用编号 `0..4`，依次对应上述五个特征。格式版本和语义版本均为 `2`。
+分辨率由不可变的基础分辨率和各租户的额外分辨率组成。默认仅保留 `5m` 基础分辨率；每个租户始终包含基础分辨率，其额外分辨率必须更大且为基础分辨率的整数倍。特征固定为 `last`、`sum`、`count`、`min`、`max`，磁盘格式和查询协议统一采用编号 `0..4`。
+
+启动参数 `-storage.downsampling.config` 接收完整 JSON，例如：
+
+```json
+{
+  "base_resolution": "5m",
+  "tenant_resolutions": [
+    {"tenant": "1:0", "resolutions": ["1h"]},
+    {"tenant": "2:0", "resolutions": ["30m", "2h"]}
+  ]
+}
+```
+
+租户使用规范的 `accountID:projectID` 十进制字符串。上例中 `1:0` 保存 5m、1h，`2:0` 保存 5m、30m、2h，未列出的租户只保存 5m。时间间隔必须为正整数毫秒，接受 Go duration 语法及整数 `d`、`w`、`y`；1d=24h、1w=7d、1y=365d。配置拒绝未知字段、重复键、重复租户、重复分辨率、null、非整数倍及不合法时间间隔，输入大小不得超过 64 KiB。解析时还以规范化配置和最大长度的统计／时间字段构造 metadata，要求其编码不超过 64 KiB，避免启动或 API 接受后无法生成 part。租户数和分辨率数不另设固定上限，受实际编码大小约束。
+
+`GET /internal/downsampling/config` 返回当前配置，`PUT` 用完整 JSON 替换租户额外分辨率；可用 `-downsamplingConfigAuthKey` 设置该接口的附加认证，原有 HTTP 全局认证同样生效。基础分辨率写入 storage 的 `metadata/downsampling.json`，启用后不可在运行中或重启时更改，即使当前没有活动 part。租户配置运行时更新只影响后续归并，重启后取启动 JSON；已开始的任务和已有 part 各持有自己的不可变配置快照。更新配置不会立即重写旧 part。
+
+更新 API 只作用于接收请求的 vmstorage，不向其他节点广播。请求必须包含完整配置，未列出的租户恢复为仅基础分辨率；例如：
+
+```sh
+curl --request PUT 'http://127.0.0.1:8482/internal/downsampling/config' \
+  --header 'Content-Type: application/json' \
+  --data '{"base_resolution":"5m","tenant_resolutions":[{"tenant":"1:0","resolutions":["1h"]},{"tenant":"2:0","resolutions":["30m","2h"]}]}'
+```
+
+配置了接口认证或全局 HTTP 认证时，请求应携带对应凭据。成功响应的 `data` 返回当前完整配置；非法配置返回 HTTP 400，当前配置不变。
 
 | 术语 | 含义 |
 |---|---|
@@ -20,7 +46,7 @@
 
 内存数据的缓冲、序列化和内存归并使用原始格式。降采样处理目标为磁盘文件的写出或归并任务，IndexDB、TSID 分配和原始数据接收流程使用原有实现。
 
-降采样专属生产代码按 block、metaindex row、reader、writer、merger、part、partition、query 八个模块组织。block 定义样本、分桶计算、多特征解码缓冲及 header 校验；metaindex row 仅定义索引行及其编解码；part 管理格式标识、元数据大小限制和原生 header 索引解码；query 包含分辨率与特征解析、查询协议编解码和 part 搜索定位。各模块的代码导航与调用边界见实现说明。
+降采样专属生产代码按 config、block、metaindex row、reader、writer、merger、part、partition、query 九个模块组织。block 定义样本、分桶计算、多特征解码缓冲及 header 校验；metaindex row 仅定义索引行及其编解码；part 管理格式标识、元数据大小限制和原生 header 索引解码；query 包含分辨率与特征解析、查询协议编解码和 part 搜索定位。各模块的代码导航与调用边界见实现说明。
 
 ## 2. 数据语义
 
@@ -44,19 +70,19 @@
 
 ### 2.2 精度与编码
 
-时间戳和五个数值列共用源 `precisionBits`，有效范围为 `1..64`，通常为 64。各数值列独立保存 `Scale`、`FirstValue` 和编码类型，使用原有 decimal 转换与原生 `Block` 编解码。
+五个数值列保留源 `precisionBits`，有效范围为 `1..64`，通常为 64；各列独立保存 `Scale`、`FirstValue` 和编码类型。时间戳始终无损编码，精确保留 bucket 内有效贡献的最大时间戳。专属 `marshalDownsampleBlock` 复用原生 `Block.MarshalData`，仅在源精度低于 64 时替换时间戳编码及其 header 描述，共享 `block.go` 保持不变。
 
 `downsampleSample.precisionBits=0` 表示空槽；首次贡献写入完整样本，后续贡献通过 `Merge` 累加。同一 bucket 的源精度不一致时返回错误；不同 bucket 的精度不同时，writer 拆分输出 Block。浮点转换和有损压缩遵循原生编码语义。
 
-编码前要求时间戳严格递增，且一个输出批次内每个 bucket 只有一行。有损时间戳编码可能改变行所属的 bucket；磁盘校验依据已编码的时间范围和顺序执行，同一 TSID 的相邻 Block 时间范围不得重叠。
+编码前要求时间戳严格递增，且一个输出批次内每个 bucket 只有一行。时间戳编码不得移动 bucket 或改变最新贡献的位置；同一 TSID、同一分辨率的相邻 Block 时间范围不得重叠。
 
 ### 2.3 保留期限
 
-保留期限按 bucket 的右端点判断：右端点不大于 `retentionDeadline` 时删除，否则保留该 bucket 的完整贡献。两种分辨率独立处理，粗分辨率结果不从已经按保留期限裁剪过的细分辨率结果重建。
+保留期限由基础输入统一处理：保守保留当前配置与源 part 配置中尚有效的粗粒度 bucket 所需贡献。基础样本先聚合一次，再供全部额外分辨率使用，不能提前删除仍被有效粗粒度 bucket 需要的基础贡献。
 
-启用降采样时，整块磁盘 part 的过期判断同样检查两种分辨率：只有 `MaxTimestamp` 所在的两个 bucket 均已结束且过期，才删除该 part。内存 part 和整个月份分区的清理沿用原有规则。
+为此，每个源 TSID 根据当前配置及源 part 配置的分辨率，将保留边界向前扩展到相关 bucket 的最早起点。基础列保存该前缀，全部额外列完整表达同一份保留输入，不再次按自身 bucket 右端点删除前缀，否则查询选择最大整除列时会遗漏基础列仍有的贡献。查询在完整聚合之后应用输出时间范围和保留期限。内存原始归并在降采样模式下向原始 merger 传入配置计算的保守保留边界；内存及磁盘 part 删除通过 `partExpired` 同时考虑当前配置与源 part 配置。整个月份分区删除通过 `retentionExpired` 检查分区边界和全部活动 part，避免粗粒度 bucket 横跨月末时提前删除其贡献。未启用降采样时沿用原始保留规则。
 
-源行统计与浮点特征 `count` 分开计算。原始源只在首个分辨率累计统计；只有两个目标分辨率的 bucket 均过期时，原始行才计入删除行数。降采样源按各分辨率的五个单特征 Block 统计物理行数。
+源行统计只针对实际读取的基础输入：原始样本每行计一次，降采样基础记录按五个单值 Block 的物理行换算。旧额外分辨率由基础列重建，不重复读取或计数。物理行统计与浮点特征 `count` 分开计算。
 
 ## 3. 文件布局
 
@@ -70,7 +96,7 @@
 | `values.bin` | 五个特征各自的编码数值负载 |
 | `index.bin` | 分块压缩的原生 `blockHeader` |
 | `metaindex.bin` | 压缩的降采样 metaindex 行，用于定位 index block |
-| `metadata.json` | part 统计、版本、分辨率和计算语义；完整降采样文件的写入完成标志 |
+| `metadata.json` | 原生 partHeader 的五个统计字段及 downsampling_config；完整降采样文件的写入完成标志 |
 
 `parts.json` 是分区的活动 part 清单，位于 `smallPartsPath`，不属于单个 part 目录。
 
@@ -82,35 +108,47 @@ values.bin/index.bin : resolution → feature → TSID.Less → MinTimestamp
 metaindex.bin        : 与 index.bin 中各 index block 的顺序一致
 ```
 
-先写 5m，再写 1h。同一 `(resolution, feature)` 的全部数值 Block 和索引条目连续存放。时间戳不按 feature 重复存储；同一批次的五个 header 指向相同的时间戳 `(offset, size)`。
+分辨率按毫秒数递增排列，只包含本 part 实际写入的分辨率；每段只包含配置了该分辨率的租户及其 TSID。同一 `(resolution, feature)` 的全部数值 Block 和索引条目连续存放。时间戳不按 feature 重复存储；同一批次的五个 header 指向相同的时间戳 `(offset, size)`。
 
 每个 index block 及其对应的 metaindex 行只属于一个分辨率、一个特征、一个租户。一个 index block 可以包含同租户的多个 TSID，也可以包含同一 TSID 的多个 Block。租户由 `TSID.AccountID` 和 `TSID.ProjectID` 确定，不单独增加磁盘字段。
 
 ### 3.2 六个 TSID 的顺序示例
 
-假设 `A < B < C < D < E < F` 符合 `TSID.Less` 顺序，且每个 TSID 在每个分辨率下恰有一个多特征批次。下图按每行从左至右、各行从上至下连接，表示同一文件中的连续顺序。
+沿用上面的配置，假设租户 `1:0` 有 A、B，租户 `2:0` 有 C、D，租户 `3:0` 有 E、F，并且 `A < B < C < D < E < F` 符合 `TSID.Less`。每个 TSID 在其各分辨率下恰有一个多特征批次：
 
 ```text
 timestamps.bin
-  5m，共享时间列：[A] [B] [C] [D] [E] [F]
-  1h，共享时间列：[A] [B] [C] [D] [E] [F]
+  5m ：[A] [B] [C] [D] [E] [F]
+  30m：[C] [D]
+  1h ：[A] [B]
+  2h ：[C] [D]
 
-values.bin
-  5m，last ：[A] [B] [C] [D] [E] [F]
-  5m，sum  ：[A] [B] [C] [D] [E] [F]
-  5m，count：[A] [B] [C] [D] [E] [F]
-  5m，min  ：[A] [B] [C] [D] [E] [F]
-  5m，max  ：[A] [B] [C] [D] [E] [F]
-  1h，last ：[A] [B] [C] [D] [E] [F]
-  1h，sum  ：[A] [B] [C] [D] [E] [F]
-  1h，count：[A] [B] [C] [D] [E] [F]
-  1h，min  ：[A] [B] [C] [D] [E] [F]
-  1h，max  ：[A] [B] [C] [D] [E] [F]
+values.bin（index.bin 的 header 顺序相同）
+  5m,last  → A B C D E F
+  5m,sum   → A B C D E F
+  5m,count → A B C D E F
+  5m,min   → A B C D E F
+  5m,max   → A B C D E F
+  30m,last → C D
+  30m,sum  → C D
+  30m,count→ C D
+  30m,min  → C D
+  30m,max  → C D
+  1h,last  → A B
+  1h,sum   → A B
+  1h,count → A B
+  1h,min   → A B
+  1h,max   → A B
+  2h,last  → C D
+  2h,sum   → C D
+  2h,count → C D
+  2h,min   → C D
+  2h,max   → C D
 ```
 
-此例有 12 份时间列负载和 60 份数值列负载；A 的五个 5m 特征共同引用 A 的 5m 时间列。若同一 TSID 有多个 Block，则在各自区段内按时间展开为 `A1、A2、…、B1、B2、…`。
+各行从左至右、各行从上至下构成同一文件的连续顺序。此例有 12 份时间列负载和 60 份数值列负载；同一 TSID、同一分辨率的五个特征引用同一份时间列。若有多个 Block，则在各自区段内展开为 `A1、A2、…、B1、B2、…`。
 
-方框表示逻辑编码负载，不表示固定字节长度。常量编码允许零字节负载，定位信息仍存在于 header；header 存放在 `index.bin`，不夹在时间戳或数值负载之间。
+方框表示编码负载，不表示固定长度。常量编码允许零字节负载，定位信息仍存在于 header；header 只存于 `index.bin`。
 
 ### 3.3 TSID 与原生 blockHeader
 
@@ -143,7 +181,7 @@ values.bin
 | 87 | 1 | `ValuesMarshalType` |
 | 88 | 1 | `PrecisionBits` |
 
-header 不含分辨率、特征或独立的时间戳精度字段。分辨率和特征由所属 metaindex 行给出；`PrecisionBits` 同时约束时间戳和值。同一批次的五个 header 必须具有相同的 TSID、行数、时间范围、时间戳 offset/size/编码类型和精度。
+header 不含分辨率、特征或独立的时间戳精度字段。分辨率和特征由所属 metaindex 行给出；`PrecisionBits` 保留源值精度，时间戳编码固定无损；解码依据各自的编码类型，不需要额外的时间戳精度字段。同一批次的五个 header 必须具有相同的 TSID、行数、时间范围、时间戳 offset/size/编码类型和精度。
 
 二进制整数复用 `lib/encoding`：无符号整数使用大端序，有符号整数先进行 ZigZag 转换，再按固定宽度大端序写入。
 
@@ -157,7 +195,7 @@ metaindex.bin：
   "VMDSMI\x00\x02" + ZSTD(downsampleMetaindexRow × 行数)
 ```
 
-上述 8 字节前缀位于 ZSTD 帧之外。一个 index block 的解压上限为 65536 字节，包含 1～736 条原生 header；`BlockHeadersCount` 表示该分辨率、该特征下的单列 Block 数，不要求为 5 的倍数。
+上述 8 字节是固定文件签名，位于 ZSTD 帧之外；完整比较这些字节，不据此选择兼容分支。一个 index block 的解压上限为 65536 字节，包含 1～736 条原生 header；`BlockHeadersCount` 表示该分辨率、该特征下的单列 Block 数，不要求为 5 的倍数。
 
 `downsampleMetaindexRow` 直接嵌入原生 `metaindexRow`，然后追加特征、分辨率、末 TSID 和行数。当前集群版每行 113 字节：
 
@@ -180,23 +218,18 @@ metaindex 行的时间范围覆盖其全部 header，`RowsCount` 为该 index bl
 
 ### 3.5 metadata.json
 
-`downsamplePartMetadata` 嵌入原生 `partHeader`。以下字段必须存在且不能为 `null`：
+`downsamplePartMetadata` 只包含原生 `partHeader` 的五个统计字段及 `downsampling_config`。降采样 metadata 中以下字段必须完整且不能为 `null`：
 
 | 字段 | 约束 |
 |---|---|
-| `FormatVersion`、`SemanticsVersion` | 均为 2 |
-| `Mode` | `downsampling` |
-| `Resolutions` | `[300000, 3600000]`，顺序固定 |
-| `BucketOrigin` | 0 |
-| `NumericCodec` | `decimal-values` |
-| `Retention` | `bucket-end` |
+| `downsampling_config` | 生成本 part 时的基础分辨率及实际出现租户的额外分辨率快照；不包含无关租户 |
 | `MinDedupInterval` | 0 |
 | `RowsCount`、`BlocksCount` | 所有分辨率、所有单特征 Block 的物理统计，均为 5 的倍数 |
 | `MinTimestamp`、`MaxTimestamp` | part 实际共享时间戳的范围 |
 
-非空 part 要求行数和 Block 数均大于零，且 Block 数不大于行数。物理 `RowsCount` 与浮点特征 `count` 含义不同。
+非空 part 要求行数和 Block 数均大于零，且 Block 数不大于行数。物理 `RowsCount` 与浮点特征 `count` 含义不同。仅非 `null` 的 `downsampling_config` 标识降采样格式，并且必须能解析为有效配置；空对象、字符串、缺少基础分辨率等内容均报错。该字段缺失或为 `null` 时按原始 metadata 校验。配置决定每个租户允许保存的分辨率；实际写入的分辨率按有序 metaindex 的区段确定，不在 metadata 中另存列表。已配置的额外分辨率可以没有实际数据。
 
-`metadata.json` 在四个 `.bin` 文件完成写入、关闭和同步，且全部 spill 清理完毕、part 目录同步后最后生成。writer 直接创建并写入该文件，关闭并同步后，再同步 part 目录和父目录。识别完成标志必须成功解析 JSON，并校验 `FormatVersion` 及完整必需字段，不能只检查文件是否存在；原始 part 的 metadata 没有 `FormatVersion`。活动集合仍由分区的 `parts.json` 决定。
+`metadata.json` 在四个 `.bin` 文件完成写入、关闭和同步，且全部 spill 清理完毕、part 目录同步后最后生成。writer 直接创建并写入该文件，关闭并同步后，再同步 part 目录和父目录。识别完成标志必须成功解析 JSON，并校验有效配置及完整统计字段，不能只检查文件是否存在。活动集合仍由分区的 `parts.json` 决定。
 
 ## 4. 归并与读取
 
@@ -204,31 +237,29 @@ metaindex 行的时间范围覆盖其全部 header，`RowsCount` 为该 index bl
 
 生产归并在一个 UTC 自然月分区内执行。源可以同时包含内存原始 part、磁盘原始 part 和磁盘降采样 part。降采样沿用原始归并的选源规则：常规后台选择最多 15 个 part；刷盘和强制合并在找不到均衡组合时可以选择全部剩余源，不另设降采样源数量上限。
 
-遍历顺序为：
+降采样文件归并在等待后台并发名额或强制合并调度名额时检查取消信号；取消后释放尚未开始处理的源合并标记，保留源数据，不再等待空闲名额。同一批已开始的任务仍需完成退出和清理，并在读取、聚合、写出和目标校验循环中检查同一信号。
+
+计算顺序为：
 
 ```text
-resolution → TSID → 源 part → Block 批次 → feature
+TSID → 汇总全部源的基础样本 → 写基础列 → 从基础样本推导本租户各额外分辨率
 ```
 
-每个分辨率建立一次 reader 堆，堆只按完整 TSID 排序。处理一个 TSID 时，顺序扫描所有相关源的首列 block header，按值保存到各源 reader 的 `currentTSIDBlockHeaders`，同时汇总完整时间范围，并将首列索引游标推进到下一个 TSID 或源末尾。降采样源的首列为 last，原始源使用原生索引中的 header。聚合槽数为：
+整次归并只建立一次基础 reader 堆，堆只按完整 TSID 排序。处理一个 TSID 时，顺序扫描所有相关源的首列 block header，按值保存到各源 reader 的 `currentTSIDBlockHeaders`，同时汇总完整时间范围和源行数，并将首列索引游标推进到下一个 TSID 或源末尾。降采样源只读取与当前基础分辨率相同的五列，原始源只读取一次原生数据；不读取旧额外列，也不按目标分辨率重扫原始数据。
 
-```text
-bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
-```
+基础分辨率的时间范围槽数为 `maxTimestamp / base - minTimestamp / base + 1`。当槽数不大于源行数时，按完整范围分配密集槽；范围更稀疏时，用 bucket 到槽号的映射只为实际遇到的 bucket 分配状态，全部源贡献完成后按时间排序。额外分辨率顺序消费已完成的基础样本，只保存非空 bucket，不再读取源文件。
 
-`currentTSIDBucketSamples` 按该范围设置长度，包含中间空 bucket；容量不足才分配，否则清空有效范围后复用。31 天在 5m 和 1h 分辨率下分别最多需要 8928 和 744 个槽。`downsampleMaxPooledBuckets=8928*2` 只控制 `reset` 时保留的池缓存容量，不限制本次计算的槽数。
+密集 31 天在 5m 基础分辨率下需要至多 8928 个槽；自定义基础分辨率按实际范围计算，并在分配前申请归并内存额度。基础槽和额外分辨率输出缓冲在任务内分别复用，writer 只读借用样本；任务结束后解除样本引用并归还额度，不在 merger 池中保留大数组。
 
-随后，`readSource` 遍历各源已保存的 header，由同一个 reader 直接读取对应 payload 并累加到槽位，不重新定位或解码首列索引。其他四个特征的索引游标只向前推进，与传入的 header 对齐；数据读取不改变堆所使用的首列 header。各源的 header 消费后清空长度，容量在当前分辨率内复用；reader 关闭时释放该缓存。所有源贡献完成后，样本切片直接交给 writer，之后再处理下一个 TSID。
+`readSource` 使用缓存 header 读取 payload；其他四个特征的索引游标只向前对齐，不重新解码首列索引，不改变堆使用的首列 header。各源 header 消费后清空，reader 关闭时释放容量。当前 TSID 的所有基础与额外列完成后再处理下一 TSID。
 
-已删除的 MetricID 对应整条 TSID 只扫描首列 header 并累计删除的源物理行，不保存 header 或读取 payload。
-
-同一源在一个目标分辨率下只贡献一种表示：原始样本按该分辨率分桶，降采样源只读取相同分辨率的五个特征。
+已删除的 MetricID 只扫描基础首列 header 并累计删除的输入物理行，不保存 header 或读取 payload。
 
 ### 4.2 多特征解码
 
 `ReadBlock(decoded, header)` 按已保存的首列 header 填充 `downsampleDecodedResolutionFeaturesBlock`，固定对齐同一分辨率的五个特征。reader 内嵌五个轻量索引游标，每个游标保存对应特征的索引位置、当前 header 和工作缓冲，不持有文件，不单独进入对象池。索引与 payload 均由外层 reader 持有的三个文件读取对象访问。
 
-`Init(p, resolution)` 绑定源 part 和分辨率，顺序扫描常驻内存的 metaindex，为该分辨率的各特征建立完整索引区间；原始源使用全部原生索引。`NextHeader` 只推进降采样 last 列或原始索引，`Header` 返回的位置在下次推进时失效，调用方须按值保存后才能延后读取。`ReadBlock` 按同一源的 TSID、时间顺序消费保存的 header，即使首列已经推进到下一 TSID 或 EOF，也可读取此前的数据。reader 不提供 TSID 定位、任意时间窗口或单特征查询入口。
+`Init(p, resolution)` 绑定源 part 和分辨率，顺序扫描常驻内存的 metaindex，为该分辨率的各特征建立完整索引区间；原始源使用全部原生索引。`NextHeader` 只推进降采样 last 列或原始索引，`Header` 返回的位置在下次推进时失效，调用方须按值保存后才能延后读取。`ReadBlock` 按同一源的 TSID、时间顺序消费保存的 header，即使首列已经推进到下一 TSID 或 EOF，也可读取此前的数据。 首列推进和其他特征向前对齐时均检查当前归并的取消信号；共享文件 I/O 调用本身仍按原有方式完成。reader 不提供 TSID 定位、任意时间窗口或单特征查询入口。
 
 首列通过原生 `Block.UnmarshalData` 完整解码时间戳和值；后四列验证共享时间戳描述后，由 `downsampleReader.readNativeValues` 仅读取各自 values，并直接调用原有 `encoding.UnmarshalValues` 解码，复用该原生 Block 中的时间戳。reader 负责清除上一列的值、校验时间戳与数值行数一致，并清理编码缓冲和重置读取位置；共享的 `block.go` 保持原有实现。时间戳在本次多特征批次内只读取、解码一次，下一批次重新读取；查询单列读取也独立解码。
 
@@ -248,7 +279,7 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 磁盘 part 的查询读取对象统一由原有 `timestampsFile`、`valuesFile`、`indexFile` 三个 `fs.MustReadAtCloser` 字段持有，实际类型均为 `*fs.ReaderAt`。原始与降采样查询共用 mmap、页驻留状态检查、系统调用回退、读取统计和索引缓存；`fs.disableMmap`、`fs.disableMincore` 的含义及实现保持不变。文件按原有机制延迟打开，不额外保存一组降采样查询句柄。
 
-归并 reader 为原始磁盘和降采样磁盘源均自行打开三个文件，并负责关闭，不借用 part 的查询读取对象。内存源读取已有缓冲。part 打开校验使用独立的临时偏移读取对象，在返回前关闭，不将校验句柄交给查询。调用方在归并 reader 使用期间持有源 part 引用；查询也沿用原有引用计数，旧 part 退出活动集合后，仍须等待最后一个引用释放才关闭及删除。归并调度沿用 `isInMerge`，不新增查询与归并之间的共享锁。
+归并 reader 为原始磁盘和降采样磁盘源均自行打开三个文件，并负责关闭，不借用 part 的查询读取对象。内存源读取已有缓冲。part 打开校验使用独立的临时偏移读取对象，在返回前关闭，不将校验句柄交给查询。新目标校验接收本次归并的取消信号，在 metaindex、索引组和基础列对齐循环中检查，取消后关闭校验句柄并阻止发布。调用方在归并 reader 使用期间持有源 part 引用；查询也沿用原有引用计数，旧 part 退出活动集合后，仍须等待最后一个引用释放才关闭及删除。归并调度沿用 `isInMerge`，不新增查询与归并之间的共享锁。
 
 ## 5. 写出与临时存储
 
@@ -258,7 +289,7 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 每个输出批次提取一份时间列，逐特征复用浮点缓冲与 decimal 整数缓冲，并依次初始化同一个 `currentFeatureBlock`。每列编码完成后立即写入对应 spill，不同时保留五个原生 Block 的工作缓冲。连续单列取数和 `Block.Init` 的自有缓冲拷贝仍然存在。
 
-每个特征均通过原生 `MarshalData` 编码。首列的编码时间戳独立复制到 `currentBlockTimestampsData`，并以局部 header 保存共享描述，供后四列逐一核对；下一列编码不会覆盖校验基准。写入端对时间戳执行五次编码校验，向 `timestamps.bin` 只写入一次。各特征的「原生 header + values payload」分别追加到对应 spill，spill 不保存时间戳负载；后续列失败时，整个未发布目标由 `Abort` 删除。
+每个特征均通过 `marshalDownsampleBlock` 复用原生编码并保证时间戳无损。首列的编码时间戳独立复制到 `currentBlockTimestampsData`，并以局部 header 保存共享描述，供后四列逐一核对；下一列编码不会覆盖校验基准。写入端对时间戳执行五次编码校验，向 `timestamps.bin` 只写入一次。writer 同时持有的分辨率数是本 part 所有租户实际输出分辨率的并集大小，每个分辨率各有五个 spill：last 追加「原生 header + timestamps payload + values payload」，其余特征追加「原生 header + values payload」。暂存 header 的时间戳偏移相对于该分辨率；同一批次只暂存一份时间戳。后续列失败时，整个未发布目标由 `Abort` 删除。
 
 ### 5.2 SpillWriter 与列顺序
 
@@ -266,34 +297,36 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 
 | 接口 | 行为 |
 |---|---|
-| `Write([]byte)` | 追加到内存；超过阈值时，将满块追加到同一个临时文件 |
+| `Write([]byte)` | 预算允许时追加到内存；超过单个缓冲阈值或进程预算不足时，追加到同一个临时文件 |
 | `Read(func(io.Reader) error)` | 以流方式读出全部已写字节；可重复调用，不关闭或删除临时文件 |
 | `Size()` | 返回已接收字节数，包含缓冲中的数据 |
 | `Close()` | 释放内存，关闭并删除本 spill 创建的临时文件 |
 
-每个 spill 的内存阈值默认为 **16 MiB**，通过 `-downsampling.spillMaxMemorySize` 配置。缓冲按需增长，容量不超过阈值。累计数据不超过阈值（含恰好达到阈值）时，不创建临时文件。满块之后仍有数据写入时，才将该满块落盘；超大的单次写入按同样规则分段处理。后续满块追加到同一个文件，最后一段保留在内存中。`Read` 依次读取文件前缀和内存尾部，不为读回而将尾部落盘。
+每个 spill 的内存阈值默认为 **16 MiB**，通过 `-downsampling.spillMaxMemorySize` 配置，必须大于零；实例在首次非空写入时固定该值。全部 spill 共享进程级内存预算 `min(256 MiB, memory.Allowed()/10)`，扩容时同时计入仍在使用的旧缓冲和完整新分配。预算允许且累计数据不超过单个阈值（含恰好达到阈值）时，不创建临时文件；满块后仍有数据时将该满块追加到同一个文件。预算不足时，先写出已有尾部并释放缓冲，再直接写入文件，不等待其他 spill 释放额度。后续写入可重新申请内存。`Read` 依次读取文件前缀和内存尾部，不为读回而将尾部落盘；`Close` 释放缓冲额度。
 
-临时文件直接位于调用方指定目录，名称为 `.spill-<name>`，文件权限为 `0666 & ~umask`。降采样 writer 使用五个特征名称区分 spill，独占目标 part 目录。满块直接写文件，不再叠加写缓冲；文件读回沿用 filestream 的缓冲大小，使用独立读缓冲池，归还时解除文件引用。内存尾部不入池，在 `Close` 时释放引用。读写沿用 filestream 的 I/O 统计，纯内存路径不计入实际文件 I/O；临时数据不执行 fsync。
+临时文件直接位于调用方指定目录，名称为 `.spill-<name>`，文件权限为 `0666 & ~umask`。降采样 writer 使用 `<resolution毫秒数>-<feature>` 区分 spill，独占目标 part 目录，按需为实际分辨率建立五个 spill。满块直接写文件，不再叠加写缓冲；文件读回沿用 filestream 的缓冲大小，使用独立读缓冲池，归还时解除文件引用。内存尾部不入池，在 `Close` 时释放引用。读写沿用 filestream 的 I/O 统计，纯内存路径不计入实际文件 I/O；临时数据不执行 fsync。
 
 `Read` 单独校验文件前缀长度，不能以内存尾部补齐被截断的文件；回调必须消费全部逻辑字节。读取成功或失败均不关闭、删除或封闭 spill，调用方最后必须显式执行 `Close`。写入失败会封闭 spill 并立即尝试清理；删除失败返回错误并保留路径，允许通过 `Close` 重试。单个 spill 不支持并发使用。
 
-分辨率结束或 `Finish` 时，`flushResolution` 按 last、sum、count、min、max 的顺序，逐个完整读回 spill：
+writer 允许按 TSID 交错写入各分辨率；每个分辨率独立校验 TSID、时间戳与 bucket 顺序。`Finish(stopCh)` 接收当前任务的取消信号，对实际分辨率排序，再逐个调用 `flushResolution`，按 last、sum、count、min、max 消费各 spill：
 
-1. 校验原生 header、时间戳引用、Block 顺序与连续性。
-2. 向 `values.bin` 追加 values，确定最终 `ValuesBlockOffset`。
-3. 将更新后的 header 加入 index；达到容量上限、租户变化或特征结束时输出 index 和对应 metaindex 行。
-4. 校验五列的 Block 数和行数一致，逐列关闭并删除已消费的 spill。
+1. 校验原生 header、相对时间戳引用、Block 顺序与连续覆盖。
+2. 读取 last 中的唯一时间列并追加到 `timestamps.bin`，将五列时间偏移统一转换为最终文件偏移。
+3. 向 `values.bin` 追加当前列的 values，确定最终 `ValuesBlockOffset`。
+4. 将更新后的 header 加入 index；达到容量上限、租户变化或特征结束时输出 index 和 metaindex 行。
+5. 核对五列 Block 数、行数与完整时间列范围，逐列清除引用并关闭已消费 spill；读回或关闭失败均退出本次写入。
 
-由此保证整个 part 的列顺序。时间戳 offset 在批次编码时确定；values offset 在 spill 读回时确定；index offset/size 在压缩输出时确定。
+全部最终数据在 `Finish(stopCh)` 中按文件全局顺序生成。入口、每个 feature、每条 spill header 读取前，以及四个 bin 同步完成但尚未创建 metadata 时检查取消；取消返回 `errForciblyStopped`，进入统一 Abort，释放尚存资源并删除未发布目录。已关闭句柄不重复关闭。时间列与值列最终偏移在 spill 读回时确定，index 偏移与长度在压缩输出时确定。
 
 ## 6. 格式校验与资源边界
 
 ### 6.1 打开校验
 
-`openDownsamplePart` 有界读取 metadata 和 metaindex，核验版本、语义字段、行长度、排序、租户及物理统计，再由 part 层为每个分辨率维护五个索引游标，遍历全部 index header；不创建 `downsampleReader`。校验使用能返回错误的临时 `filestream.ReadAtCloser`，在成功和失败路径上均关闭并合并关闭错误；通过校验的 part 使用原有 `fs.ReaderAt` 建立查询读取对象。
+`openDownsamplePart` 有界读取 metadata 和 metaindex，核验配置、统计字段、文件签名、行长度、排序及租户归属，再由 part 层为每个分辨率维护五个索引游标，遍历全部 index header；不创建 `downsampleReader`。校验使用能返回错误的临时 `filestream.ReadAtCloser`，在成功和失败路径上均关闭并合并关闭错误；通过校验的 part 使用原有 `fs.ReaderAt` 建立查询读取对象。
 
 校验包括：
 
+- 顺序读取 metaindex 中实际存在的分辨率区段，必须包含基础分辨率；每条额外列属于该租户配置，且额外列的 TSID 必须有基础数据。已配置但没有实际数据的额外分辨率无需出现；实际出现的每个分辨率均须通过完整的五特征校验。
 - 五列同时存在或同时结束；各对应 Block 的共享时间戳描述完全一致。
 - 每条 header 的行数、时间域、编码类型、精度、offset/size 合法，且与所属 metaindex 行一致。
 - 同一 index 行内的 TSID 均属于同一租户，并处于首末 TSID 范围内；行内和跨 index 的 TSID、时间顺序合法。
@@ -317,22 +350,30 @@ bucketCount = maxTimestamp / resolution - minTimestamp / resolution + 1
 | metadata 文件 | 64 KiB |
 | 单个 spill 的内存缓冲容量 | 默认 16 MiB，由 downsampling.spillMaxMemorySize 配置；按需分配，关闭后不保留到池中 |
 
-reader 的各特征索引游标只保留当前 index block；此外，每个源 reader 暂存当前 TSID 的全部首列 header，空间随该 TSID 的 block 数增长，不缓存对应的完整 payload。header 消费后清空长度，reader 关闭时释放容量，避免进入对象池后长期保留。源 part 的 metaindex 整体驻留内存。merger 的聚合状态按当前 TSID 的时间范围分配。writer 保留当前批次及其编码缓冲、当前分辨率的五个 spill 缓冲、临时文件读回缓冲、当前未输出的 index，以及整个目标 part 尚未压缩的 metaindex；压缩时复用压缩缓冲。默认配置下，五个 spill 当前持有的缓冲容量合计最多 80 MiB，不含扩容过程中尚待 GC 的旧分配及其他工作缓冲。
+降采样新增的可增长工作内存使用三份相互独立的进程级预算，并发任务或查询共享对应额度：
 
-这些是单项边界，不是进程内存的统一额度。总占用还受源 part 数量、并发任务、对象池保留容量和系统页缓存影响。`reset` 清除 `currentResolutionReaders`、`currentResolutionReaderHeap` 和 `currentTSIDReaders` 中的全部源引用，将切片长度归零，保留底层数组用于复用；reader 指针切片不设容量丢弃阈值。bucket 切片仍以 `downsampleMaxPooledBuckets = 17856` 控制 `reset` 后保留的池缓存容量，该阈值不限制任务的 bucket 数量。
+| 用途 | 预算 | 计费与不足时的处理 |
+|---|---|---|
+| SpillWriter 缓冲 | `min(256 MiB, memory.Allowed()/10)` | 按实际容量计费，扩容期间同时预留新旧缓冲；不足时直接落盘，不等待 |
+| 归并 header、基础样本、派生样本及稀疏 bucket 映射 | `min(256 MiB, memory.Allowed()/16)` | 切片按实际容量计费，稀疏映射预留 1 KiB 加每项 256 字节；不足时返回错误并进入任务清理，不等待 |
+| 查询目标 bucket 聚合 | `min(256 MiB, memory.Allowed()/20)` | 首次创建映射预留 1 KiB，每个 bucket 另按 256 字节保守计费，包含映射扩容和排序键；按当前查询的历史最大 bucket 数持有额度，直到 `tableSearch.reset` 释放；不足时返回查询错误 |
+
+`memory.Allowed()` 来自 `-memory.allowedBytes` 或 `-memory.allowedPercent` 计算的可用额度。上述预算仅约束对应的降采样工作分配，不能相加后当作进程 RSS 硬上限；它们不包含全部原始链路共享缓冲、对象池、源 part 常驻 metaindex、文件 mmap、系统页缓存以及等待垃圾回收的无引用对象。writer 仍持有当前批次编码缓冲、当前 index 和目标 metaindex；reader 仍持有当前 index block 的工作缓冲。磁盘预留额度同样不约束这些内存。
+
+每个源 reader 只缓存当前 TSID 的首列 header，不缓存完整 payload。merger 根据时间范围和源行数选择密集基础槽或实际 bucket 映射，再逐个生成额外分辨率。writer 的实际分辨率数是本 part 各租户输出分辨率的并集，每个分辨率有五个 spill；总 spill 缓冲受进程预算约束，不按分辨率或任务数量无限叠加。资源释放时先清除持有引用，再归还相应额度；失败和取消路径也必须释放，重复清理不得重复归还。
 
 ### 6.3 磁盘空间预算
 
-令 `R` 为两个分辨率合计的降采样逻辑行数，`B` 为多特征批次数，`F=5`、`H=89`、`M=113`。[downsample_writer.go](lib/storage/downsample_writer.go) 中的 `estimateDownsampleOutputSize` 采用以下保守预算：
+令 `R` 为全部实际分辨率合计的降采样逻辑行数，`B` 为多特征批次数，`F=5`、`H=89`、`M=113`。[downsample_writer.go](lib/storage/downsample_writer.go) 中的 `estimateDownsampleOutputSize` 采用以下保守预算：
 
 | 部分 | 字节数上界 |
 |---|---|
 | 最终时间戳和值负载 | `10 × R × (F + 1)` |
 | index 与 metaindex | `F × B × ((2H + 256 + 8) + (2M + 256 + 8))` |
-| 与最终输出同时存在的 spill | `10 × R × F + F × B × H` |
+| 与最终输出同时存在的 spill | `10 × R × (F + 1) + F × B × H` |
 | metadata | 64 KiB |
 
-[downsample_part.go](lib/storage/downsample_part.go) 中的 `estimateDownsamplePartSize` 根据源统计计算所需行数：原始输入按两个目标分辨率估算；降采样源的物理行数除以五并向上取整。未知 TSID 分布时取 `B=R`，按每行单独占据 Block 和 index 的情况估算。writer 中的空间加法和乘法在溢出时饱和到 `math.MaxUint64`，不将删除源文件作为可用空间。
+[downsample_part.go](lib/storage/downsample_part.go) 中的 `estimateDownsamplePartSize` 根据源统计计算所需行数：原始输入使用原始行数；降采样源优先累加基础 last 列的 metaindex 行数，没有索引统计时按物理行数除以五并向上取整。再乘当前配置的单租户最大分辨率数，保守估算每条源输入最多生成的输出。这一系数用于逐行磁盘估算，不代表 writer 同时活跃的分辨率并集大小。未知 TSID 分布时取 `B=R`，按每行单独占据 Block 和 index 的情况估算。writer 中的空间加法和乘法在溢出时饱和到 `math.MaxUint64`，不将删除源文件作为可用空间。
 
 [downsample_partition.go](lib/storage/downsample_partition.go) 管理预算类型、进程级预算、预留与缓存有效期。进程内所有目录的降采样任务共享磁盘预算，并保留 `freeDiskSpaceLimitBytes` 指定的最低空闲空间。已释放的预算继续计入占用两秒，覆盖空闲空间查询的缓存周期。writer 在写批次、读回 spill 和最终输出前重新查询可用磁盘空间，该查询仍有两秒缓存；空间不足返回可识别的 `errDownsampleNoSpace`。预算检查不能替代实际 I/O 错误处理。
 
@@ -342,7 +383,7 @@ reader 的各特征索引游标只保留当前 index block；此外，每个源 
 
 降采样自身的校验、取消、spill、偏移读取以及接口返回的写入错误由本模块处理。最终文件创建、缓冲刷出、同步和关闭复用原始链路的 `Must` 行为，目录同步复用 `fs.MustSyncPath`；这些共享操作失败时仍采用原有致命错误处理。`lib/filestream` 的既有 Writer、Reader、接口和缓冲池，以及 `lib/fs` 的实现保持不变。新增组件只有纯临时字节流 `SpillWriter` 和独立偏移读取 `ReaderAt`。
 
-非空目标的 `Finish` 按以下顺序完成：
+非空目标的 `Finish(stopCh)` 按以下顺序完成，取消信号沿 spill 组装流程透传；不需要取消的调用传入 `nil`：
 
 1. 读回并清理全部 spill，完成 `timestamps.bin`、`values.bin`、`index.bin` 和 `metaindex.bin` 的写入。
 2. 通过原有 `MustClose` 刷出缓冲、同步并关闭四个 `.bin` 文件，再同步 part 目录。
@@ -371,25 +412,22 @@ writer 自身验证、spill 读回及接口返回的写入错误会阻止发布�
 
 分区发现排除快照目录、空目录和带有 `.delete-this-dir` 删除标记的目录。清单中的非法 part 名称、未知字段、重复字段、重复 part 名称，以及活动 part 目录缺失，均返回错误。存在活动降采样 part 时必须启用降采样，快照中的非活动文件不构成此开关冲突。
 
-合法原始文件可以与降采样文件共存，并在后续归并时转换。`detectDownsampleFormat` 只读取 metadata，校验 JSON、格式版本及必需字段；不读取 metaindex 标识，也不检查 `.bin` 文件的大小或类型。缺少 metadata 的旧原始格式继续按目录名解析。带有降采样语义但版本缺失，或降采样 metadata 不完整、版本不支持时返回错误。实际数据文件的标识、类型、长度和索引一致性由 `openDownsamplePart` 校验；格式检测成功不等于数据文件已通过完整检查。降采样只接受本文规定的布局；版本值相同并不代表其他二进制布局兼容。当前不提供布局迁移。
+合法原始文件可以与降采样文件共存，并在后续归并时转换。`detectDownsampleFormat` 只读取 metadata：`downsampling_config` 缺失或为 `null` 时校验原始 partHeader；非 `null` 时必须是有效配置，同时完整校验五个统计字段。配置或统计损坏时返回错误，不退回原始格式。缺少 metadata 的旧原始格式继续按目录名解析。格式识别不读取 metaindex，也不检查 `.bin` 文件大小或类型；固定签名、文件类型、长度和索引一致性由 `openDownsamplePart` 校验。格式检测成功不等于数据文件已经完整校验。降采样只接受本文规定的布局，当前不提供布局迁移。
 
 ## 8. 降采样查询
 
-HTTP 使用两个独立参数：`query.resolution` 指定 `5m` 或 `1h`，`query.feature` 指定 `last`、`sum`、`count`、`min` 或 `max`，例如 `query.resolution=5m&query.feature=sum`。两个参数必须同时提供且各出现一次；空值、非法值、重复参数和旧参数 `query.field` 均返回错误。两者均未提供时使用原始查询路径。
+HTTP 使用 `resolution` 和 `feature` 两个参数，例如 `resolution=2h&feature=sum`。两者必须同时提供且各出现一次；空值、非法值、重复参数和旧参数 `query.field` 返回参数错误。分辨率使用与配置相同的时间间隔语法，并须为源 part 基础分辨率的整数倍；不要求它已经作为额外分辨率配置或落盘。特征固定为五种。两者均未提供时使用原始查询路径。
 
-参数解析为 `DownsampleQuery{ResolutionMs, Feature}`，经 HTTP、`EvalConfig`、`SearchQuery` 和集群 RPC 传递到存储端。`Search.Init → tableSearch.Init → partitionSearch.Init → partSearch.Init` 均在原有参数表末尾接收 `*DownsampleQuery`；`nil` 表示原始查询。各层只透传选择，不复制一套搜索入口，也不在查询中重新降采样。
+参数以 `DownsampleQuery{ResolutionMs, Feature}` 经 HTTP、`EvalConfig`、`SearchQuery` 和 RPC 进入 `Search.Init → tableSearch.Init → partitionSearch.Init → partSearch.Init`。指定参数只读取降采样 part，不将原始 part 临时转换；不指定参数只读取原始 part。
 
-| 查询方式 | 读取范围 |
-|---|---|
-| 同时指定 `query.resolution` 和 `query.feature` | 只读取已落盘的降采样 part 中对应分辨率、对应特征；跳过原始 part |
-| 两个参数均未指定 | 使用原有查询流程；跳过降采样 part |
+`partSearch` 根据每个 part 自身的配置和实际 metaindex，逐租户选择「能整除目标分辨率的最大已存分辨率」，同一 part 只选一种输入表示。例如请求 2h：已有 1h 就读 1h，只有 30m 就读 30m，只有基础 5m 就读 5m；请求 90m 时可选 45m 或 30m，不能选 1h。不同 part 可以选择不同输入分辨率，避免同时读取基础列与额外列而重复计数。
 
-降采样 RPC 为 `search_downsampling_v2`。它保留原有租户、时间范围和筛选条件的组织方式，在查询负载后追加 8 字节分辨率和 1 字节特征编号；编号与磁盘格式相同。响应继续使用原生 MetricBlock。`netstorage.execSearchQueryRequest` 在原有请求发送流程内选择 RPC 和编码方式，不另设降采样请求包装层。
+选定列的 index 继续使用 `ibCache` 和 `p.indexFile.MustReadAt`；原生 header 交给 `BlockRef.MustReadBlock`，通过 part 原有 `fs.ReaderAt` 读取时间列和单个请求特征。mmap、页状态判断、系统调用回退、读取统计、时间范围筛选和文件 I/O 的 `Must` 语义保持一致，查询不使用 `downsampleReader`，也不读其他四个特征。
 
-降采样查询与原始查询共用 `collectResults`。节点故障按原有 `denyPartialResponse`、组内及跨组副本配置、`search.skipSlowReplicas` 策略处理；符合副本完整性条件时可返回完整响应，允许部分响应且仍有成功节点时可返回带部分结果标记的响应，无法满足要求时返回错误。远端明确错误、复杂度限制和临时结果文件错误仍遵守原有分类规则，不因指定降采样而另加“全部节点成功”的要求。共用 HTTP 和 RPC 流程不按降采样选择添加通用错误前缀，也不为旧节点另设兼容回退。
+`tableSearch` 复用原有 part／partition 堆按 TSID 收集全部选定输入，再按目标 bucket 聚合请求特征：sum/count 累加，last 按最大共享时间戳选择，min/max 取极值。即使输入跨 block、index、part 或月份分区，同一个目标 bucket 也只在当前 TSID 的全部贡献完成后输出。状态仅保存当前 TSID 的非空 bucket；输出按行数与精度拆分成独立、不可变的原生编码 Block，已复制的 BlockRef 不依赖后续游标缓冲。
 
-降采样查询禁用结果缓存及为缓存进行的时间范围对齐，因为结果缓存键尚未区分分辨率和特征；原有存储索引缓存继续使用。
+输入时间范围先扩展到完整目标 bucket，避免查询边界截断贡献；聚合完成后，以结果的最大共享时间戳应用原请求范围及保留期限。HTTP 仍遵循 PromQL 的回看窗口和求值网格，不恢复 bucket 内的原始样本或精确裁剪部分贡献。源精度在同一输出 bucket 内必须一致。原有查询 deadline 与 pace 检查覆盖聚合入口、构建排序键及输出过滤循环，失败时停止当前查询；排序为一次同步操作，输入规模受查询 bucket 预算约束。预算按查询高水位持有至 `tableSearch.reset`，不在 TSID 切换时提前归还仍在复用的映射和切片容量。
 
-`partSearch` 直接按分辨率和特征筛选 metaindex，读取目标列的 index，并复用原有 `ibCache`、TSID 与时间范围筛选以及 `BlockRef` 构造流程。索引未命中缓存时，通过 `p.indexFile.MustReadAt` 读取；定位到原生 `blockHeader` 后，由 `BlockRef` 和原生 `Block` 经 `p.timestampsFile`、`p.valuesFile` 按偏移读取并解码 payload。这三个查询读取对象均为原有 `fs.ReaderAt`，文件读取方式及 mmap 优化与原始查询一致，I/O 故障沿用原有 `Must` 语义。查询不读取其余四个特征的 index 和 payload。`downsampleReader` 仅供归并使用，查询不创建或借用该 reader。
+降采样 RPC 使用 `search_downsampling_v2`，在原查询负载后追加 8 字节分辨率和 1 字节特征，响应仍为原生 MetricBlock。`execSearchQueryRequest` 在既有发送流程中选择 RPC，结果收集共用 `collectResults`。节点错误、部分响应、副本容错、慢副本、超时和通用错误沿用原始策略；参数与协议校验单独保留，不为旧节点新增回退。
 
-存储层按共享时间戳选择记录，不恢复或重新裁剪 bucket 内原始贡献；HTTP 查询继续遵循 PromQL 的回看窗口和求值网格。vmselect 与 vmstorage 的去重配置独立生效，需要保留全部降采样记录时，两端都应设置 `dedup.minScrapeInterval=0`。当前降采样接口不聚合尚未合并的跨 part 记录，不组合原始与降采样结果，也不提供自定义分辨率或任意时间区间的精确原始聚合。
+降采样禁用未区分分辨率与特征的结果缓存及相应时间对齐，保留索引缓存。vmselect 与 vmstorage 的去重配置独立生效，需要保留全部降采样记录时两端均应设置 `dedup.minScrapeInterval=0`。跨 part／partition 聚合发生在单个 vmstorage 的查询内；多个 vmstorage 的网络响应继续遵守现有分布式查询机制。

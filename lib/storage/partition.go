@@ -584,7 +584,16 @@ func (pt *partition) smallPartsMerger() {
 			return
 		}
 
-		smallPartsConcurrencyCh <- struct{}{}
+		if pt.s.downsamplingEnabled {
+			select {
+			case smallPartsConcurrencyCh <- struct{}{}:
+			case <-pt.stopCh:
+				pt.releasePartsToMerge(pws)
+				return
+			}
+		} else {
+			smallPartsConcurrencyCh <- struct{}{}
+		}
 		err := pt.mergeParts(pws, pt.stopCh, false, false)
 		<-smallPartsConcurrencyCh
 
@@ -617,7 +626,16 @@ func (pt *partition) bigPartsMerger() {
 			return
 		}
 
-		bigPartsConcurrencyCh <- struct{}{}
+		if pt.s.downsamplingEnabled {
+			select {
+			case bigPartsConcurrencyCh <- struct{}{}:
+			case <-pt.stopCh:
+				pt.releasePartsToMerge(pws)
+				return
+			}
+		} else {
+			bigPartsConcurrencyCh <- struct{}{}
+		}
 		err := pt.mergeParts(pws, pt.stopCh, false, false)
 		<-bigPartsConcurrencyCh
 
@@ -1094,10 +1112,21 @@ func (pt *partition) mergePartsToFilesWithDownsampling(pws []*partWrapper, stopC
 	var errGlobal error
 	var errGlobalLock sync.Mutex
 	wg := getWaitGroup()
+mergeLoop:
 	for len(pws) > 0 {
 		pwsToMerge, pwsRemaining := getPartsForOptimalMerge(pws)
-		concurrencyCh <- struct{}{}
 		if downsampling {
+			select {
+			case concurrencyCh <- struct{}{}:
+			case <-stopCh:
+				pt.releasePartsToMerge(pws)
+				errGlobalLock.Lock()
+				if errGlobal == nil {
+					errGlobal = errForciblyStopped
+				}
+				errGlobalLock.Unlock()
+				break mergeLoop
+			}
 			errGlobalLock.Lock()
 			failed := errGlobal != nil
 			errGlobalLock.Unlock()
@@ -1107,6 +1136,8 @@ func (pt *partition) mergePartsToFilesWithDownsampling(pws []*partWrapper, stopC
 				pt.releasePartsToMerge(pwsRemaining)
 				break
 			}
+		} else {
+			concurrencyCh <- struct{}{}
 		}
 
 		wg.Go(func() {
@@ -1145,7 +1176,7 @@ func (pt *partition) ForceMergeAllParts(stopCh <-chan struct{}) error {
 	// Check whether there is enough disk space for merging pws.
 	newPartSize := getPartsSize(pws)
 	if pt.s.downsamplingEnabled {
-		newPartSize = estimateDownsamplePartSize(pws)
+		newPartSize = estimateDownsamplePartSize(pws, pt.s.getDownsamplingConfig())
 	}
 	maxOutBytes := fs.MustGetFreeSpace(pt.bigPartsPath)
 	if newPartSize > maxOutBytes {
@@ -1433,7 +1464,7 @@ var (
 func (pt *partition) getDstPartType(pws []*partWrapper, isFinal bool) partType {
 	dstPartType := pt.getRawDstPartType(pws, isFinal)
 	// 原始内存目标选择保持不变，仅复核文件目标的降采样空间上界。
-	if pt.s != nil && pt.s.downsamplingEnabled && dstPartType == partSmall && estimateDownsamplePartSize(pws) > pt.getMaxSmallPartSize() {
+	if pt.s != nil && pt.s.downsamplingEnabled && dstPartType == partSmall && estimateDownsamplePartSize(pws, pt.s.getDownsamplingConfig()) > pt.getMaxSmallPartSize() {
 		return partBig
 	}
 	return dstPartType
@@ -1514,6 +1545,10 @@ func (pt *partition) mergePartsInternal(dstPartPath string, bsw *blockStreamWrit
 		logger.Panicf("BUG: unknown partType=%d", dstPartType)
 	}
 	retentionDeadline := currentTimestamp - pt.s.retentionMsecs
+	if pt.s.downsamplingEnabled {
+		// 内存输出保持原生格式，但必须保留后续降采样所需的完整 bucket 前缀。
+		retentionDeadline = downsampleRetentionStart(pt.s.getDownsamplingConfig(), retentionDeadline)
+	}
 	activeMerges.Add(1)
 	_ = useSparseCache // unused in OSS version.
 	dmis := pt.idb.getDeletedMetricIDs()
@@ -1676,21 +1711,21 @@ func (pt *partition) removeStaleParts() {
 	var pws []*partWrapper
 	pt.partsLock.Lock()
 	for _, pw := range pt.inmemoryParts {
-		if !pw.isInMerge && pw.p.ph.MaxTimestamp < retentionDeadline {
+		if !pw.isInMerge && pt.partExpired(pw.p, retentionDeadline) {
 			pt.inmemoryRowsDeleted.Add(pw.p.ph.RowsCount)
 			pw.isInMerge = true
 			pws = append(pws, pw)
 		}
 	}
 	for _, pw := range pt.smallParts {
-		if !pw.isInMerge && pt.filePartExpired(pw.p, retentionDeadline) {
+		if !pw.isInMerge && pt.partExpired(pw.p, retentionDeadline) {
 			pt.smallRowsDeleted.Add(pw.p.ph.RowsCount)
 			pw.isInMerge = true
 			pws = append(pws, pw)
 		}
 	}
 	for _, pw := range pt.bigParts {
-		if !pw.isInMerge && pt.filePartExpired(pw.p, retentionDeadline) {
+		if !pw.isInMerge && pt.partExpired(pw.p, retentionDeadline) {
 			pt.bigRowsDeleted.Add(pw.p.ph.RowsCount)
 			pw.isInMerge = true
 			pws = append(pws, pw)

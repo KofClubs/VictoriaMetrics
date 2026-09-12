@@ -238,7 +238,7 @@ func TestDownsampleFailureFinalLifecycle(t *testing.T) {
 	for _, operation := range []string{"close", "snapshot"} {
 		t.Run(operation, func(t *testing.T) {
 			path := t.TempDir()
-			s := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true})
+			s := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true, DownsamplingConfig: downsampleTestConfig(t)})
 			t.Cleanup(func() {
 				if s != nil {
 					s.MustClose()
@@ -263,7 +263,7 @@ func TestDownsampleFailureFinalLifecycle(t *testing.T) {
 			}
 			s.MustClose()
 			s = nil
-			reopened := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true})
+			reopened := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true, DownsamplingConfig: downsampleTestConfig(t)})
 			defer reopened.MustClose()
 			assertDownsampleTestStorageFormats(t, reopened, true, false)
 			if source.refCount.Load() != 0 {
@@ -297,7 +297,7 @@ func TestDownsampleFailureAfterPublication(t *testing.T) {
 	if _, err := os.Stat(sourcePath); err != nil {
 		t.Fatalf("目录 sync 失败删除了旧磁盘源: %v", err)
 	}
-	target, err := openDownsamplePart(pt.smallParts[0].p.path)
+	target, err := openDownsamplePart(pt.smallParts[0].p.path, nil)
 	if err != nil {
 		t.Fatalf("目录 sync 失败删除了已提交目标: %v", err)
 	}
@@ -326,7 +326,7 @@ func TestDownsampleFailureFinalSyncAfterPublication(t *testing.T) {
 	if pt.smallParts[0].p.dsMetadata == nil {
 		t.Fatal("已发布目标被错误回退或覆盖")
 	}
-	target, err := openDownsamplePart(pt.smallParts[0].p.path)
+	target, err := openDownsamplePart(pt.smallParts[0].p.path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,7 +497,7 @@ func TestCheckDownsamplingOpenInvalidManifests(t *testing.T) {
 			manifest := filepath.Join(path, "data/small/2025_01", partsFilename)
 			writeDownsampleOpenTestFile(t, manifest, []byte(tc.data))
 			before := snapshotDownsampleOpenTestFiles(t, path)
-			err := checkDownsamplingOpen(path, OpenOptions{DownsamplingEnabled: true})
+			err := checkDownsamplingOpen(path, OpenOptions{DownsamplingEnabled: true, DownsamplingConfig: downsampleTestConfig(t)})
 			if err == nil || !strings.HasPrefix(err.Error(), "[downsampling] ") || !strings.Contains(err.Error(), tc.wantErr) || !strings.Contains(err.Error(), manifest) {
 				t.Fatalf("unexpected manifest error: got %v; want %q and %q", err, tc.wantErr, manifest)
 			}
@@ -520,7 +520,7 @@ func TestMustOpenStorageDownsamplingRejectsDedup(t *testing.T) {
 						t.Fatalf("unexpected storage API result: got %v; want a dedup configuration panic", r)
 					}
 				}()
-				s := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true})
+				s := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true, DownsamplingConfig: downsampleTestConfig(t)})
 				s.MustClose()
 			}()
 			for _, name := range []string{dataDirname, indexdbDirname, snapshotsDirname, cacheDirname, metadataDirname} {
@@ -580,8 +580,32 @@ func TestCheckDownsamplingOpenDisabledPreservesDedup(t *testing.T) {
 	}
 }
 
+func TestDownsamplePartitionCancelledWhileWaitingForMergeSlot(t *testing.T) {
+	source := &partWrapper{p: &part{size: 1}, isInMerge: true}
+	pt := &partition{}
+	concurrencyCh := make(chan struct{}, 1)
+	concurrencyCh <- struct{}{}
+	stopCh := make(chan struct{})
+	close(stopCh)
+	done := make(chan error, 1)
+	go func() {
+		done <- pt.mergePartsToFilesWithDownsampling([]*partWrapper{source}, stopCh, concurrencyCh, false, true)
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errForciblyStopped) || source.isInMerge || source.mustDrop.Load() {
+			t.Fatalf("cancelled queue wait did not preserve and release its source: err=%v inMerge=%t", err, source.isInMerge)
+		}
+		if len(concurrencyCh) != 1 {
+			t.Fatal("cancelled waiter consumed another merge's concurrency slot")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled downsampling merge remained blocked on a full concurrency queue")
+	}
+}
+
 func TestDownsamplePartitionInmemoryAndFailedOutput(t *testing.T) {
-	s := MustOpenStorage(t.TempDir(), OpenOptions{DownsamplingEnabled: true})
+	s := MustOpenStorage(t.TempDir(), OpenOptions{DownsamplingEnabled: true, DownsamplingConfig: downsampleTestConfig(t)})
 	defer s.MustClose()
 	base := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour).UnixMilli()
 	ptw := s.tb.MustGetPartition(base)
@@ -651,7 +675,7 @@ func TestDownsamplePartitionInmemoryAndFailedOutput(t *testing.T) {
 }
 
 func TestDownsamplePartitionSmallBigMerge(t *testing.T) {
-	s := MustOpenStorage(t.TempDir(), OpenOptions{DownsamplingEnabled: true})
+	s := MustOpenStorage(t.TempDir(), OpenOptions{DownsamplingEnabled: true, DownsamplingConfig: downsampleTestConfig(t)})
 	defer s.MustClose()
 	base := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour).UnixMilli()
 	ptw := s.tb.MustGetPartition(base)
@@ -694,13 +718,90 @@ func TestDownsamplePartitionSmallBigMerge(t *testing.T) {
 	assertDownsampleTestStorageRows(t, s, referenceDownsampleTestRows(rows, nil, 0))
 }
 
-func TestDownsamplePartitionFilePartExpired(t *testing.T) {
+func TestDownsamplePartitionRetentionBoundaries(t *testing.T) {
+	config, err := ParseDownsamplingConfig([]byte(`{"base_resolution":"5m","tenant_resolutions":[{"tenant":"1:0","resolutions":["7h"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const resolution = int64(7 * time.Hour / time.Millisecond)
+	monthEnd := time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC).UnixMilli() - 1
+	bucketEnd := (monthEnd/resolution + 1) * resolution
+	if bucketEnd <= monthEnd+1 {
+		t.Fatal("fixture must cross a month boundary")
+	}
+	s := &Storage{downsamplingEnabled: true}
+	s.downsamplingConfig.Store(config)
+	pt := partition{s: s, tr: TimeRange{MinTimestamp: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli(), MaxTimestamp: monthEnd}}
+	p := &part{ph: partHeader{MaxTimestamp: monthEnd}}
+	if pt.partExpired(p, monthEnd+2) || pt.retentionExpired(monthEnd+2) {
+		t.Fatal("retention removed a live bucket's previous-month prefix")
+	}
+	if !pt.partExpired(p, bucketEnd) || !pt.retentionExpired(bucketEnd) {
+		t.Fatal("retention kept a fully expired bucket")
+	}
+	// 移除当前配置的粗分辨率后，旧 part 的配置仍保护它已保存的跨月贡献。
+	p.dsMetadata = &downsamplePartMetadata{DownsamplingConfig: config}
+	pt.smallParts = []*partWrapper{{p: p}}
+	s.downsamplingConfig.Store(defaultDownsamplingConfig())
+	if pt.partExpired(p, monthEnd+2) || pt.retentionExpired(monthEnd+2) {
+		t.Fatal("configuration update removed the old part's live bucket prefix")
+	}
+	if !pt.retentionExpired(bucketEnd) {
+		t.Fatal("old metadata retained a fully expired partition")
+	}
+	s.downsamplingEnabled = false
+	if !pt.partExpired(p, monthEnd+2) || !pt.retentionExpired(monthEnd+2) {
+		t.Fatal("disabled downsampling changed raw retention")
+	}
+}
+
+func TestDownsamplePartitionInmemoryRetention(t *testing.T) {
+	owner, _ := newDownsampleFailurePartition(t)
+	config, err := ParseDownsamplingConfig([]byte(`{"base_resolution":"5m","tenant_resolutions":[{"tenant":"0:0","resolutions":["2h"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const base int64 = 1704067200000
+	rows := []rawRow{
+		{TSID: TSID{MetricID: 1}, Timestamp: base + 60000, Value: 2, PrecisionBits: 64},
+		{TSID: TSID{MetricID: 1}, Timestamp: base + 61*60000, Value: 3, PrecisionBits: 64},
+	}
+	source := newDownsampleTestRawPart(t, rows)
+	for _, enabled := range []bool{true, false} {
+		// 使用独立状态和显式当前时间，避免修改后台 Storage 的 retention。
+		s := &Storage{downsamplingEnabled: enabled}
+		s.downsamplingConfig.Store(config)
+		pt := partition{s: s, idb: owner.idb}
+		reader := getBlockStreamReader()
+		reader.MustInitFromInmemoryPart(source.mp)
+		writer := getBlockStreamWriter()
+		target := getInmemoryPart()
+		writer.MustInitFromInmemoryPart(target, 1)
+		ph, err := pt.mergePartsInternal("", writer, []*blockStreamReader{reader}, partInmemory, nil, base+70*60000, false)
+		putBlockStreamReader(reader)
+		putBlockStreamWriter(writer)
+		putInmemoryPart(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantRows := uint64(0)
+		if enabled {
+			wantRows = uint64(len(rows))
+		}
+		if ph.RowsCount != wantRows {
+			t.Fatalf("downsampling=%v: got %d retained raw rows; want %d", enabled, ph.RowsCount, wantRows)
+		}
+	}
+}
+
+func TestDownsamplePartitionPartExpired(t *testing.T) {
 	const base int64 = 1704067200000
 	pt := partition{s: &Storage{downsamplingEnabled: true}}
+	pt.s.downsamplingConfig.Store(downsampleTestConfig(t))
 	for _, summary := range []bool{false, true} {
 		p := part{ph: partHeader{MaxTimestamp: base + 60000}}
 		if summary {
-			p.dsMetadata = &downsamplePartMetadata{}
+			p.dsMetadata = &downsamplePartMetadata{DownsamplingConfig: downsampleTestConfig(t)}
 		}
 		for _, tc := range []struct {
 			deadline int64
@@ -712,18 +813,18 @@ func TestDownsamplePartitionFilePartExpired(t *testing.T) {
 			{base + downsampleResolution1h, true},
 			{base + downsampleResolution1h + 1, true},
 		} {
-			if got := pt.filePartExpired(&p, tc.deadline); got != tc.want {
+			if got := pt.partExpired(&p, tc.deadline); got != tc.want {
 				t.Fatalf("unexpected expiry for summary=%v, deadline=%d; got %v; want %v", summary, tc.deadline, got, tc.want)
 			}
 		}
 	}
 	invalid := part{ph: partHeader{MaxTimestamp: minUnixMilli - 1}}
-	if pt.filePartExpired(&invalid, maxUnixMilli) {
+	if pt.partExpired(&invalid, maxUnixMilli) {
 		t.Fatal("cannot prove invalid time range fully expired")
 	}
 	pt.s.downsamplingEnabled = false
 	raw := part{ph: partHeader{MaxTimestamp: base + 60000}}
-	if pt.filePartExpired(&raw, raw.ph.MaxTimestamp) || !pt.filePartExpired(&raw, raw.ph.MaxTimestamp+1) {
+	if pt.partExpired(&raw, raw.ph.MaxTimestamp) || !pt.partExpired(&raw, raw.ph.MaxTimestamp+1) {
 		t.Fatal("disabled downsampling changed the raw expiry boundary")
 	}
 }
@@ -735,7 +836,7 @@ func TestDownsamplePartitionFileOutput(t *testing.T) {
 			name = "multiple-inmemory-merge"
 		}
 		t.Run(name, func(t *testing.T) {
-			s := MustOpenStorage(t.TempDir(), OpenOptions{DownsamplingEnabled: true})
+			s := MustOpenStorage(t.TempDir(), OpenOptions{DownsamplingEnabled: true, DownsamplingConfig: downsampleTestConfig(t)})
 			defer s.MustClose()
 			base := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour).UnixMilli()
 			ptw := s.tb.MustGetPartition(base)
@@ -779,7 +880,7 @@ func TestDownsamplePartitionFileOutput(t *testing.T) {
 func TestDownsampleRecoveryKeepsCommittedTargetAfterPanic(t *testing.T) {
 	setDownsampleOpenTestDedup(t, 0)
 	path := t.TempDir()
-	s := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true})
+	s := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true, DownsamplingConfig: downsampleTestConfig(t)})
 	defer func() {
 		if s != nil {
 			s.MustClose()
@@ -851,7 +952,7 @@ func TestDownsampleRecoveryKeepsCommittedTargetAfterPanic(t *testing.T) {
 		targetPath = filepath.Join(pt.bigPartsPath, manifest.Big[0])
 	}
 	// 独立打开清单指向的文件，确保外层清理没有删除已提交的目标及其任一列。
-	target, err := openDownsamplePart(targetPath)
+	target, err := openDownsamplePart(targetPath, nil)
 	if err != nil {
 		t.Fatalf("committed target was deleted or corrupted after the panic: %s", err)
 	}
@@ -866,7 +967,7 @@ func TestDownsampleRecoveryKeepsCommittedTargetAfterPanic(t *testing.T) {
 	s.MustClose()
 	s = nil
 
-	reopened := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true})
+	reopened := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true, DownsamplingConfig: downsampleTestConfig(t)})
 	defer reopened.MustClose()
 	assertDownsampleTestStorageRows(t, reopened, referenceDownsampleTestRows(rows, nil, 0))
 }
@@ -874,7 +975,7 @@ func TestDownsampleRecoveryKeepsCommittedTargetAfterPanic(t *testing.T) {
 func TestDownsampleRecoveryDiscardsUnpublishedPart(t *testing.T) {
 	setDownsampleOpenTestDedup(t, 0)
 	path := t.TempDir()
-	s := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true})
+	s := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true, DownsamplingConfig: downsampleTestConfig(t)})
 	defer func() {
 		if s != nil {
 			s.MustClose()
@@ -902,8 +1003,8 @@ func TestDownsampleRecoveryDiscardsUnpublishedPart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 模拟目标仅写出部分内容便退出；未知格式的孤立目录不得进入活动格式校验或恢复结果。
-	writeDownsampleOpenTestFile(t, filepath.Join(orphanPath, metadataFilename), []byte(`{"FormatVersion":255}`))
+	// 模拟目标仅写出部分内容便退出；元数据不完整的孤立目录不得进入活动格式校验或恢复结果。
+	writeDownsampleOpenTestFile(t, filepath.Join(orphanPath, metadataFilename), []byte(`{"downsampling_config":{}}`))
 	writeDownsampleOpenTestFile(t, filepath.Join(orphanPath, metaindexFilename), []byte("incomplete output"))
 	// 同时模拟 rename 前退出，私有暂存目录内只有不完整清单。
 	manifestTempDir, err := os.MkdirTemp(filepath.Dir(manifestPath), partsFilename+".tmp.")
@@ -911,7 +1012,7 @@ func TestDownsampleRecoveryDiscardsUnpublishedPart(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeDownsampleOpenTestFile(t, filepath.Join(manifestTempDir, partsFilename), []byte(`{"Small":[`))
-	reopened := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true})
+	reopened := MustOpenStorage(path, OpenOptions{DownsamplingEnabled: true, DownsamplingConfig: downsampleTestConfig(t)})
 	defer reopened.MustClose()
 	for _, unpublishedPath := range []string{orphanPath, manifestTempDir} {
 		if _, err := os.Stat(unpublishedPath); !os.IsNotExist(err) {
@@ -950,7 +1051,7 @@ func TestDownsamplePartitionConcurrentQueryMerge(t *testing.T) {
 				w := getDownsampleWriter()
 				func() {
 					defer putDownsampleWriter(w)
-					if err := w.Init(sourcePath, 1); err != nil {
+					if err := w.Init(sourcePath, 1, downsampleTestConfig(t, TenantToken{AccountID: 11, ProjectID: 17})); err != nil {
 						t.Fatal(err)
 					}
 					// 每个 index 最多两个 header；同一 TSID 必须跨 index 继续读取。
@@ -968,7 +1069,7 @@ func TestDownsamplePartitionConcurrentQueryMerge(t *testing.T) {
 							}
 						}
 					}
-					if _, err := w.Finish(); err != nil {
+					if _, err := w.Finish(nil); err != nil {
 						t.Fatal(err)
 					}
 				}()

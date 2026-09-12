@@ -13,20 +13,31 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
 )
 
-// spillMaxMemorySize bounds each spill's in-memory tail. A downsampling writer
-// can hold five spills at once, so their buffers can occupy up to 5× this value
-// per job. Buffers grow on demand and are released on Close, without a
-// large-buffer pool. It is tunable at runtime via -downsampling.spillMaxMemorySize;
-// raising it reduces write syscalls but multiplies peak memory by the merge
-// concurrency, which reaches up to max(4, CPU cores).
+// spillMaxMemorySize bounds each spill's in-memory tail. All spills additionally
+// share a process-wide budget, including buffers temporarily retained during growth.
 var spillMaxMemorySize = flagutil.NewBytes("downsampling.spillMaxMemorySize", 16*1024*1024,
 	"The maximum number of bytes to buffer in memory per downsampling spill before overflowing to a temporary file. "+
-		"A downsampling merge holds five spills (last, sum, count, min, max) at once and up to max(4, CPU cores) merges run concurrently, "+
-		"so peak memory scales as concurrency × 5 × this value. Larger values reduce write syscalls but increase memory usage")
+		"Must be positive. All spills share a memory budget of the smaller of 256 MiB and 10% of memory.allowedBytes or the memory.allowedPercent allowance; "+
+		"when this budget is exhausted, writes spill to disk without waiting for memory")
 
-// SpillWriter keeps a byte stream in memory until it exceeds spillMaxMemorySize.
+// Bound the combined buffers across all resolutions and concurrent merges.
+// This is an allocation budget, not a limit on the process RSS or filesystem cache.
+const spillMaxTotalMemorySize = 256 << 20
+
+var spillMemoryBudgetOnce sync.Once
+var spillMemoryBudget memory.Limiter
+
+func getSpillMemoryBudget() *memory.Limiter {
+	spillMemoryBudgetOnce.Do(func() {
+		spillMemoryBudget.MaxSize = uint64(min(spillMaxTotalMemorySize, memory.Allowed()/10))
+	})
+	return &spillMemoryBudget
+}
+
+// SpillWriter keeps a byte stream in memory while both memory budgets permit it.
 // Each full buffer is then appended to one lazily created temporary file; the
 // final tail remains in memory. It owns and removes that file.
 //
@@ -39,9 +50,10 @@ var spillMaxMemorySize = flagutil.NewBytes("downsampling.spillMaxMemorySize", 16
 type SpillWriter struct {
 	path          string
 	f             spillFile
-	memory        []byte // Pending tail; capacity never exceeds the memory threshold.
-	fileSize      uint64 // Bytes appended to the temporary file, preceding memory.
-	size          uint64 // All accepted bytes, including memory; preserved after Close.
+	memory        []byte          // Pending tail; capacity never exceeds the memory threshold.
+	memoryBudget  *memory.Limiter // Accounts for owned capacity; no reservation is held across a blocking wait.
+	fileSize      uint64          // Bytes appended to the temporary file, preceding memory.
+	size          uint64          // All accepted bytes, including memory; preserved after Close.
 	state         spillState
 	closed        bool // Sealed by Close (or a failed Write); further operations fail.
 	created       bool // The temporary file exists and still needs removal.
@@ -49,7 +61,7 @@ type SpillWriter struct {
 	err           error
 
 	// A positive value lets instance-level tests exercise spilling with small data.
-	// Production leaves this zero and always uses spillMaxMemorySize.
+	// Production captures spillMaxMemorySize at the first nonempty Write.
 	memoryLimit int
 
 	// Per-instance removal allows testing cleanup failures without global hooks.
@@ -79,7 +91,7 @@ const (
 )
 
 // NewSpillWriter returns a writer which creates its temporary file directly
-// under dir when its in-memory data exceeds spillMaxMemorySize. dir must already
+// under dir when its per-spill threshold or shared allocation budget is reached. dir must already
 // exist. name identifies this spill within dir, so each spill in a directory
 // must use a distinct name; it also documents the spill's purpose in the filename.
 // The caller must eventually call Close, including on failure.
@@ -108,6 +120,13 @@ func (w *SpillWriter) Write(p []byte) (n int, err error) {
 	if limit <= 0 {
 		limit = spillMaxMemorySize.IntN()
 	}
+	if limit <= 0 {
+		return 0, w.finish(fmt.Errorf("downsampling.spillMaxMemorySize must be positive; got %d", limit))
+	}
+	w.memoryLimit = limit
+	if w.memoryBudget == nil {
+		w.memoryBudget = getSpillMemoryBudget()
+	}
 	for len(p) > 0 {
 		// Keep exactly one threshold in memory until another byte arrives.
 		// This also splits large Writes without allocating a buffer for all of p.
@@ -121,10 +140,32 @@ func (w *SpillWriter) Write(p []byte) (n int, err error) {
 		if needed > cap(w.memory) {
 			// Clamp capacity as well as length; append's default growth could
 			// retain more than the threshold even when length is bounded.
-			capacity := min(limit, max(needed, 2*cap(w.memory)))
-			memory := make([]byte, len(w.memory), capacity)
-			copy(memory, w.memory)
-			w.memory = memory
+			capacity := limit
+			if cap(w.memory) <= limit/2 {
+				capacity = min(limit, max(needed, 2*cap(w.memory)))
+			}
+			// Reserve the full new allocation while the old buffer is still live.
+			// Budget pressure must never wait while another merge holds buffers.
+			if !w.memoryBudget.Get(uint64(capacity)) {
+				if len(w.memory) > 0 {
+					if err := w.dump(); err != nil {
+						return n, w.finish(err)
+					}
+				}
+				w.memoryBudget.Put(uint64(cap(w.memory)))
+				w.memory = nil
+				written, err := w.appendFile(p)
+				w.size += uint64(written)
+				n += written
+				if err != nil {
+					return n, w.finish(err)
+				}
+				return n, nil
+			}
+			buf := make([]byte, len(w.memory), capacity)
+			copy(buf, w.memory)
+			w.memoryBudget.Put(uint64(cap(w.memory)))
+			w.memory = buf
 		}
 		w.memory = append(w.memory, p[:count]...)
 		w.size += uint64(count)
@@ -137,19 +178,31 @@ func (w *SpillWriter) Write(p []byte) (n int, err error) {
 // dump appends a full memory buffer to the same file on each call. These large
 // writes need no additional bufio.Writer; write errors surface in this Write.
 func (w *SpillWriter) dump() error {
-	if w.f == nil {
-		if err := w.create(); err != nil {
-			return err
-		}
-	}
-	n, err := (spillFileWriter{w.f}).Write(w.memory)
-	w.fileSize += uint64(n)
-	if err != nil {
-		return fmt.Errorf("cannot write spill file: %w", err)
+	if _, err := w.appendFile(w.memory); err != nil {
+		return err
 	}
 	w.memory = w.memory[:0]
-	w.state = spillDisk
 	return nil
+}
+
+func (w *SpillWriter) appendFile(p []byte) (int, error) {
+	if w.f == nil {
+		if err := w.create(); err != nil {
+			return 0, err
+		}
+	}
+	// A previous Read may have returned early, leaving the descriptor before EOF.
+	offset, err := w.f.Seek(int64(w.fileSize), io.SeekStart)
+	if err != nil || offset != int64(w.fileSize) {
+		return 0, errors.Join(fmt.Errorf("cannot position spill append at offset %d; got %d", w.fileSize, offset), err)
+	}
+	n, err := (spillFileWriter{w.f}).Write(p)
+	w.fileSize += uint64(n)
+	if err != nil {
+		return n, fmt.Errorf("cannot write spill file: %w", err)
+	}
+	w.state = spillDisk
+	return n, nil
 }
 
 func (w *SpillWriter) create() error {
@@ -242,6 +295,9 @@ func (w *SpillWriter) Read(consume func(io.Reader) error) (err error) {
 // removal retains the created file for the next Close.
 func (w *SpillWriter) Close() error {
 	w.closed = true
+	if cap(w.memory) > 0 {
+		w.memoryBudget.Put(uint64(cap(w.memory)))
+	}
 	w.memory = nil
 	if w.f != nil {
 		if w.writerCounted {

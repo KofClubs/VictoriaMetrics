@@ -6,9 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
 	"io"
 	"math"
 	"os"
@@ -18,19 +15,27 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
 )
 
 func TestDownsampleWriterOrderAbort(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "part")
 	w := getDownsampleWriter()
-	if err := w.Init(path, 1); err != nil {
+	if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeDownsampleTestBlock(w, fileTestDownsampleBlock(1, 3600000)); err != nil {
-		t.Fatal(err)
+	for _, tsid := range []uint64{1, 2} {
+		for _, resolution := range []int64{300000, 3600000} {
+			if err := writeDownsampleTestBlock(w, fileTestDownsampleBlock(tsid, resolution)); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
-	if err := writeDownsampleTestBlock(w, fileTestDownsampleBlock(1, 300000)); err == nil {
-		t.Fatal("未拒绝分辨率逆序")
+	if err := writeDownsampleTestBlock(w, fileTestDownsampleBlock(1, 3600000)); err == nil {
+		t.Fatal("未拒绝同一分辨率的 TSID 逆序")
 	}
 	if err := w.Abort(); err != nil {
 		t.Fatal(err)
@@ -49,7 +54,7 @@ func TestDownsampleWriterExistingDirectory(t *testing.T) {
 	}
 	w := getDownsampleWriter()
 	defer putDownsampleWriter(w)
-	if err := w.Init(path, 1); err == nil {
+	if err := w.Init(path, 1, downsampleTestConfig(t)); err == nil {
 		t.Fatal("writer 接受了已有目录")
 	}
 	if err := w.Abort(); err != nil {
@@ -98,7 +103,7 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "part")
 			w := getDownsampleWriter()
 			defer putDownsampleWriter(w)
-			if err := w.Init(path, 1); err != nil {
+			if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 				t.Fatal(err)
 			}
 			if err := writeDownsampleTestBlock(w, batch); err != nil {
@@ -120,15 +125,24 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 				want := &stored[feature]
 				want.Init(&batch.tsid, batch.timestamps, values, scale, precision)
 				want.MarshalData(0, 0)
+				// 数值沿用源精度，时间戳必须按原值无损保存，独立构造其原生编码。
+				want.timestampsData, want.bh.TimestampsMarshalType, want.bh.MinTimestamp = encoding.MarshalTimestamps(nil, append([]int64(nil), batch.timestamps...), 64)
+				want.bh.MaxTimestamp = batch.timestamps[len(batch.timestamps)-1]
+				want.bh.TimestampsBlockSize = uint32(len(want.timestampsData))
+				want.headerData = want.bh.Marshal(want.headerData[:0])
 				if !bytes.Equal(w.currentBlockTimestampsData, want.timestampsData) || want.bh.TimestampsBlockOffset != 0 {
 					t.Fatalf("特征 %d 未引用同一时间戳负载", feature)
 				}
-				if err := w.currentResolutionFeatureSpills[feature].Read(func(r io.Reader) error {
+				if err := w.partResolutionSpills[downsampleResolution5m].featureSpills[feature].Read(func(r io.Reader) error {
 					got, err := io.ReadAll(r)
 					if err != nil {
 						return err
 					}
-					wantData := append(append([]byte(nil), want.headerData...), want.valuesData...)
+					wantData := append([]byte(nil), want.headerData...)
+					if feature == downsampleFeatureLast {
+						wantData = append(wantData, want.timestampsData...)
+					}
+					wantData = append(wantData, want.valuesData...)
 					if !bytes.Equal(got, wantData) {
 						return fmt.Errorf("feature %d spill differs from native Block encoding", feature)
 					}
@@ -141,7 +155,7 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 			if fb.bh != stored[downsampleFeatureMax].bh || fb.nextIdx != 0 || len(fb.values) != 0 || len(fb.timestamps) != 0 || !bytes.Equal(fb.headerData, stored[downsampleFeatureMax].headerData) || !bytes.Equal(fb.timestampsData, w.currentBlockTimestampsData) || !bytes.Equal(fb.valuesData, stored[downsampleFeatureMax].valuesData) {
 				t.Fatal("writer 未保持最后一个特征的原生 Block 编码状态")
 			}
-			if _, err := w.Finish(); err != nil {
+			if _, err := w.Finish(nil); err != nil {
 				t.Fatal(err)
 			}
 			entries, err = os.ReadDir(path)
@@ -156,7 +170,7 @@ func TestDownsampleNativeBlockReuse(t *testing.T) {
 			if !reflect.DeepEqual(fileNames, wantFiles) {
 				t.Fatalf("完成写入后的文件集合错误: got=%v want=%v", fileNames, wantFiles)
 			}
-			p, err := openDownsamplePart(path)
+			p, err := openDownsamplePart(path, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -283,7 +297,7 @@ func TestDownsampleFilePhysicalLayout(t *testing.T) {
 			timestampOffsets := make([]uint64, len(blocks))
 			for i, b := range blocks {
 				timestampOffsets[i] = uint64(len(expectedTimestamps))
-				payload, _, _ := encoding.MarshalTimestamps(nil, b.timestamps, b.precisionBits)
+				payload, _, _ := encoding.MarshalTimestamps(nil, b.timestamps, 64)
 				expectedTimestamps = append(expectedTimestamps, payload...)
 			}
 			var zeroColumns, nonzeroColumns int
@@ -323,7 +337,7 @@ func TestDownsampleFilePhysicalLayout(t *testing.T) {
 					if b.tsid.AccountID != firstTSID.AccountID || b.tsid.ProjectID != firstTSID.ProjectID {
 						t.Fatal("同一 metaindex row 跨越租户")
 					}
-					timestampsPayload, timestampsType, firstTimestamp := encoding.MarshalTimestamps(nil, b.timestamps, b.precisionBits)
+					timestampsPayload, timestampsType, firstTimestamp := encoding.MarshalTimestamps(nil, b.timestamps, 64)
 					decodedTimestamps, err := encoding.UnmarshalTimestamps(nil, timestampsPayload, timestampsType, firstTimestamp, n)
 					if err != nil || !reflect.DeepEqual(decodedTimestamps, b.timestamps) {
 						t.Fatalf("时间戳列解码错误: %v", err)
@@ -372,11 +386,19 @@ func TestDownsampleFilePhysicalLayout(t *testing.T) {
 			if zeroColumns == 0 || (!tc.singleRow && nonzeroColumns == 0) {
 				t.Fatal("测试未覆盖预期的零负载或非零负载列")
 			}
+			var tenantConfigs []any
+			seenTenants := make(map[TenantToken]bool)
+			for _, block := range blocks {
+				tenant := TenantToken{AccountID: block.tsid.AccountID, ProjectID: block.tsid.ProjectID}
+				if !seenTenants[tenant] {
+					tenantConfigs = append(tenantConfigs, map[string]any{"tenant": fmt.Sprintf("%d:%d", tenant.AccountID, tenant.ProjectID), "resolutions": []any{"1h0m0s"}})
+					seenTenants[tenant] = true
+				}
+			}
 			wantMetadata := map[string]any{
-				"FormatVersion": float64(2), "SemanticsVersion": float64(2), "Mode": "downsampling",
-				"Resolutions": []any{float64(300000), float64(3600000)}, "BucketOrigin": float64(0),
-				"NumericCodec": "decimal-values", "Retention": "bucket-end", "MinDedupInterval": float64(0),
-				"RowsCount": float64(totalRows), "BlocksCount": float64(len(blocks) * 5),
+				"MinDedupInterval":    float64(0),
+				"downsampling_config": map[string]any{"base_resolution": "5m0s", "tenant_resolutions": tenantConfigs},
+				"RowsCount":           float64(totalRows), "BlocksCount": float64(len(blocks) * 5),
 				"MinTimestamp": float64(minTimestamp), "MaxTimestamp": float64(maxTimestamp),
 			}
 			var gotMetadata map[string]any
@@ -389,6 +411,111 @@ func TestDownsampleFilePhysicalLayout(t *testing.T) {
 			t.Logf("核验 %d 个原生单特征 Block、%d 个物理行、%d 个 metaindex 行；values=%d 字节，timestamps=%d 字节", len(blocks)*5, totalRows, tc.wantMetaRows, len(expectedValues), len(expectedTimestamps))
 		})
 	}
+}
+
+// 按 TSID 写入不同租户的分辨率集合，独立核验最终文件的稀疏 resolution/feature 排列。
+func TestDownsampleWriterTenantResolutionLayout(t *testing.T) {
+	config, err := ParseDownsamplingConfig([]byte(`{"base_resolution":"5m","tenant_resolutions":[{"tenant":"1:0","resolutions":["1h"]},{"tenant":"2:0","resolutions":["30m","2h"]},{"tenant":"99:0","resolutions":["3h"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "part")
+	var w downsampleWriter
+	if err := w.Init(path, 1, config); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Abort()
+	blocksByResolution := make(map[int64][]*downsampleDecodedResolutionFeaturesBlock)
+	for _, tenantColumns := range []struct {
+		tenant      uint32
+		resolutions []int64
+	}{
+		{1, []int64{300000, 3600000}},
+		{2, []int64{300000, 1800000, 7200000}},
+		{3, []int64{300000}},
+	} {
+		tenant := tenantColumns.tenant
+		for _, resolution := range tenantColumns.resolutions {
+			block := &downsampleDecodedResolutionFeaturesBlock{tsid: TSID{AccountID: tenant, MetricID: uint64(tenant * 10)}, resolution: resolution, precisionBits: 64}
+			for row, offset := range []int64{137, 2911, 42123} {
+				block.timestamps = append(block.timestamps, minUnixMilli+int64(row)*resolution+offset)
+				for feature := range block.values {
+					block.values[feature] = append(block.values[feature], float64(tenant*100)+float64(feature*10)+float64(row*row)/4)
+				}
+			}
+			if err := writeDownsampleTestBlock(&w, block); err != nil {
+				t.Fatal(err)
+			}
+			blocksByResolution[resolution] = append(blocksByResolution[resolution], block)
+		}
+	}
+	if _, err := w.Finish(nil); err != nil {
+		t.Fatal(err)
+	}
+	files := make(map[string][]byte)
+	for _, name := range []string{timestampsFilename, valuesFilename, indexFilename, metaindexFilename, metadataFilename} {
+		files[name], err = os.ReadFile(filepath.Join(path, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	resolutions := []int64{300000, 1800000, 3600000, 7200000}
+	var expectedTimestamps, expectedValues []byte
+	timestampOffsets := make(map[*downsampleDecodedResolutionFeaturesBlock]uint64)
+	for _, resolution := range resolutions {
+		for _, block := range blocksByResolution[resolution] {
+			timestampOffsets[block] = uint64(len(expectedTimestamps))
+			payload, _, _ := encoding.MarshalTimestamps(nil, append([]int64(nil), block.timestamps...), 64)
+			expectedTimestamps = append(expectedTimestamps, payload...)
+		}
+	}
+	metaindex := decodeDownsampleLayoutFrame(t, files[metaindexFilename], "VMDSMI")
+	var indexOffset uint64
+	for _, resolution := range resolutions {
+		for feature := range countOfDownsampleFeatures {
+			for _, block := range blocksByResolution[resolution] {
+				if len(metaindex) < clusterDownsampleMetaindexBytes {
+					t.Fatal("missing resolution/feature/tenant metaindex row")
+				}
+				mr := metaindex[:clusterDownsampleMetaindexBytes]
+				metaindex = metaindex[clusterDownsampleMetaindexBytes:]
+				indexSize := binary.BigEndian.Uint32(mr[60:64])
+				if readDownsampleLayoutInt64(mr[65:73]) != resolution || int(mr[64]) != feature || readDownsampleLayoutTSID(mr[:32]) != block.tsid || readDownsampleLayoutTSID(mr[73:105]) != block.tsid || binary.BigEndian.Uint32(mr[32:36]) != 1 || binary.BigEndian.Uint64(mr[52:60]) != indexOffset || indexOffset+uint64(indexSize) > uint64(len(files[indexFilename])) {
+					t.Fatalf("incorrect sparse column ordering: resolution=%d feature=%d tenant=%d", resolution, feature, block.tsid.AccountID)
+				}
+				h := decodeDownsampleLayoutFrame(t, files[indexFilename][indexOffset:indexOffset+uint64(indexSize)], "VMDSIX")
+				indexOffset += uint64(indexSize)
+				if len(h) != clusterDownsampleHeaderBytes || readDownsampleLayoutTSID(h[:32]) != block.tsid || binary.BigEndian.Uint32(h[80:84]) != uint32(len(block.timestamps)) {
+					t.Fatal("invalid sparse native block header")
+				}
+				timestampsData, timestampsType, firstTimestamp := encoding.MarshalTimestamps(nil, append([]int64(nil), block.timestamps...), 64)
+				integers, scale := decimal.AppendFloatToDecimal(nil, block.values[feature])
+				valuesData, valuesType, firstValue := encoding.MarshalValues(nil, integers, 64)
+				checkDownsampleLayoutPayload(t, h[56:64], h[72:76], timestampOffsets[block], timestampsData, files[timestampsFilename])
+				checkDownsampleLayoutPayload(t, h[64:72], h[76:80], uint64(len(expectedValues)), valuesData, files[valuesFilename])
+				expectedValues = append(expectedValues, valuesData...)
+				scaleBits := binary.BigEndian.Uint16(h[84:86])
+				if readDownsampleLayoutInt64(h[32:40]) != firstTimestamp || readDownsampleLayoutInt64(h[40:48]) != block.timestamps[len(block.timestamps)-1] || readDownsampleLayoutInt64(h[48:56]) != firstValue || int16(scaleBits>>1)^-int16(scaleBits&1) != scale || h[86] != byte(timestampsType) || h[87] != byte(valuesType) || h[88] != 64 {
+					t.Fatal("sparse native block encoding metadata differs from its column")
+				}
+			}
+		}
+	}
+	if len(metaindex) != 0 || indexOffset != uint64(len(files[indexFilename])) || !bytes.Equal(files[timestampsFilename], expectedTimestamps) || !bytes.Equal(files[valuesFilename], expectedValues) {
+		t.Fatal("sparse part contains interleaved, duplicated or unreferenced payloads")
+	}
+	var metadata downsamplePartMetadata
+	if err := json.Unmarshal(files[metadataFilename], &metadata); err != nil || metadata.DownsamplingConfig == nil {
+		t.Fatalf("metadata does not contain the downsampling configuration: %+v err=%v", metadata, err)
+	}
+	if bytes.Contains(files[metadataFilename], []byte(`99:0`)) {
+		t.Fatal("metadata retained configuration for an absent tenant")
+	}
+	p, err := openDownsamplePart(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.MustClose()
 }
 
 func TestEstimateDownsampleOutputSize(t *testing.T) {
@@ -416,14 +543,14 @@ func TestEstimateDownsampleOutputSize(t *testing.T) {
 	if got := estimateDownsampleOutputSize(100, 2) - estimateDownsampleOutputSize(100, 1); got != 5105 {
 		t.Fatalf("independent per-column index/metaindex and spill headers: got %d; want 5105", got)
 	}
-	if got := estimateDownsampleOutputSize(101, 1) - estimateDownsampleOutputSize(100, 1); got != 110 {
-		t.Fatalf("one shared timestamp plus final/spilled values: got %d; want 110", got)
+	if got := estimateDownsampleOutputSize(101, 1) - estimateDownsampleOutputSize(100, 1); got != 120 {
+		t.Fatalf("final and spilled shared timestamps and values: got %d; want 120", got)
 	}
 }
 
 func TestDownsampleSpaceEstimateOverflow(t *testing.T) {
 	const bytesPerBatch = 5105
-	rowLimit := (uint64(math.MaxUint64) - (64 << 10)) / 110
+	rowLimit := (uint64(math.MaxUint64) - (64 << 10)) / 120
 	blockLimit := (uint64(math.MaxUint64) - (64 << 10)) / bytesPerBatch
 	for _, tc := range []struct {
 		name         string
@@ -476,7 +603,7 @@ func TestDownsampleSpaceBoundCoversEncodedParts(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "part")
 			w := getDownsampleWriter()
 			defer putDownsampleWriter(w)
-			if err := w.Init(path, 1); err != nil {
+			if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 				t.Fatal(err)
 			}
 			w.maxIndexBlockSize = tc.indexLimit
@@ -509,20 +636,20 @@ func TestDownsampleSpaceBoundCoversEncodedParts(t *testing.T) {
 				}
 			}
 			var spillBytes uint64
-			for feature, f := range w.currentResolutionFeatureSpills {
+			for feature, f := range w.partResolutionSpills[downsampleResolution5m].featureSpills {
 				if f == nil {
 					t.Fatalf("missing spill for feature %d", feature)
 				}
 				spillBytes += f.Size()
 			}
-			wantSpill := valuesBytes + uint64(tc.blockCount)*5*89
+			wantSpill := valuesBytes + timestampBytes + uint64(tc.blockCount)*5*89
 			if spillBytes != wantSpill {
-				t.Fatalf("spill must contain five headers/values, no timestamps: got %d; want %d", spillBytes, wantSpill)
+				t.Fatalf("spill must contain five headers/values and one shared timestamp column: got %d; want %d", spillBytes, wantSpill)
 			}
-			if w.timestampsBlockOffset != timestampBytes || w.valuesBlockOffset != 0 || w.indexBlockOffset != 0 {
-				t.Fatalf("before resolution flush only shared timestamps may reach final files: timestampsOffset=%d; valuesOffset=%d; indexOffset=%d; timestamps=%d", w.timestampsBlockOffset, w.valuesBlockOffset, w.indexBlockOffset, timestampBytes)
+			if w.timestampsBlockOffset != 0 || w.valuesBlockOffset != 0 || w.indexBlockOffset != 0 {
+				t.Fatalf("data reached final files before Finish: timestampsOffset=%d; valuesOffset=%d; indexOffset=%d", w.timestampsBlockOffset, w.valuesBlockOffset, w.indexBlockOffset)
 			}
-			ph, err := w.Finish()
+			ph, err := w.Finish(nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -544,7 +671,7 @@ func TestDownsampleSpaceBoundCoversEncodedParts(t *testing.T) {
 			if len(entries) != 5 {
 				t.Fatalf("finished part must contain only five final files, no spills: got %d entries", len(entries))
 			}
-			for feature, f := range w.currentResolutionFeatureSpills {
+			for feature, f := range w.partResolutionSpills[downsampleResolution5m].featureSpills {
 				if f != nil {
 					t.Fatalf("finished writer retained spill %d", feature)
 				}
@@ -557,11 +684,11 @@ func TestDownsampleSpaceBoundCoversEncodedParts(t *testing.T) {
 			if peakEnvelope > bound {
 				t.Fatalf("output plus spill exceeds batch-derived bound: output=%d; spill=%d; bound=%d", encodedSize, spillBytes, bound)
 			}
-			partBound := estimateDownsamplePartSize([]*partWrapper{{p: &part{ph: ph, dsMetadata: &downsamplePartMetadata{}}}})
+			partBound := estimateDownsamplePartSize([]*partWrapper{{p: &part{ph: ph, dsMetadata: &downsamplePartMetadata{DownsamplingConfig: w.downsamplingConfig}}}}, w.downsamplingConfig)
 			if partBound < bound || peakEnvelope > partBound {
 				t.Fatalf("row-derived bound does not cover output/spill: peak=%d; batch bound=%d; part bound=%d", peakEnvelope, bound, partBound)
 			}
-			p, err := openDownsamplePart(path)
+			p, err := openDownsamplePart(path, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -618,13 +745,48 @@ func TestDownsampleAvailableSpaceBoundaries(t *testing.T) {
 	}
 }
 
+func TestDownsampleWriterFinishCancellation(t *testing.T) {
+	for _, duringFlush := range []bool{false, true} {
+		path := filepath.Join(t.TempDir(), "part")
+		var w downsampleWriter
+		if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
+			t.Fatal(err)
+		}
+		defer w.Abort()
+		if err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, 300000)); err != nil {
+			t.Fatal(err)
+		}
+		stopCh := make(chan struct{})
+		writes := 0
+		file := &failingDownsampleFile{WriteCloser: w.timestampsWriter}
+		file.afterWrite = func() {
+			writes++
+			if duringFlush && writes == 1 {
+				close(stopCh)
+			}
+		}
+		w.timestampsWriter = file
+		if !duringFlush {
+			close(stopCh)
+		}
+		_, err := w.Finish(stopCh)
+		if !errors.Is(err, errForciblyStopped) {
+			t.Fatalf("Finish ignored cancellation: %v", err)
+		}
+		if file.closes != 1 || duringFlush && writes != 1 || !duringFlush && writes != 0 {
+			t.Fatalf("unexpected final-file lifecycle: writes=%d closes=%d", writes, file.closes)
+		}
+		assertDownsampleWriterAborted(t, &w, path, errForciblyStopped)
+	}
+}
+
 func TestDownsampleWriterFinalFileFailures(t *testing.T) {
 	for _, name := range []string{timestampsFilename, valuesFilename, indexFilename, metaindexFilename} {
 		for _, operation := range []string{"write", "short_write"} {
 			t.Run(name+"/"+operation, func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "part")
 				var w downsampleWriter
-				if err := w.Init(path, 1); err != nil {
+				if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 					t.Fatal(err)
 				}
 				defer w.Abort()
@@ -653,7 +815,7 @@ func TestDownsampleWriterFinalFileFailures(t *testing.T) {
 				}
 				err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, 300000))
 				if err == nil {
-					_, err = w.Finish()
+					_, err = w.Finish(nil)
 				}
 				if !errors.Is(err, cause) {
 					t.Fatalf("lost %s error: %v", operation, err)
@@ -675,7 +837,7 @@ func TestDownsampleWriterMetadataCompletion(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "part")
 			var w downsampleWriter
-			if err := w.Init(path, 1); err != nil {
+			if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 				t.Fatal(err)
 			}
 			defer w.Abort()
@@ -713,7 +875,7 @@ func TestDownsampleWriterMetadataCompletion(t *testing.T) {
 						interrupted = true
 					}
 				}()
-				ph, finishErr = w.Finish()
+				ph, finishErr = w.Finish(nil)
 			}()
 			switch scenario {
 			case "success":
@@ -724,7 +886,7 @@ func TestDownsampleWriterMetadataCompletion(t *testing.T) {
 				if err != nil || m == nil || m.partHeader != ph {
 					t.Fatalf("final metadata is incomplete or has wrong statistics: metadata=%+v err=%v", m, err)
 				}
-				p, err := openDownsamplePart(path)
+				p, err := openDownsamplePart(path, nil)
 				if err != nil {
 					t.Fatalf("completion metadata refers to invalid data: %v", err)
 				}
@@ -760,34 +922,71 @@ func TestDownsampleWriterMetadataCompletion(t *testing.T) {
 }
 
 func TestDownsampleWriterSpillAndValidationFailures(t *testing.T) {
-	for _, scenario := range []string{"spill_truncated_header", "invalid_next_batch", "later_feature_write"} {
+	for _, scenario := range []string{"spill_truncated_header", "spill_truncated_timestamps", "invalid_next_batch", "unconfigured_tenant_resolution", "later_feature_write"} {
 		t.Run(scenario, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "part")
 			var w downsampleWriter
-			if err := w.Init(path, 1); err != nil {
+			if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 				t.Fatal(err)
 			}
 			defer w.Abort()
-			err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, 300000))
+			block := fileTestDownsampleBlock(1, downsampleResolution5m)
+			if scenario == "spill_truncated_timestamps" {
+				block.timestamps = append(block.timestamps, block.timestamps[1]+downsampleResolution5m+123)
+				for feature := range block.values {
+					block.values[feature] = append(block.values[feature], block.values[feature][1])
+				}
+			}
+			err := writeDownsampleTestBlock(&w, block)
 			if err != nil {
 				t.Fatal(err)
 			}
 			switch scenario {
 			case "spill_truncated_header":
-				if _, err := w.currentResolutionFeatureSpills[2].Write([]byte{1}); err != nil {
+				if _, err := w.partResolutionSpills[downsampleResolution5m].featureSpills[2].Write([]byte{1}); err != nil {
 					t.Fatal(err)
 				}
-				_, err = w.Finish()
+				_, err = w.Finish(nil)
 				if !errors.Is(err, io.ErrUnexpectedEOF) {
 					t.Fatalf("truncated spill header must fail: %v", err)
 				}
 			case "invalid_next_batch":
 				err = writeDownsampleTestBlock(&w, nil)
+			case "unconfigured_tenant_resolution":
+				block := fileTestDownsampleBlock(2, downsampleResolution1h)
+				block.tsid.AccountID = 99
+				err = writeDownsampleTestBlock(&w, block)
+			case "spill_truncated_timestamps":
+				spills := w.partResolutionSpills[downsampleResolution5m]
+				last := spills.featureSpills[downsampleFeatureLast]
+				var data []byte
+				if err := last.Read(func(r io.Reader) error {
+					var err error
+					data, err = io.ReadAll(r)
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := last.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if spills.timestampsSize == 0 {
+					t.Fatal("fixture must contain a non-empty encoded timestamp payload")
+				}
+				last = filestream.NewSpillWriter(path, "truncated-last")
+				spills.featureSpills[downsampleFeatureLast] = last
+				if _, err := last.Write(data[:uint64(marshaledBlockHeaderSize)+spills.timestampsSize-1]); err != nil {
+					t.Fatal(err)
+				}
+				_, err = w.Finish(nil)
+				if !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Fatalf("truncated shared timestamp payload must fail: %v", err)
+				}
 			case "later_feature_write":
 				// 第三个特征失败时，共享时间戳和前两个特征已写入，仍须撤销整个目标。
-				spills := w.currentResolutionFeatureSpills
+				spills := w.partResolutionSpills[downsampleResolution5m].featureSpills
 				lastBytes, sumBytes := spills[downsampleFeatureLast].Size(), spills[downsampleFeatureSum].Size()
-				timestampBytes := w.timestampsBlockOffset
+				timestampBytes := w.partResolutionSpills[downsampleResolution5m].timestampsSize
 				if err := spills[downsampleFeatureCount].Close(); err != nil {
 					t.Fatal(err)
 				}
@@ -795,7 +994,7 @@ func TestDownsampleWriterSpillAndValidationFailures(t *testing.T) {
 				if !errors.Is(err, os.ErrClosed) {
 					t.Fatalf("closed later feature spill must fail: %v", err)
 				}
-				if spills[downsampleFeatureLast].Size() <= lastBytes || spills[downsampleFeatureSum].Size() <= sumBytes || w.timestampsBlockOffset <= timestampBytes {
+				if spills[downsampleFeatureLast].Size() <= lastBytes || spills[downsampleFeatureSum].Size() <= sumBytes || w.partResolutionSpills[downsampleResolution5m].timestampsSize <= timestampBytes {
 					t.Fatal("later feature failure did not follow partial batch output")
 				}
 			}
@@ -804,13 +1003,13 @@ func TestDownsampleWriterSpillAndValidationFailures(t *testing.T) {
 			}
 			assertDownsampleWriterAborted(t, &w, path, err)
 			// The same instance must be reusable after all failed output is gone.
-			if err := w.Init(path, 1); err != nil {
+			if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 				t.Fatal(err)
 			}
 			if err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, 300000)); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := w.Finish(); err != nil {
+			if _, err := w.Finish(nil); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -829,14 +1028,14 @@ func TestDownsampleWriterFinalFilePermissions(t *testing.T) {
 	}
 	var w downsampleWriter
 	path := filepath.Join(dir, "part")
-	if err := w.Init(path, 1); err != nil {
+	if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 		t.Fatal(err)
 	}
 	defer w.Abort()
 	if err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, 300000)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Finish(); err != nil {
+	if _, err := w.Finish(nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{timestampsFilename, valuesFilename, indexFilename, metaindexFilename, metadataFilename} {
@@ -853,7 +1052,7 @@ func TestDownsampleWriterFinalFilePermissions(t *testing.T) {
 func TestDownsampleWriterAbortRetriesOnlyDirectory(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "part")
 	var w downsampleWriter
-	if err := w.Init(path, 1); err != nil {
+	if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 		t.Fatal(err)
 	}
 	defer w.Abort()
@@ -861,7 +1060,7 @@ func TestDownsampleWriterAbortRetriesOnlyDirectory(t *testing.T) {
 	if err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, downsampleResolution5m)); err != nil {
 		t.Fatal(err)
 	}
-	spills := w.currentResolutionFeatureSpills
+	spills := w.partResolutionSpills[downsampleResolution5m].featureSpills
 	writeErr := errors.New("injected write failure")
 	removeErr1 := errors.New("injected first removal failure")
 	removeErr2 := errors.New("injected second removal failure")
@@ -882,6 +1081,9 @@ func TestDownsampleWriterAbortRetriesOnlyDirectory(t *testing.T) {
 	}
 	files[0].writeErr = writeErr
 	err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(2, downsampleResolution5m))
+	if err == nil {
+		_, err = w.Finish(nil)
+	}
 	if !errors.Is(err, writeErr) || !errors.Is(err, removeErr1) || !strings.HasPrefix(err.Error(), "[downsampling]") {
 		t.Fatalf("failure lost its original cause or context: %v", err)
 	}
@@ -889,7 +1091,7 @@ func TestDownsampleWriterAbortRetriesOnlyDirectory(t *testing.T) {
 		t.Fatal("failed removal lost the target's cleanup ownership")
 	}
 	for feature, spill := range spills {
-		if w.currentResolutionFeatureSpills[feature] != nil {
+		if w.partResolutionSpills[downsampleResolution5m].featureSpills[feature] != nil {
 			t.Fatalf("released spill %d remains available for repeated cleanup", feature)
 		}
 		if _, err := spill.Write(nil); !errors.Is(err, os.ErrClosed) {
@@ -902,7 +1104,7 @@ func TestDownsampleWriterAbortRetriesOnlyDirectory(t *testing.T) {
 		}
 	}
 	newPath := filepath.Join(t.TempDir(), "new-part")
-	if err := w.Init(newPath, 1); err == nil || !errors.Is(err, writeErr) || !errors.Is(err, removeErr1) {
+	if err := w.Init(newPath, 1, downsampleTestConfig(t)); err == nil || !errors.Is(err, writeErr) || !errors.Is(err, removeErr1) {
 		t.Fatalf("Init discarded pending cleanup or its error: %v", err)
 	}
 	if w.partPath != path || removes != 1 {
@@ -933,7 +1135,7 @@ func TestDownsampleWriterAbortRetriesOnlyDirectory(t *testing.T) {
 	if !errors.Is(w.writeErr, writeErr) || !errors.Is(w.writeErr, removeErr1) || !errors.Is(w.writeErr, removeErr2) {
 		t.Fatalf("successful cleanup discarded the operation's error history: %v", w.writeErr)
 	}
-	if err := w.Init(newPath, 1); err != nil {
+	if err := w.Init(newPath, 1, downsampleTestConfig(t)); err != nil {
 		t.Fatalf("fully cleaned writer cannot be reused: %v", err)
 	}
 	if w.writeErr != nil {
@@ -951,17 +1153,17 @@ func TestDownsampleWriterFinishedTargetOwnership(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "part")
 			newPath := filepath.Join(t.TempDir(), "new-part")
 			var w downsampleWriter
-			if err := w.Init(path, 1); err != nil {
+			if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 				t.Fatal(err)
 			}
 			oldFiles := trackDownsampleWriterFiles(&w)
 			if err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(1, downsampleResolution5m)); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := w.Finish(); err != nil {
+			if _, err := w.Finish(nil); err != nil {
 				t.Fatal(err)
 			}
-			if err := w.Init(newPath, 1); err != nil {
+			if err := w.Init(newPath, 1, downsampleTestConfig(t)); err != nil {
 				t.Fatalf("finished writer cannot be reused: %v", err)
 			}
 			if w.partPath != newPath || w.isFinished {
@@ -974,7 +1176,7 @@ func TestDownsampleWriterFinishedTargetOwnership(t *testing.T) {
 			if err := writeDownsampleTestBlock(&w, fileTestDownsampleBlock(2, downsampleResolution5m)); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := w.Finish(); err != nil {
+			if _, err := w.Finish(nil); err != nil {
 				t.Fatal(err)
 			}
 			if abort {
@@ -1006,7 +1208,7 @@ func TestDownsampleWriterFinishedTargetOwnership(t *testing.T) {
 func TestDownsampleWriterPoolKeepsPendingCleanup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "part")
 	var w downsampleWriter
-	if err := w.Init(path, 1); err != nil {
+	if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 		t.Fatal(err)
 	}
 	files := trackDownsampleWriterFiles(&w)
@@ -1057,7 +1259,7 @@ func TestDownsampleWriterSamplesPreserveInput(t *testing.T) {
 			want := downsampleTestBlockRows(roundTripDownsampleTestReferenceBlock(t, decoded))
 			var w downsampleWriter
 			path := filepath.Join(t.TempDir(), "part")
-			if err := w.Init(path, -5); err != nil {
+			if err := w.Init(path, -5, downsampleTestConfig(t)); err != nil {
 				t.Fatal(err)
 			}
 			defer w.Abort()
@@ -1073,7 +1275,7 @@ func TestDownsampleWriterSamplesPreserveInput(t *testing.T) {
 			if err := w.WriteSamples(&tsid, downsampleResolution5m, samples, nil); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := w.Finish(); err != nil {
+			if _, err := w.Finish(nil); err != nil {
 				t.Fatal(err)
 			}
 			for i, sample := range samples {
@@ -1087,7 +1289,7 @@ func TestDownsampleWriterSamplesPreserveInput(t *testing.T) {
 					}
 				}
 			}
-			p, err := openDownsamplePart(path)
+			p, err := openDownsamplePart(path, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1097,51 +1299,35 @@ func TestDownsampleWriterSamplesPreserveInput(t *testing.T) {
 	}
 }
 
-func TestDownsampleWriterSamplesLaterBlockFailure(t *testing.T) {
+func TestDownsampleWriterSamplesCancellationAfterOutput(t *testing.T) {
 	const base int64 = 1704067200000
-	for _, scenario := range []string{"write", "cancel"} {
-		t.Run(scenario, func(t *testing.T) {
-			tsid := TSID{MetricID: 7}
-			samples := make([]downsampleSample, 3)
-			for i, precision := range []uint8{64, 8, 64} {
-				samples[i] = downsampleSample{
-					timestamp: base + int64(i)*downsampleResolution5m + 1,
-					values:    [countOfDownsampleFeatures]float64{2, 2, 1, 2, 2}, precisionBits: precision,
-				}
-			}
-			var w downsampleWriter
-			path := filepath.Join(t.TempDir(), "part")
-			if err := w.Init(path, -5); err != nil {
-				t.Fatal(err)
-			}
-			defer w.Abort()
-			stopCh := make(chan struct{})
-			cause := errors.New("injected later block write failure")
-			writes := 0
-			w.timestampsWriter = &downsampleCloseTestWriter{WriteCloser: w.timestampsWriter, beforeWrite: func() error {
-				writes++
-				if writes != 2 {
-					return nil
-				}
-				if w.partHeader.BlocksCount != countOfDownsampleFeatures {
-					t.Fatal("failure did not occur after a completed output block")
-				}
-				if scenario == "cancel" {
-					close(stopCh)
-					return nil
-				}
-				return cause
-			}}
-			err := w.WriteSamples(&tsid, downsampleResolution5m, samples, stopCh)
-			if scenario == "cancel" {
-				cause = errForciblyStopped
-			}
-			if !errors.Is(err, cause) || writes != 2 {
-				t.Fatalf("later block failure was missed: writes=%d; err=%v", writes, err)
-			}
-			assertDownsampleWriterAborted(t, &w, path, cause)
-		})
+	tsid := TSID{MetricID: 7}
+	samples := make([]downsampleSample, 3)
+	for i, precision := range []uint8{64, 8, 64} {
+		samples[i] = downsampleSample{
+			timestamp: base + int64(i)*downsampleResolution5m + 1,
+			values:    [countOfDownsampleFeatures]float64{2, 2, 1, 2, 2}, precisionBits: precision,
+		}
 	}
+	var w downsampleWriter
+	path := filepath.Join(t.TempDir(), "part")
+	if err := w.Init(path, -5, downsampleTestConfig(t)); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Abort()
+	if err := w.WriteSamples(&tsid, downsampleResolution5m, samples[:1], nil); err != nil {
+		t.Fatal(err)
+	}
+	if w.partHeader.BlocksCount != countOfDownsampleFeatures {
+		t.Fatal("cancellation must follow a complete output block")
+	}
+	stopCh := make(chan struct{})
+	close(stopCh)
+	err := w.WriteSamples(&tsid, downsampleResolution5m, samples[1:], stopCh)
+	if !errors.Is(err, errForciblyStopped) {
+		t.Fatalf("later cancellation was missed: %v", err)
+	}
+	assertDownsampleWriterAborted(t, &w, path, errForciblyStopped)
 }
 
 func BenchmarkDownsampleFileWrite(b *testing.B) {
@@ -1168,7 +1354,7 @@ func BenchmarkDownsampleFileWrite(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				path := filepath.Join(root, "output-"+strconv.Itoa(i))
 				b.StartTimer()
-				if err := w.Init(path, -5); err != nil {
+				if err := w.Init(path, -5, downsampleTestConfig(b)); err != nil {
 					b.Fatal(err)
 				}
 				for blockIndex, block := range blocks {
@@ -1176,7 +1362,7 @@ func BenchmarkDownsampleFileWrite(b *testing.B) {
 						b.Fatal(err)
 					}
 				}
-				if _, err := w.Finish(); err != nil {
+				if _, err := w.Finish(nil); err != nil {
 					b.Fatal(err)
 				}
 				b.StopTimer()

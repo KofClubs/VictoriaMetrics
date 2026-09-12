@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""独立核验 E2E 产物中活动 v2 part 的磁盘索引、列负载覆盖及边界覆盖证据。"""
+"""独立核验 E2E 产物中活动降采样 part 的磁盘索引、列负载覆盖及边界覆盖证据。"""
 
 import argparse
 import collections
 import ctypes
 import ctypes.util
 import datetime
+import decimal
 import json
 import pathlib
 import re
@@ -14,7 +15,6 @@ import sys
 
 
 FEATURES = ("last", "sum", "count", "min", "max")
-RESOLUTIONS = {300_000: "5m", 3_600_000: "1h"}
 BLOCK_HEADER_BYTES = 89
 METAINDEX_ROW_BYTES = 113
 MIN_TIMESTAMP = 86_400_000
@@ -74,7 +74,7 @@ class Zstandard:
         self.lib.ZSTD_getErrorName.restype = ctypes.c_char_p
 
     def frame(self, data, prefix, limit):
-        require(data[:8] == prefix + b"\x00\x02", "v2 压缩帧前缀错误")
+        require(data[:8] == prefix + b"\x00\x02", "压缩帧固定文件签名错误")
         compressed = data[8:]
         require(compressed, "压缩帧为空")
         source = ctypes.create_string_buffer(compressed)
@@ -103,7 +103,7 @@ def decode_block_header(data, entry):
         "rows": unsigned(data, 80, 4), "scale": signed(data, 84, 2),
         "timestamp_codec": data[86], "value_codec": data[87], "precision": data[88],
     }
-    require(header["resolution_ms"] in RESOLUTIONS, "非法分辨率")
+    require(0 < header["resolution_ms"] <= MAX_TIMESTAMP, "非法分辨率")
     require(0 <= header["feature"] < len(FEATURES), "非法特征编号")
     require(1 <= header["rows"] <= 8192, "单特征 Block 行数超出限制")
     require(MIN_TIMESTAMP <= header["min_timestamp"] <= header["max_timestamp"] <= MAX_TIMESTAMP,
@@ -134,7 +134,7 @@ def decode_meta(data):
         "feature": data[64], "resolution_ms": signed(data, 65, 8),
         "last_tsid": tsid_at(data, 73), "rows": unsigned(data, 105, 8),
     }
-    require(result["resolution_ms"] in RESOLUTIONS, "metaindex 分辨率无效")
+    require(0 < result["resolution_ms"] <= MAX_TIMESTAMP, "metaindex 分辨率无效")
     require(0 <= result["feature"] < len(FEATURES), "metaindex 特征编号无效（当前格式为 0..4）")
     require(result["first_tsid"] <= result["last_tsid"], "metaindex TSID 首末范围无效")
     require(result["first_tsid"][:2] == result["last_tsid"][:2], "metaindex 首末 TSID 不属于同一租户")
@@ -148,26 +148,73 @@ def decode_meta(data):
     return result
 
 
+def resolution_name(milliseconds):
+    for unit, duration in (("h", 3600000), ("m", 60000), ("s", 1000)):
+        if milliseconds % duration == 0:
+            return str(milliseconds // duration) + unit
+    return str(milliseconds) + "ms"
+
+
+def resolution_ms(value):
+    """独立解析配置 duration；Decimal 避免小数毫秒在浮点转换中被截断。"""
+    require(isinstance(value, str) and value, "配置分辨率不是非空字符串")
+    units = {"ns": decimal.Decimal("0.000001"), "us": decimal.Decimal("0.001"),
+             "µs": decimal.Decimal("0.001"), "μs": decimal.Decimal("0.001"),
+             "ms": 1, "s": 1000, "m": 60000, "h": 3600000,
+             "d": 86400000, "w": 604800000, "y": 31536000000}
+    matches = list(re.finditer(r"([0-9]+(?:\.[0-9]+)?)(ns|us|µs|μs|ms|s|m|h|d|w|y)", value))
+    require("".join(match.group(0) for match in matches) == value, "配置分辨率语法无效")
+    total = sum((decimal.Decimal(match.group(1)) * units[match.group(2)] for match in matches), decimal.Decimal(0))
+    require(total == int(total) and 0 < total <= MAX_TIMESTAMP, "配置分辨率必须为合法正整数毫秒")
+    return int(total)
+
+
+def validate_config(config):
+    require(isinstance(config, dict) and set(config) == {"base_resolution", "tenant_resolutions"},
+            "downsampling_config 字段无效")
+    base = resolution_ms(config["base_resolution"])
+    require(isinstance(config["tenant_resolutions"], list), "tenant_resolutions 不是数组")
+    tenants = {}
+    for entry in config["tenant_resolutions"]:
+        require(isinstance(entry, dict) and set(entry) == {"tenant", "resolutions"}, "租户配置字段无效")
+        tenant = entry["tenant"]
+        require(isinstance(tenant, str) and re.fullmatch(r"(?:0|[1-9][0-9]*):(?:0|[1-9][0-9]*)", tenant),
+                "租户配置标识无效")
+        identity = tuple(map(int, tenant.split(":")))
+        require(max(identity) <= 0xffffffff and identity not in tenants, "租户配置重复或越界")
+        require(isinstance(entry["resolutions"], list), "租户 resolutions 不是数组")
+        extras = [resolution_ms(value) for value in entry["resolutions"]]
+        require(len(set(extras)) == len(extras) and all(value > base and value % base == 0 for value in extras),
+                "租户附加分辨率重复或不是 base 的较大整数倍")
+        tenants[identity] = [base] + sorted(extras)
+    return base, tenants
+
+
 def validate_metadata(metadata):
-    require(set(metadata) == {
-        "RowsCount", "BlocksCount", "MinTimestamp", "MaxTimestamp", "MinDedupInterval",
-        "FormatVersion", "SemanticsVersion", "Mode", "Resolutions", "BucketOrigin",
-        "NumericCodec", "Retention",
-    }, "metadata 字段集合与 v2 约定不一致")
-    require(metadata["FormatVersion"] == 2 and metadata["SemanticsVersion"] == 2
-            and metadata["Mode"] == "downsampling", "活动 part 不是支持的 v2 降采样格式")
-    require(metadata["Resolutions"] == [300000, 3600000] and metadata["BucketOrigin"] == 0,
-            "metadata 分辨率或 bucket 原点错误")
-    require(metadata["NumericCodec"] == "decimal-values" and metadata["Retention"] == "bucket-end"
-            and metadata["MinDedupInterval"] == 0, "metadata 计算语义字段错误")
-    for key in ("RowsCount", "BlocksCount", "MinTimestamp", "MaxTimestamp", "MinDedupInterval",
-                "FormatVersion", "SemanticsVersion", "BucketOrigin"):
-        require(type(metadata[key]) is int, "metadata 的 " + key + " 不是整数")
-    require(metadata["RowsCount"] >= metadata["BlocksCount"] > 0
-            and metadata["RowsCount"] % 5 == 0 and metadata["BlocksCount"] % 5 == 0,
-            "metadata 物理行数或 Block 数量无效")
-    require(MIN_TIMESTAMP <= metadata["MinTimestamp"] <= metadata["MaxTimestamp"] <= MAX_TIMESTAMP,
-            "metadata 时间范围无效")
+    """校验统计并返回是否为降采样；仅非 null 配置决定分支。"""
+    require(isinstance(metadata, dict), "metadata 不是 JSON 对象")
+    fields = ("RowsCount", "BlocksCount", "MinTimestamp", "MaxTimestamp", "MinDedupInterval")
+    downsampled = metadata.get("downsampling_config") is not None
+    if downsampled:
+        require(set(metadata) == set(fields) | {"downsampling_config"}, "降采样 metadata 字段集合不一致")
+        validate_config(metadata["downsampling_config"])
+        values = {key: metadata[key] for key in fields}
+    else:
+        # 原始 partHeader 的 JSON 解码将缺失或 null 的数值字段保留为零。
+        values = {key: 0 if metadata.get(key) is None else metadata[key] for key in fields}
+    for key, value in values.items():
+        require(type(value) is int, "metadata 的 " + key + " 不是整数")
+        low, high = (0, (1 << 64) - 1) if key in ("RowsCount", "BlocksCount") else (-(1 << 63), (1 << 63) - 1)
+        require(low <= value <= high, "metadata 的 " + key + " 超出整数范围")
+    require(values["RowsCount"] >= values["BlocksCount"] > 0, "metadata 物理行数或 Block 数量无效")
+    require(values["MinTimestamp"] <= values["MaxTimestamp"], "metadata 时间范围无效")
+    if downsampled:
+        require(values["MinDedupInterval"] == 0, "降采样 metadata 的 MinDedupInterval 必须为零")
+        require(values["RowsCount"] % 5 == 0 and values["BlocksCount"] % 5 == 0,
+                "降采样 metadata 物理统计必须按五特征分组")
+        require(MIN_TIMESTAMP <= values["MinTimestamp"] <= values["MaxTimestamp"] <= MAX_TIMESTAMP,
+                "降采样 metadata 时间范围无效")
+    return downsampled
 
 
 def active_parts(data_dir):
@@ -223,7 +270,7 @@ def column_headers(entries, index_file, sizes, zstd, reports, endpoints):
                 and max(header["max_timestamp"] for header in headers) == entry["max_timestamp"],
                 "index 与 metaindex 的行数或时间范围不一致")
         reports.append({
-            "number": entry["number"], "resolution": RESOLUTIONS[entry["resolution_ms"]],
+            "number": entry["number"], "resolution": resolution_name(entry["resolution_ms"]),
             "feature": FEATURES[entry["feature"]], "feature_id": entry["feature"],
             "account_id": entry["first_tsid"][0], "project_id": entry["first_tsid"][1],
             "offset": entry["offset"], "size": entry["size"],
@@ -259,7 +306,8 @@ def inspect_part(partition, path, zstd):
     require(sizes["metadata.json"] <= 64 << 10, "metadata 文件超过大小上限")
     require(sizes["metaindex.bin"] <= 64 << 20, "metaindex 文件超过大小上限")
     metadata = read_json(path / "metadata.json")
-    validate_metadata(metadata)
+    require(validate_metadata(metadata), "活动 part 不是降采样格式")
+    base_resolution, tenant_resolutions = validate_config(metadata["downsampling_config"])
     meta = zstd.frame((path / "metaindex.bin").read_bytes(), b"VMDSMI", 64 << 20)
     require(meta and len(meta) % METAINDEX_ROW_BYTES == 0, "metaindex 解码长度无效")
     groups = collections.defaultdict(list)
@@ -268,6 +316,8 @@ def inspect_part(partition, path, zstd):
     for number, pos in enumerate(range(0, len(meta), METAINDEX_ROW_BYTES)):
         entry = decode_meta(meta[pos:pos + METAINDEX_ROW_BYTES])
         entry["number"] = number
+        require(entry["resolution_ms"] in tenant_resolutions.get(entry["first_tsid"][:2], [base_resolution]),
+                "metaindex 分辨率不属于该租户配置")
         require(entry["offset"] == next_index_offset, "index.bin 存在间隙、重叠或起始偏移错误")
         next_index_offset += entry["size"]
         require(next_index_offset <= sizes["index.bin"], "index 负载超出文件或被截断")
@@ -279,6 +329,8 @@ def inspect_part(partition, path, zstd):
         groups[(entry["resolution_ms"], entry["feature"])].append(entry)
     require(next_index_offset == sizes["index.bin"], "index.bin 存在未引用尾部")
     del meta
+    resolutions = sorted({resolution for resolution, _ in groups})
+    require(resolutions and resolutions[0] == base_resolution, "metaindex 缺少基础分辨率")
 
     reports, boundaries, endpoints = [], [], {}
     series, metric_ids = {}, {}
@@ -288,7 +340,7 @@ def inspect_part(partition, path, zstd):
     zero_value_payloads = zero_timestamp_payloads = 0
     minimum = maximum = None
     with (path / "index.bin").open("rb") as index_file:
-        for resolution in sorted(RESOLUTIONS):
+        for resolution in resolutions:
             readers = [column_headers(groups[(resolution, feature)], index_file, sizes, zstd, reports, endpoints)
                        for feature in range(len(FEATURES))]
             first_values = [None] * len(FEATURES)
@@ -309,7 +361,7 @@ def inspect_part(partition, path, zstd):
                 zero_timestamp_payloads += first["timestamp_size"] == 0
                 identity = (resolution, first["tsid"])
                 if identity not in series:
-                    series[identity] = {"resolution": RESOLUTIONS[resolution], "tsid": tsid_text(identity[1]),
+                    series[identity] = {"resolution": resolution_name(resolution), "tsid": tsid_text(identity[1]),
                                         "account_id": identity[1][0], "project_id": identity[1][1],
                                         "blocks_by_feature": dict.fromkeys(FEATURES, 0), "rows_by_feature": dict.fromkeys(FEATURES, 0),
                                         "batch_rows": [], "index_numbers": set(),
@@ -335,6 +387,7 @@ def inspect_part(partition, path, zstd):
                     physical_blocks += 1
                     minimum = header["min_timestamp"] if minimum is None else min(minimum, header["min_timestamp"])
                     maximum = header["max_timestamp"] if maximum is None else max(maximum, header["max_timestamp"])
+            require(first_values[0] is not None, "实际分辨率缺少 last Block")
             if first_values[0] is not None:
                 for first_value, last_value in zip(first_values, last_values):
                     require(first_value == next_value_offset,
@@ -358,8 +411,8 @@ def inspect_part(partition, path, zstd):
             kind = "tsid_switch"
         boundaries.append({
             "previous_index": number - 1, "next_index": number, "kind": kind,
-            "previous_resolution": RESOLUTIONS[previous["resolution_ms"]],
-            "next_resolution": RESOLUTIONS[first["resolution_ms"]],
+            "previous_resolution": resolution_name(previous["resolution_ms"]),
+            "next_resolution": resolution_name(first["resolution_ms"]),
             "previous_feature": FEATURES[previous["feature"]], "next_feature": FEATURES[first["feature"]],
             "previous_tsid": tsid_text(previous["tsid"]), "next_tsid": tsid_text(first["tsid"]),
             "previous_batch_min_timestamp": previous["min_timestamp"],
@@ -368,7 +421,10 @@ def inspect_part(partition, path, zstd):
     physical_tsids = {}
     for resolution, sets in sorted(feature_tsid_sets.items()):
         require(all(values == sets[0] for values in sets), "同分辨率下五个特征的物理 TSID 集合不一致")
-        physical_tsids[RESOLUTIONS[resolution]] = [tsid_text(tsid) for tsid in sorted(sets[0])]
+        physical_tsids[resolution_name(resolution)] = [tsid_text(tsid) for tsid in sorted(sets[0])]
+    base_tsids = feature_tsid_sets[base_resolution][0]
+    require(all(sets[0] <= base_tsids for sets in feature_tsid_sets.values()),
+            "附加分辨率 TSID 缺少 base 数据")
     for stat in series.values():
         require(len(set(stat["blocks_by_feature"].values())) == 1 and len(set(stat["rows_by_feature"].values())) == 1,
                 "同一物理 TSID 五个特征的 Block 数量或行数不一致")
@@ -377,10 +433,12 @@ def inspect_part(partition, path, zstd):
                                            for feature, numbers in stat["index_numbers_by_feature"].items()}
     return {
         "partition": partition, "path": str(path), "metadata": metadata, "file_sizes": sizes,
+        "resolutions_ms": resolutions,
         "physical_rows": physical_rows, "physical_blocks": physical_blocks,
         "shared_timestamp_batches": shared_timestamp_batches, "timestamp_reference_count": physical_blocks,
-        "physical_tsid_sets_equal_between_resolutions": (set(physical_tsids) == {"5m", "1h"}
-                                                        and physical_tsids["5m"] == physical_tsids["1h"]),
+        "physical_tsid_sets_equal_between_resolutions": all(set(values) == set(next(iter(physical_tsids.values())))
+                                                            for values in physical_tsids.values()),
+        "extra_resolution_tsids_have_base": True,
         "zero_value_payloads": zero_value_payloads, "zero_timestamp_payloads": zero_timestamp_payloads,
         "physical_tsids_by_resolution": physical_tsids,
         "indexes": sorted(reports, key=lambda report: report["number"]), "index_boundaries": boundaries,
@@ -389,6 +447,8 @@ def inspect_part(partition, path, zstd):
 
 
 def summarize(parts):
+    require(len({resolution_ms(part["metadata"]["downsampling_config"]["base_resolution"]) for part in parts}) == 1,
+            "活动 part 的 base_resolution 不一致")
     partitions = collections.defaultdict(lambda: {"parts": [], "series": {}})
     identities = {}
     split_evidence, continuation_evidence, switch_evidence, multiple_indexes_evidence = [], [], [], []
@@ -434,11 +494,12 @@ def summarize(parts):
     for name, partition in sorted(partitions.items()):
         stats = [partition["series"][key] for key in sorted(partition["series"])]
         tsid_sets = {resolution: sorted({stat["tsid"] for stat in stats if stat["resolution"] == resolution})
-                     for resolution in RESOLUTIONS.values()}
+                     for resolution in sorted({stat["resolution"] for stat in stats})}
         partition_reports.append({"partition": name, "parts": partition["parts"],
                                   "unique_tsids": len({stat["tsid"] for stat in stats}),
                                   "physical_tsids_by_resolution": tsid_sets,
-                                  "physical_tsid_sets_equal_between_resolutions": tsid_sets["5m"] == tsid_sets["1h"],
+                                  "physical_tsid_sets_equal_between_resolutions": all(values == next(iter(tsid_sets.values()))
+                                                                                        for values in tsid_sets.values()),
                                   "series": stats})
     coverage = {
         "same_tsid_5m_over_8192_rows_and_multiple_blocks": bool(split_evidence),

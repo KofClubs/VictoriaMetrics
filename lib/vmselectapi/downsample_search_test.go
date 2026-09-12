@@ -110,6 +110,7 @@ func TestDownsampleSearchRPCDispatch(t *testing.T) {
 			{},
 			{"5m", "last"}, {"5m", "sum"}, {"5m", "count"}, {"5m", "min"}, {"5m", "max"},
 			{"1h", "last"}, {"1h", "sum"}, {"1h", "count"}, {"1h", "min"}, {"1h", "max"},
+			{"1m", "sum"}, {"45m", "last"}, {"2h", "count"},
 		} {
 			t.Run(fmt.Sprintf("%s/%s/%s", tenant.String(), selection.resolution, selection.feature), func(t *testing.T) {
 				sq := storage.NewSearchQuery(tenant.AccountID, tenant.ProjectID, 86400001, 90000000, nil, 37)

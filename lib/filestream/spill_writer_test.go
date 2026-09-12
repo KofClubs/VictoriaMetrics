@@ -11,7 +11,145 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
 )
+
+func TestSpillWriterInvalidMemoryLimit(t *testing.T) {
+	old := spillMaxMemorySize.N
+	t.Cleanup(func() { spillMaxMemorySize.N = old })
+	for _, limit := range []int64{0, -1} {
+		t.Run(strconv.FormatInt(limit, 10), func(t *testing.T) {
+			spillMaxMemorySize.N = limit
+			dir := t.TempDir()
+			w := NewSpillWriter(dir, "invalid-limit")
+			defer w.Close()
+			n, err := w.Write([]byte("data"))
+			if n != 0 || err == nil || !strings.Contains(err.Error(), "must be positive") || !w.closed {
+				t.Fatalf("invalid limit did not fail immediately: n=%d err=%v closed=%t", n, err, w.closed)
+			}
+			assertSpillRemoved(t, w, dir)
+		})
+	}
+}
+
+func TestSpillWriterSharedMemoryBudget(t *testing.T) {
+	budget := &memory.Limiter{MaxSize: 64}
+	dir := t.TempDir()
+	newWriter := func(name string) *SpillWriter {
+		w := NewSpillWriter(dir, name)
+		w.memoryLimit, w.memoryBudget = 64, budget
+		t.Cleanup(func() { _ = w.Close() })
+		return w
+	}
+	a, b := newWriter("a"), newWriter("b")
+	first := bytes.Repeat([]byte("a"), 48)
+	second := bytes.Repeat([]byte("b"), 48)
+	if _, err := a.Write(first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write(second); err != nil {
+		t.Fatal(err)
+	}
+	if a.f != nil || cap(a.memory) != 48 || b.fileSize != 48 || cap(b.memory) != 0 {
+		t.Fatal("shared budget did not keep the first spill in memory and write the second to disk")
+	}
+	// Growing a must account for both the old and new buffer; fall back without waiting.
+	if _, err := a.Write(second); err != nil {
+		t.Fatal(err)
+	}
+	if cap(a.memory) != 0 || a.fileSize != 96 {
+		t.Fatal("growth exceeded the combined allocation budget")
+	}
+	for _, tc := range []struct {
+		w    *SpillWriter
+		want []byte
+	}{{a, append(append([]byte(nil), first...), second...)}, {b, second}} {
+		if err := tc.w.Read(func(r io.Reader) error {
+			got, err := io.ReadAll(r)
+			if !bytes.Equal(got, tc.want) {
+				t.Fatal("budget fallback changed the stream")
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := newWriter("c")
+	if _, err := c.Write(make([]byte, 64)); err != nil || cap(c.memory) != 64 {
+		t.Fatalf("released budget could not be reused: %v", err)
+	}
+	for _, w := range []*SpillWriter{a, b, c} {
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !budget.Get(budget.MaxSize) {
+		t.Fatal("Close leaked the shared memory reservation")
+	}
+	budget.Put(budget.MaxSize)
+	assertSpillRemoved(t, a, dir)
+}
+
+func TestSpillWriterBudgetFallbackFailure(t *testing.T) {
+	for _, failDump := range []bool{false, true} {
+		t.Run(strconv.FormatBool(failDump), func(t *testing.T) {
+			w, f, dir := newFaultSpill(t)
+			budget := &memory.Limiter{MaxSize: 16}
+			w.memoryBudget = budget
+			if failDump {
+				if _, err := w.Write(make([]byte, 16)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.write = func(p []byte) (int, error) { return len(p) / 2, nil }
+			n, err := w.Write(make([]byte, 32))
+			wantN := 16
+			if failDump {
+				wantN = 0
+			}
+			if n != wantN || !errors.Is(err, io.ErrShortWrite) || !w.closed || f.closeCalls != 1 {
+				t.Fatalf("budget fallback failure: n=%d err=%v close calls=%d", n, err, f.closeCalls)
+			}
+			if !budget.Get(budget.MaxSize) {
+				t.Fatal("failed spill retained its memory reservation")
+			}
+			budget.Put(budget.MaxSize)
+			assertSpillRemoved(t, w, dir)
+		})
+	}
+}
+
+func TestSpillWriterAppendAfterIncompleteRead(t *testing.T) {
+	w := NewSpillWriter(t.TempDir(), "append")
+	w.memoryBudget = &memory.Limiter{} // Exercise direct writes with no available buffer budget.
+	defer w.Close()
+	data := bytes.Repeat([]byte("original"), 32768)
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Read(func(r io.Reader) error {
+		_, err := io.ReadFull(r, make([]byte, 1))
+		return err
+	}); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("incomplete Read did not fail: %v", err)
+	}
+	if _, err := w.Write([]byte("tail")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Read(func(r io.Reader) error {
+		got, err := io.ReadAll(r)
+		if !bytes.Equal(got, append(data, []byte("tail")...)) {
+			t.Fatal("append after an incomplete Read overwrote the file prefix")
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestSpillWriterRoundTrip(t *testing.T) {
 	const limit = 1024
@@ -19,7 +157,7 @@ func TestSpillWriterRoundTrip(t *testing.T) {
 		for _, chunkSize := range []int{1, 373, 32 * limit} {
 			t.Run(strconv.Itoa(size)+"/chunk_"+strconv.Itoa(chunkSize), func(t *testing.T) {
 				dir := t.TempDir()
-			w := NewSpillWriter(dir, "spill")
+				w := NewSpillWriter(dir, "spill")
 				w.memoryLimit = limit
 				defer w.Close()
 				data := bytes.Repeat([]byte("aBc012"), size/6+1)[:size]

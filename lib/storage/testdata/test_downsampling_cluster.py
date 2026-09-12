@@ -16,7 +16,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from downsampling_cluster import ClusterRuntime
 from downsampling_cluster_compatibility import assert_downsample_query_rejected
-from downsampling_compare import Server
+from downsampling_compare import Server, aggregate
+from downsampling_cluster_tenants import (STARTUP_CONFIG, UPDATED_CONFIG, config_request,
+                                          configured_resolutions, cross_partition_fixture)
+from downsampling_inspect import resolution_ms
 from downsampling_multiseries_compare import MultiServer
 
 
@@ -31,6 +34,57 @@ class ClusterRuntimeTests(unittest.TestCase):
         self.root = pathlib.Path(self.directory.name)
         ports = iter(range(18000, 18005))
         self.runtime = ClusterRuntime(self.root, self.root, self.root / "data", True, "11:17", lambda: next(ports))
+
+    def test_startup_configuration_is_explicit_and_scoped(self):
+        arguments = self.runtime.commands["vmstorage"]
+        config = json.loads(next(value.split("=", 1)[1] for value in arguments
+                                 if value.startswith("-storage.downsampling.config=")))
+        self.assertEqual(config, {"base_resolution": "5m", "tenant_resolutions": [
+            {"tenant": "11:17", "resolutions": ["1h"]}]})
+        for enabled in (True, False):
+            ports = iter(range(19000, 19005))
+            runtime = ClusterRuntime(self.root, self.root, self.root / "data", enabled, "11:17",
+                                     lambda: next(ports), STARTUP_CONFIG)
+            flags = [value for value in runtime.commands["vmstorage"] if value.startswith("-storage.downsampling.")]
+            if enabled:
+                self.assertEqual(json.loads(flags[1].split("=", 1)[1]), STARTUP_CONFIG)
+            else:
+                self.assertEqual(flags, [])
+
+    def test_configuration_update_uses_put_body_and_storage_route(self):
+        payload = json.dumps(UPDATED_CONFIG).encode()
+        with mock.patch("downsampling_cluster.urllib.request.urlopen", return_value=Response(b"{}")) as request:
+            self.runtime.request("/internal/downsampling/config", data=payload, method="PUT")
+        outgoing = request.call_args.args[0]
+        self.assertEqual(outgoing.full_url, self.runtime.http["vmstorage"] + "/internal/downsampling/config")
+        self.assertEqual(outgoing.get_method(), "PUT")
+        self.assertEqual(json.loads(outgoing.data), UPDATED_CONFIG)
+
+    def test_configuration_round_trip_rejects_stale_runtime_snapshot(self):
+        server = mock.Mock(root=self.root)
+        response = json.dumps({"status": "success", "data": UPDATED_CONFIG})
+        server.request.return_value = response
+        result = config_request(server, "updated", UPDATED_CONFIG, update=True)
+        self.assertEqual(server.request.call_count, 2)
+        self.assertEqual(server.request.call_args_list[0].kwargs["method"], "PUT")
+        self.assertEqual(server.request.call_args_list[1].kwargs, {})
+        self.assertEqual(result["config"], UPDATED_CONFIG)
+        server.request.return_value = json.dumps({"status": "success", "data": STARTUP_CONFIG})
+        with self.assertRaises(AssertionError):
+            config_request(server, "stale", UPDATED_CONFIG, update=True)
+        self.assertEqual(configured_resolutions(STARTUP_CONFIG, "11:17"), [300000, 3600000])
+        self.assertEqual(configured_resolutions(STARTUP_CONFIG, "11:18"), [300000, 1800000, 7200000])
+        self.assertEqual(configured_resolutions(STARTUP_CONFIG, "12:17"), [300000])
+
+    def test_cross_partition_fixture_has_one_target_bucket_and_all_contributions(self):
+        metric, boundary, before, after, resolution = cross_partition_fixture()
+        self.assertLess(before[-1]["timestamp"], boundary)
+        self.assertGreater(after[0]["timestamp"], boundary)
+        rows = aggregate(before + after, metric, resolution_ms(resolution))
+        self.assertEqual(rows, [{"timestamp": after[-1]["timestamp"], "last": 7, "sum": 17,
+                                 "count": 4, "min": 2, "max": 7}])
+        self.assertEqual(len(aggregate(before, metric, 3600000)), 1)
+        self.assertEqual(len(aggregate(after, metric, 1800000)), 2)
 
     def test_tenant_switch_routes_to_correct_component(self):
         runtime = self.runtime
@@ -76,11 +130,11 @@ class ClusterRuntimeTests(unittest.TestCase):
                         parameters = urllib.parse.parse_qs(parsed.query)
                         self.assertNotIn("query.field", parameters)
                         if feature is None:
-                            self.assertNotIn("query.resolution", parameters)
-                            self.assertNotIn("query.feature", parameters)
+                            self.assertNotIn("resolution", parameters)
+                            self.assertNotIn("feature", parameters)
                         else:
-                            self.assertEqual(parameters["query.resolution"], [resolution])
-                            self.assertEqual(parameters["query.feature"], [feature])
+                            self.assertEqual(parameters["resolution"], [resolution])
+                            self.assertEqual(parameters["feature"], [feature])
 
     def test_import_count_advances_only_after_success(self):
         payload = json.dumps({"metric": {"__name__": "probe"}, "timestamps": [1, 2], "values": [3, 4]}).encode()
@@ -142,7 +196,7 @@ class CompatibilityAssertionTests(unittest.TestCase):
         self.server.name = "new-select-old-storage"
         self.server.root = pathlib.Path(self.directory.name)
         self.server.url.return_value = "http://localhost/select/31:47/prometheus/api/v1/query"
-        self.params = {"query.resolution": "5m", "query.feature": "sum"}
+        self.params = {"resolution": "5m", "feature": "sum"}
         self.log = self.server.root / "vmstorage.log"
         self.log.write_text("先前的启动日志\n")
 

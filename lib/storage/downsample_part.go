@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"unsafe"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
@@ -17,7 +18,6 @@ import (
 )
 
 const (
-	downsampleVersion          = 2
 	downsampleMaxIndexSize     = 2 * maxBlockSize
 	downsampleMaxMetaindexSize = 64 << 20
 	downsampleMaxMetadataSize  = 64 << 10
@@ -27,25 +27,22 @@ const (
 	downsampleIndexMagic     = "VMDSIX\x00\x02"
 )
 
-// downsamplePartMetadata 保留原有统计字段，并显式声明降采样的计算语义。
+// downsamplePartMetadata 在原有统计字段之外，仅保存生成此 part 时采用的降采样配置。
 type downsamplePartMetadata struct {
 	partHeader
-	FormatVersion    uint32
-	SemanticsVersion uint32
-	Mode             string
-	Resolutions      []int64
-	BucketOrigin     int64
-	NumericCodec     string
-	Retention        string
+	DownsamplingConfig *DownsamplingConfig `json:"downsampling_config"`
 }
 
-func newDownsamplePartMetadata(ph partHeader) downsamplePartMetadata {
-	return downsamplePartMetadata{partHeader: ph, FormatVersion: downsampleVersion, SemanticsVersion: downsampleVersion, Mode: "downsampling", Resolutions: []int64{300000, 3600000}, NumericCodec: "decimal-values", Retention: "bucket-end"}
+func newDownsamplePartMetadata(ph partHeader, config *DownsamplingConfig) downsamplePartMetadata {
+	return downsamplePartMetadata{partHeader: ph, DownsamplingConfig: config.clone()}
 }
 
 func (m *downsamplePartMetadata) validate() error {
-	if m.FormatVersion != downsampleVersion || m.SemanticsVersion != downsampleVersion || m.Mode != "downsampling" || len(m.Resolutions) != 2 || m.Resolutions[0] != 300000 || m.Resolutions[1] != 3600000 || m.BucketOrigin != 0 || m.NumericCodec != "decimal-values" || m.Retention != "bucket-end" || m.MinDedupInterval != 0 {
-		return fmt.Errorf("[downsampling] unsupported or inconsistent format, resolution, or semantics metadata")
+	if m.DownsamplingConfig == nil || !validDownsampleResolution(m.DownsamplingConfig.BaseResolutionMs()) {
+		return fmt.Errorf("[downsampling] metadata is missing a valid downsampling_config")
+	}
+	if m.MinDedupInterval != 0 {
+		return fmt.Errorf("[downsampling] MinDedupInterval must be zero")
 	}
 	if m.RowsCount%countOfDownsampleFeatures != 0 || m.BlocksCount%countOfDownsampleFeatures != 0 {
 		return fmt.Errorf("[downsampling] physical row and block counts must be grouped by five features")
@@ -85,7 +82,7 @@ func readDownsampleLimitedFile(path string, limit int64) (_ []byte, err error) {
 	return b, nil
 }
 
-// readDownsampleMetadata 不把损坏的降采样格式解释为 raw 格式。
+// readDownsampleMetadata 以非空配置识别降采样 part；配置存在但无效时返回错误。
 func readDownsampleMetadata(path string) (*downsamplePartMetadata, error) {
 	b, err := readDownsampleLimitedFile(filepath.Join(path, metadataFilename), downsampleMaxMetadataSize)
 	if errors.Is(err, os.ErrNotExist) {
@@ -102,7 +99,8 @@ func readDownsampleMetadata(path string) (*downsamplePartMetadata, error) {
 	if err := json.Unmarshal(b, &fields); err != nil {
 		return nil, err
 	}
-	if _, ok := fields["FormatVersion"]; !ok {
+	config, ok := fields["downsampling_config"]
+	if !ok || bytes.Equal(bytes.TrimSpace(config), []byte("null")) {
 		var ph partHeader
 		if err := json.Unmarshal(b, &ph); err != nil {
 			return nil, err
@@ -110,15 +108,9 @@ func readDownsampleMetadata(path string) (*downsamplePartMetadata, error) {
 		if err := validateDownsamplePartHeader(&ph); err != nil {
 			return nil, err
 		}
-		// 缺少版本但含降采样语义字段时不能按 raw 格式解释。
-		for _, key := range []string{"SemanticsVersion", "Mode", "Resolutions", "BucketOrigin", "NumericCodec", "Retention"} {
-			if _, ok := fields[key]; ok {
-				return nil, fmt.Errorf("[downsampling] metadata is missing FormatVersion")
-			}
-		}
 		return nil, nil
 	}
-	for _, key := range []string{"FormatVersion", "SemanticsVersion", "Mode", "Resolutions", "BucketOrigin", "NumericCodec", "Retention", "RowsCount", "BlocksCount", "MinTimestamp", "MaxTimestamp", "MinDedupInterval"} {
+	for _, key := range []string{"RowsCount", "BlocksCount", "MinTimestamp", "MaxTimestamp", "MinDedupInterval"} {
 		if v, ok := fields[key]; !ok || bytes.Equal(bytes.TrimSpace(v), []byte("null")) {
 			return nil, fmt.Errorf("[downsampling] metadata is missing field %s", key)
 		}
@@ -143,7 +135,10 @@ func detectDownsampleFormat(path string) (bool, error) {
 }
 
 // openDownsamplePart 在正常错误路径上关闭已打开文件，不改变原始 inmemory 打开过程。
-func openDownsamplePart(path string) (_ *part, err error) {
+func openDownsamplePart(path string, stopCh <-chan struct{}) (_ *part, err error) {
+	if err := checkDownsampleStopped(stopCh); err != nil {
+		return nil, err
+	}
 	m, err := readDownsampleMetadata(path)
 	if err != nil {
 		return nil, fmt.Errorf("[downsampling] cannot read part metadata %q: %w", path, err)
@@ -200,9 +195,17 @@ func openDownsamplePart(path string) (_ *part, err error) {
 	var rows, blocks, nextOffset uint64
 	var minTime, maxTime int64
 	for len(data) > 0 {
+		if err := checkDownsampleStopped(stopCh); err != nil {
+			return nil, err
+		}
 		var mr downsampleMetaindexRow
 		if err := mr.unmarshal(data[:downsampleMetaindexRowSize]); err != nil {
 			return nil, err
+		}
+		allowed := m.DownsamplingConfig.resolutionsForTenant(mr.TSID.AccountID, mr.TSID.ProjectID)
+		i := sort.Search(len(allowed), func(i int) bool { return allowed[i] >= mr.ResolutionMs })
+		if i == len(allowed) || allowed[i] != mr.ResolutionMs {
+			return nil, fmt.Errorf("[downsampling] resolution %d is not configured for tenant %d:%d", mr.ResolutionMs, mr.TSID.AccountID, mr.TSID.ProjectID)
 		}
 		if err := checkDownsampleExtent(mr.IndexBlockOffset, mr.IndexBlockSize, p.dsIndexSize); err != nil {
 			return nil, err
@@ -233,10 +236,13 @@ func openDownsamplePart(path string) (_ *part, err error) {
 	if rows != p.ph.RowsCount || blocks != p.ph.BlocksCount || minTime != p.ph.MinTimestamp || maxTime != p.ph.MaxTimestamp || nextOffset != p.dsIndexSize {
 		return nil, fmt.Errorf("[downsampling] metaindex statistics do not match part statistics")
 	}
-	if err := validateDownsamplePartIndexes(p, indexReader); err != nil {
+	if err := validateDownsamplePartIndexes(p, indexReader, stopCh); err != nil {
 		return nil, fmt.Errorf("[downsampling] cannot validate part %q: %w", path, err)
 	}
 	if err := closeValidationFiles(); err != nil {
+		return nil, err
+	}
+	if err := checkDownsampleStopped(stopCh); err != nil {
 		return nil, err
 	}
 	p.metaindexSizeBytes = uint64(cap(p.dsMetaindex)) * uint64(unsafe.Sizeof(downsampleMetaindexRow{}))
@@ -268,17 +274,41 @@ func openDownsamplePartDataFile(path, name string, dst *filestream.ReadAtCloser,
 
 // 五路只保留各自当前 index block，不建立随 part 大小增长的 header/offset 集合。
 // 打开校验仅读取索引，不借用合并 reader，也不解码 timestamps.bin 或 values.bin。
-func validateDownsamplePartIndexes(p *part, indexReader filestream.ReadAtCloser) error {
+func validateDownsamplePartIndexes(p *part, indexReader filestream.ReadAtCloser, stopCh <-chan struct{}) error {
 	var cursors [countOfDownsampleFeatures]downsamplePartIndexCursor
+	var baseCursor downsamplePartIndexCursor
+	baseResolution := p.dsMetadata.DownsamplingConfig.BaseResolutionMs()
+	baseRowsEnd := 0
+	for baseRowsEnd < len(p.dsMetaindex) && p.dsMetaindex[baseRowsEnd].ResolutionMs == baseResolution && p.dsMetaindex[baseRowsEnd].feature == downsampleFeatureLast {
+		if err := checkDownsampleStopped(stopCh); err != nil {
+			return err
+		}
+		baseRowsEnd++
+	}
+	if baseRowsEnd == 0 {
+		return fmt.Errorf("[downsampling] part has no base resolution blocks")
+	}
 	var timestampEnd, valuesEnd uint64
 	metaPos := 0
-	for _, resolution := range p.dsMetadata.Resolutions {
+	// 配置校验每个租户允许的分辨率；直接顺序遍历 metaindex 中实际存在的分辨率段。
+	for metaPos < len(p.dsMetaindex) {
+		if err := checkDownsampleStopped(stopCh); err != nil {
+			return err
+		}
+		resolution := p.dsMetaindex[metaPos].ResolutionMs
+		baseCursor.rows = p.dsMetaindex[:baseRowsEnd]
+		baseCursor.headers = baseCursor.headers[:0]
+		baseCursor.headerPos = 0
+		var baseHeader *blockHeader
 		var firstValues, lastValues [countOfDownsampleFeatures]uint64
 		var previousHeaders [countOfDownsampleFeatures]blockHeader
 		var seen bool
 		for feature := range cursors {
 			start := metaPos
 			for metaPos < len(p.dsMetaindex) && p.dsMetaindex[metaPos].ResolutionMs == resolution && p.dsMetaindex[metaPos].feature == uint8(feature) {
+				if err := checkDownsampleStopped(stopCh); err != nil {
+					return err
+				}
 				metaPos++
 			}
 			cursors[feature].rows = p.dsMetaindex[start:metaPos]
@@ -286,6 +316,9 @@ func validateDownsamplePartIndexes(p *part, indexReader filestream.ReadAtCloser)
 			cursors[feature].headerPos = 0
 		}
 		for {
+			if err := checkDownsampleStopped(stopCh); err != nil {
+				return err
+			}
 			var headers [countOfDownsampleFeatures]*blockHeader
 			for feature := range cursors {
 				h, err := cursors[feature].nextHeader(p, indexReader)
@@ -302,6 +335,24 @@ func validateDownsamplePartIndexes(p *part, indexReader filestream.ReadAtCloser)
 			h := headers[0]
 			if h == nil {
 				break
+			}
+			if resolution != baseResolution {
+				for baseHeader == nil || baseHeader.TSID.Less(&h.TSID) {
+					if err := checkDownsampleStopped(stopCh); err != nil {
+						return err
+					}
+					var err error
+					baseHeader, err = baseCursor.nextHeader(p, indexReader)
+					if err != nil {
+						return err
+					}
+					if baseHeader == nil {
+						return fmt.Errorf("[downsampling] extra resolution TSID has no base data")
+					}
+				}
+				if baseHeader.TSID != h.TSID {
+					return fmt.Errorf("[downsampling] extra resolution TSID has no base data")
+				}
 			}
 			if h.TimestampsBlockOffset != timestampEnd {
 				return fmt.Errorf("[downsampling] shared timestamp payloads are not contiguous")
@@ -333,12 +384,28 @@ func validateDownsamplePartIndexes(p *part, indexReader filestream.ReadAtCloser)
 				}
 				valuesEnd = lastValues[feature]
 			}
+		} else {
+			return fmt.Errorf("[downsampling] resolution %d has no blocks", resolution)
 		}
 	}
 	if metaPos != len(p.dsMetaindex) || timestampEnd != p.dsTimestampsSize || valuesEnd != p.dsValuesSize {
 		return fmt.Errorf("[downsampling] payload is truncated or contains an unreferenced tail")
 	}
 	return nil
+}
+
+// downsampleResolutionsForTenant returns the actual stored resolutions, not merely configured extras.
+func (p *part) downsampleResolutionsForTenant(accountID, projectID uint32) []int64 {
+	var resolutions []int64
+	for _, row := range p.dsMetaindex {
+		if row.feature != downsampleFeatureLast || row.TSID.AccountID != accountID || row.TSID.ProjectID != projectID {
+			continue
+		}
+		if len(resolutions) == 0 || resolutions[len(resolutions)-1] != row.ResolutionMs {
+			resolutions = append(resolutions, row.ResolutionMs)
+		}
+	}
+	return resolutions
 }
 
 // downsamplePartIndexCursor 只用于打开校验；各特征独立推进，允许其 index 分块边界不同。
@@ -456,23 +523,40 @@ func unmarshalDownsampleIndexBlock(dst []blockHeader, data []byte, m *downsample
 
 // estimateDownsamplePartSize 估算整个目标 part 的编码上界，不假设源 part 已被删除。
 // 估算以五个特征的聚合批次为单位；磁盘统计的五个单值 Block 行数须先换算。
-func estimateDownsamplePartSize(pws []*partWrapper) uint64 {
+func estimateDownsamplePartSize(pws []*partWrapper, config *DownsamplingConfig) uint64 {
+	if config == nil {
+		config = defaultDownsamplingConfig()
+	}
+	if !validDownsampleResolution(config.BaseResolutionMs()) || config.MaxResolutionsPerTenant() < 1 {
+		return math.MaxUint64
+	}
 	var rows uint64
 	for _, pw := range pws {
 		if pw == nil || pw.p == nil {
 			return math.MaxUint64
 		}
 		n := pw.p.ph.RowsCount
-		if pw.p.dsMetadata == nil {
-			n = multiplyDownsampleSpace(n, uint64(len(downsampleResolutions)))
-		} else {
+		if pw.p.dsMetadata != nil {
 			// 完整摘要每行对应五个单值 Block 行；非整除统计保守向上取整。
 			physicalRows := n
 			n /= countOfDownsampleFeatures
 			if physicalRows%countOfDownsampleFeatures != 0 {
 				n++
 			}
+			if len(pw.p.dsMetaindex) != 0 && pw.p.dsMetadata.DownsamplingConfig != nil {
+				n = 0
+				base := pw.p.dsMetadata.DownsamplingConfig.BaseResolutionMs()
+				for _, row := range pw.p.dsMetaindex {
+					if row.ResolutionMs == base && row.feature == downsampleFeatureLast {
+						n = addDownsampleSpace(n, row.RowsCount)
+					}
+				}
+				if n == 0 && physicalRows != 0 {
+					return math.MaxUint64
+				}
+			}
 		}
+		n = multiplyDownsampleSpace(n, uint64(config.MaxResolutionsPerTenant()))
 		rows = addDownsampleSpace(rows, n)
 	}
 	if rows == 0 {

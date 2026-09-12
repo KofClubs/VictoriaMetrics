@@ -57,6 +57,15 @@ func checkDownsamplingOpen(path string, opts OpenOptions) error {
 	if opts.DownsamplingEnabled && GetDedupInterval() != 0 {
 		return fmt.Errorf("[downsampling] -storage.downsampling.enabled requires -dedup.minScrapeInterval=0; got %dms", GetDedupInterval())
 	}
+	config := opts.DownsamplingConfig
+	if config == nil {
+		config = defaultDownsamplingConfig()
+	}
+	if opts.DownsamplingEnabled {
+		if err := checkDownsamplingBase(path, config); err != nil {
+			return err
+		}
+	}
 	dataPath := filepath.Join(path, dataDirname)
 	rootPaths := [3]string{
 		filepath.Join(dataPath, smallDirname),
@@ -101,8 +110,17 @@ func checkDownsamplingOpen(path string, opts OpenOptions) error {
 				if err != nil {
 					return fmt.Errorf("[downsampling] cannot inspect active part %q: %w", partPath, err)
 				}
-				if downsampled && !opts.DownsamplingEnabled {
-					return fmt.Errorf("[downsampling] active part %q uses downsampling format %d; enable -storage.downsampling.enabled to open this storage", partPath, downsampleVersion)
+				if downsampled {
+					if !opts.DownsamplingEnabled {
+						return fmt.Errorf("[downsampling] active part %q contains downsampling data; enable -storage.downsampling.enabled to open this storage", partPath)
+					}
+					metadata, err := readDownsampleMetadata(partPath)
+					if err != nil {
+						return err
+					}
+					if metadata.DownsamplingConfig.BaseResolutionMs() != config.BaseResolutionMs() {
+						return fmt.Errorf("%w: part %q has %dms; requested %dms", errDownsamplingBaseChanged, partPath, metadata.DownsamplingConfig.BaseResolutionMs(), config.BaseResolutionMs())
+					}
 				}
 			}
 		}
@@ -256,6 +274,9 @@ func (pt *partition) mergeDownsampleParts(pws []*partWrapper, dstPartType partTy
 			}
 		}
 	}()
+	if err := checkDownsampleStopped(stopCh); err != nil {
+		return err
+	}
 	if isDedupEnabled() {
 		return fmt.Errorf("[downsampling] cannot merge with deduplication enabled")
 	}
@@ -271,7 +292,8 @@ func (pt *partition) mergeDownsampleParts(pws []*partWrapper, dstPartType partTy
 			downsampleSpaceLogger.Warnf("[downsampling] merge postponed for %q: %s", pt.name, err)
 		}
 	}()
-	budget := estimateDownsamplePartSize(pws)
+	config := pt.s.getDownsamplingConfig()
+	budget := estimateDownsamplePartSize(pws, config)
 	release, err := reserveDownsampleSpace(filepath.Dir(dstPartPath), budget)
 	if err != nil {
 		return err
@@ -302,7 +324,7 @@ func (pt *partition) mergeDownsampleParts(pws []*partWrapper, dstPartType partTy
 	compressLevel := getCompressLevel(float64(sourceRows) / float64(max(sourceBlocks, 1)))
 	w := getDownsampleWriter()
 	defer putDownsampleWriter(w)
-	if err := w.Init(dstPartPath, compressLevel); err != nil {
+	if err := w.Init(dstPartPath, compressLevel, config); err != nil {
 		return err
 	}
 	published := false
@@ -331,7 +353,7 @@ func (pt *partition) mergeDownsampleParts(pws []*partWrapper, dstPartType partTy
 	if err != nil {
 		return fmt.Errorf("[downsampling] cannot merge downsampling part %q: %w", dstPartPath, err)
 	}
-	ph, err := w.Finish()
+	ph, err := w.Finish(stopCh)
 	if err != nil {
 		return err
 	}
@@ -352,7 +374,7 @@ func (pt *partition) mergeDownsampleParts(pws []*partWrapper, dstPartType partTy
 			return err
 		}
 	} else {
-		p, err := openDownsamplePart(dstPartPath)
+		p, err := openDownsamplePart(dstPartPath, stopCh)
 		if err != nil {
 			return fmt.Errorf("[downsampling] cannot open unpublished downsampling part %q: %w", dstPartPath, err)
 		}
@@ -493,15 +515,57 @@ func (pt *partition) writeDownsamplePartNames(small, big []*partWrapper, stopCh 
 	return nil
 }
 
-// filePartExpired 按两种目标区间保守清理磁盘源，原始 inmemory 使用原有判断。
-func (pt *partition) filePartExpired(p *part, deadline int64) bool {
+// partExpired 保守保留仍可能为任一配置分辨率贡献数据的源。
+// 逐 TSID 的精确保留边界由 merger 根据新旧租户配置计算。
+func (pt *partition) partExpired(p *part, deadline int64) bool {
 	if !pt.s.downsamplingEnabled {
 		return p.ph.MaxTimestamp < deadline
 	}
-	for _, resolution := range downsampleResolutions {
-		end, err := downsampleBucketEnd(p.ph.MaxTimestamp, resolution)
-		if err != nil || end > deadline {
+	if deadline <= 0 || p.ph.MaxTimestamp < minUnixMilli || p.ph.MaxTimestamp > maxUnixMilli {
+		return false
+	}
+	start := downsampleRetentionStart(pt.s.getDownsamplingConfig(), deadline)
+	if p.dsMetadata != nil {
+		if p.dsMetadata.DownsamplingConfig == nil {
 			return false
+		}
+		start = min(start, downsampleRetentionStart(p.dsMetadata.DownsamplingConfig, deadline))
+	}
+	return p.ph.MaxTimestamp < start
+}
+
+// downsampleRetentionStart 用配置中最早的 bucket 起点保护尚未过期 bucket 的全部贡献。
+// 尚未解析 TSID 的内存归并、part 清理和分区清理共用此保守边界。
+func downsampleRetentionStart(config *DownsamplingConfig, deadline int64) int64 {
+	if deadline <= 0 {
+		return deadline
+	}
+	base := config.BaseResolutionMs()
+	start := deadline - deadline%base
+	for _, resolutions := range config.tenantResolutions {
+		for _, resolution := range resolutions {
+			start = min(start, deadline-deadline%resolution)
+		}
+	}
+	return start
+}
+
+// retentionExpired 防止整月分区早于其中尚有效的降采样 bucket 被删除。
+// 当前配置覆盖尚未写为 part 的内存行；旧 part 自带的配置覆盖更新之前的粗分辨率。
+func (pt *partition) retentionExpired(deadline int64) bool {
+	if !pt.s.downsamplingEnabled {
+		return pt.tr.MaxTimestamp < deadline
+	}
+	if pt.tr.MaxTimestamp >= downsampleRetentionStart(pt.s.getDownsamplingConfig(), deadline) {
+		return false
+	}
+	pt.partsLock.Lock()
+	defer pt.partsLock.Unlock()
+	for _, parts := range [][]*partWrapper{pt.inmemoryParts, pt.smallParts, pt.bigParts} {
+		for _, pw := range parts {
+			if !pt.partExpired(pw.p, deadline) {
+				return false
+			}
 		}
 	}
 	return true
@@ -513,6 +577,7 @@ func (pt *partition) getFilePartsToMerge(pws []*partWrapper, maxOutBytes uint64)
 	if !pt.s.downsamplingEnabled {
 		return getPartsToMerge(pws, maxOutBytes)
 	}
+	config := pt.s.getDownsamplingConfig()
 	maxInputSize := uint64(float64(maxOutBytes) / minMergeMultiplier)
 	candidates := make([]downsamplePartCandidate, 0, len(pws))
 	for _, pw := range pws {
@@ -520,7 +585,7 @@ func (pt *partition) getFilePartsToMerge(pws []*partWrapper, maxOutBytes uint64)
 			continue
 		}
 		one := [1]*partWrapper{pw}
-		size := estimateDownsamplePartSize(one[:])
+		size := estimateDownsamplePartSize(one[:], config)
 		if size > maxInputSize {
 			continue
 		}

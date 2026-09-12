@@ -25,7 +25,7 @@ func TestDownsampleFileRoundtrip(t *testing.T) {
 	if ds, err := detectDownsampleFormat(path); err != nil || !ds {
 		t.Fatalf("格式识别: %v %v", ds, err)
 	}
-	p, err := openDownsamplePart(path)
+	p, err := openDownsamplePart(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestDownsampleFileRoundtrip(t *testing.T) {
 func TestDownsampleFileConstantAndEmptyResolution(t *testing.T) {
 	b := fileTestDownsampleBlock(1, 300000)
 	path := writeFileTestDownsamplePart(t, b)
-	p, err := openDownsamplePart(path)
+	p, err := openDownsamplePart(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestDownsampleFileAllConstantPayloads(t *testing.T) {
 	if isDS, err := detectDownsampleFormat(path); err != nil || !isDS {
 		t.Fatalf("空负载格式识别失败: %v", err)
 	}
-	p, err := openDownsamplePart(path)
+	p, err := openDownsamplePart(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestDownsampleFileAllConstantPayloads(t *testing.T) {
 
 func TestDownsampleReaderReadErrors(t *testing.T) {
 	path := writeFileTestDownsamplePart(t, fileTestDownsampleBlock(1, 300000))
-	p, err := openDownsamplePart(path)
+	p, err := openDownsamplePart(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestDownsampleReaderResolutionAndSharedTSID(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "part")
 	w := getDownsampleWriter()
 	defer putDownsampleWriter(w)
-	if err := w.Init(path, 1); err != nil {
+	if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 		t.Fatal(err)
 	}
 	w.maxIndexBlockSize = 2 * marshaledBlockHeaderSize
@@ -286,10 +286,10 @@ func TestDownsampleReaderResolutionAndSharedTSID(t *testing.T) {
 			}
 		}
 	}
-	if _, err := w.Finish(); err != nil {
+	if _, err := w.Finish(nil); err != nil {
 		t.Fatal(err)
 	}
-	p, err := openDownsamplePart(path)
+	p, err := openDownsamplePart(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +479,7 @@ func TestDownsampleReaderCrossIndexOffsets(t *testing.T) {
 
 func TestDownsampleReaderCrossIndexInitAndReset(t *testing.T) {
 	path := writeDownsampleCrossIndexPart(t)
-	p, err := openDownsamplePart(path)
+	p, err := openDownsamplePart(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,7 +545,7 @@ func TestDownsampleReaderDuplicateBatchKey(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "part")
 			w := getDownsampleWriter()
 			defer putDownsampleWriter(w)
-			if err := w.Init(path, 1); err != nil {
+			if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 				t.Fatal(err)
 			}
 			if separateIndexes {
@@ -560,7 +560,7 @@ func TestDownsampleReaderDuplicateBatchKey(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if _, err := w.Finish(); err != nil {
+			if _, err := w.Finish(nil); err != nil {
 				t.Fatal(err)
 			}
 			metaFile, err := os.ReadFile(filepath.Join(path, metaindexFilename))
@@ -730,7 +730,7 @@ func TestDownsampleReaderCloseFiles(t *testing.T) {
 
 func TestDownsampleReaderFilesIndependentFromQueries(t *testing.T) {
 	path := writeFileTestDownsamplePart(t, fileTestDownsampleBlock(1, downsampleResolution5m))
-	p, err := openDownsamplePart(path)
+	p, err := openDownsamplePart(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -876,13 +876,44 @@ func TestDownsampleReaderInitCloseFailure(t *testing.T) {
 	})
 }
 
+func TestDownsampleReaderCancellation(t *testing.T) {
+	input := sharedTimestampsTestBlock(10, downsampleResolution5m, minUnixMilli+1, 4, 64)
+	path := writeFileTestDownsamplePart(t, input)
+	p, err := openDownsamplePart(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.MustClose()
+	var r downsampleReader
+	defer r.Close()
+	if err := r.Init(p, input.resolution); err != nil || !r.NextHeader() {
+		t.Fatalf("cannot initialize reader: %v / %v", err, r.Error())
+	}
+	header := *r.Header()
+	stopCh := make(chan struct{})
+	r.stopCh = stopCh
+	close(stopCh)
+	if _, err := r.readFeatureHeader(&header, downsampleFeatureSum); !errors.Is(err, errForciblyStopped) {
+		t.Fatalf("feature scan ignored cancellation: %v", err)
+	}
+	if r.NextHeader() || !errors.Is(r.Error(), errForciblyStopped) {
+		t.Fatalf("index scan ignored cancellation: %v", r.Error())
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if r.stopCh != nil {
+		t.Fatal("reader retained previous merge cancellation")
+	}
+}
+
 // 首列之后关闭时间戳文件，使任何重复读取立即失败；原生 Block 中仅保留已解码时间戳。
 func TestDownsampleReaderSharedTimestampsValuesOnly(t *testing.T) {
 	for _, precision := range []uint8{64, 8} {
 		t.Run(fmt.Sprintf("precision_%d", precision), func(t *testing.T) {
 			input := sharedTimestampsTestBlock(10, downsampleResolution5m, minUnixMilli+1, 512, precision)
 			path := writeFileTestDownsamplePart(t, input)
-			p, err := openDownsamplePart(path)
+			p, err := openDownsamplePart(path, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -957,7 +988,7 @@ func TestDownsampleReaderSharedTimestampsSwitches(t *testing.T) {
 				sharedTimestampsTestBlock(2, resolution, base+3*resolution, 1, precision),
 			)
 		}
-		p, err := openDownsamplePart(writeFileTestDownsamplePart(t, inputs...))
+		p, err := openDownsamplePart(writeFileTestDownsamplePart(t, inputs...), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1023,7 +1054,7 @@ func TestDownsampleReaderSharedTimestampsSwitches(t *testing.T) {
 
 func TestDownsampleReaderSharedTimestampsValidation(t *testing.T) {
 	input := sharedTimestampsTestBlock(1, downsampleResolution5m, minUnixMilli+1, 8, 64)
-	p, err := openDownsamplePart(writeFileTestDownsamplePart(t, input))
+	p, err := openDownsamplePart(writeFileTestDownsamplePart(t, input), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1108,7 +1139,7 @@ func TestDownsampleReaderSharedTimestampsValidation(t *testing.T) {
 func TestDownsampleClusterTenantIndexBoundaries(t *testing.T) {
 	batches := makeDownsampleLayoutBlocks(330, false)
 	path := writeFileTestDownsamplePart(t, batches...)
-	p, err := openDownsamplePart(path)
+	p, err := openDownsamplePart(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

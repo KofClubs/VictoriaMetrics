@@ -22,20 +22,28 @@ import (
 type BlockRef struct {
 	p  *part
 	bh blockHeader
+	// downsampleBlock 是查询生成的不可变原生编码 Block；按值复制 BlockRef 即可独立保活，不借用游标的可复用缓冲。
+	downsampleBlock *Block
 }
 
 func (br *BlockRef) reset() {
 	br.p = nil
 	br.bh = blockHeader{}
+	br.downsampleBlock = nil
 }
 
 func (br *BlockRef) init(p *part, bh *blockHeader) {
 	br.p = p
 	br.bh = *bh
+	br.downsampleBlock = nil
 }
 
 // MustReadBlock reads block from br to dst.
 func (br *BlockRef) MustReadBlock(dst *Block) {
+	if br.downsampleBlock != nil {
+		dst.CopyFrom(br.downsampleBlock)
+		return
+	}
 	dst.Reset()
 	dst.bh = br.bh
 
@@ -197,7 +205,12 @@ func (s *Search) Init(qt *querytracer.Tracer, storage *Storage, tfss []*TagFilte
 	retentionDeadline := int64(fasttime.UnixTimestamp()*1e3) - storage.retentionMsecs
 
 	s.reset()
-	s.mns = getMetricNameSearch(storage, tr, false)
+	sourceTimeRange := tr
+	var sourceRangeErr error
+	if downsampleQuery != nil {
+		sourceTimeRange, sourceRangeErr = downsampleQuery.SourceTimeRange(tr)
+	}
+	s.mns = getMetricNameSearch(storage, sourceTimeRange, false)
 	s.retentionDeadline = retentionDeadline
 	s.metricsTracker = storage.metricsTracker
 	s.tr = tr
@@ -205,12 +218,19 @@ func (s *Search) Init(qt *querytracer.Tracer, storage *Storage, tfss []*TagFilte
 	s.deadline = deadline
 	s.needClosing = true
 
-	tsids, err := storage.SearchTSIDs(qt, tfss, tr, maxMetrics, deadline)
+	var tsids []TSID
+	err := sourceRangeErr
+	if err == nil {
+		tsids, err = storage.SearchTSIDs(qt, tfss, sourceTimeRange, maxMetrics, deadline)
+	}
 
 	// It is ok to call Init on non-nil err.
 	// Init must be called before returning because it will fail
 	// on Search.MustClose otherwise.
 	s.ts.Init(storage.tb, tsids, tr, downsampleQuery)
+	if s.ts.downsampleQuery != nil {
+		s.ts.downsampleQuery.deadline = deadline
+	}
 	qt.Printf("search for parts with data for %d series", len(tsids))
 	if err != nil {
 		s.err = err

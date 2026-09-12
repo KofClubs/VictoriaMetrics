@@ -14,15 +14,15 @@ func getDownsampleQuery(r *http.Request) (*storage.DownsampleQuery, error) {
 		return nil, httpserver.InvalidParamError(err)
 	}
 	if _, ok := r.Form["query.field"]; ok {
-		return nil, httpserver.InvalidParamError(fmt.Errorf("[downsampling] query.field is unsupported; use query.resolution and query.feature"))
+		return nil, httpserver.InvalidParamError(fmt.Errorf("[downsampling] query.field is unsupported; use resolution and feature"))
 	}
-	resolutions := r.Form["query.resolution"]
-	features := r.Form["query.feature"]
+	resolutions := r.Form["resolution"]
+	features := r.Form["feature"]
 	if len(resolutions) == 0 && len(features) == 0 {
 		return nil, nil
 	}
 	if len(resolutions) != 1 || resolutions[0] == "" || len(features) != 1 || features[0] == "" {
-		return nil, httpserver.InvalidParamError(fmt.Errorf("[downsampling] query.resolution and query.feature must each contain exactly one non-empty value"))
+		return nil, httpserver.InvalidParamError(fmt.Errorf("[downsampling] resolution and feature must each contain exactly one non-empty value"))
 	}
 	downsampleQuery, err := storage.ParseDownsampleQuery(resolutions[0], features[0])
 	if err != nil {

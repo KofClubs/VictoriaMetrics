@@ -21,7 +21,7 @@ import time
 testdata = pathlib.Path(sys.argv[1]).resolve()
 parser = argparse.ArgumentParser(
     prog="downsampling_e2e.sh",
-    description="一键运行降采样集群测试：两套组件构建、UT、三小时、三租户、93 天对照、重启一致性、兼容性及文件检查。")
+    description="一键运行降采样集群测试：两套组件构建、UT、三小时、三租户四分辨率及动态更新、93 天对照、重启一致性、兼容性及文件检查。")
 parser.add_argument("--output", type=pathlib.Path, help="尚不存在的输出目录；默认在系统临时目录中自动创建")
 args = parser.parse_args(sys.argv[2:])
 for tool in ("git", "go"):
@@ -73,6 +73,9 @@ manifest = {"status": "running", "started_utc": datetime.datetime.now(datetime.t
                     "fixtures": ["每分辨率 738 批次，超过默认每 index 的 736 个 header 上限",
                                  "180 条时间线，以 132 header/index 使同一 TSID 跨相邻 index",
                                  "AccountID 与 ProjectID 分别切换时 row 保持同租户"]},
+                "tenants": {
+                    "scope": "5m/30m/1h/2h 四个物理分辨率；租户配置隔离、PUT 更新前后 fallback、重启恢复 startup extras",
+                    "cross_partition": "同一 vmstorage 相邻月旧 1h 与新 30m 源，合并一个跨月目标 bucket 的五个特征"},
                 "long": {
                     "required": long_required_coverage,
                     "scope": "160 条时间线的真实 E2E 文件；同列跨 index 按实际产物报告，不作为本场景必选项"}}}
@@ -259,7 +262,7 @@ try:
     run_step("go-layout-ut", ["go", "test", "-p", "4", "./lib/storage", "-run", layout_tests, "-count=1", "-v"])
     run_step("go-ut", ["go", "test", "-p", "4", "./lib/storage", "./lib/vmselectapi", "./app/vmstorage",
                        "./app/vmselect/netstorage", "./app/vmselect/prometheus", "-run",
-                       "Test(Downsample|Downsampling|CheckDownsampling|MustOpenStorageDownsampling|EstimateDownsample|ReserveDownsample)",
+                       "Test(Downsample|Downsampling|SearchQueryRPCDispatchAndPartialResults|CheckDownsampling|MustOpenStorageDownsampling|EstimateDownsample|ReserveDownsample)",
                        "-skip", layout_tests, "-count=1"])
     common = ["--original", output / "original", "--candidate", output / "candidate"]
     cluster = ["--mode", "cluster", "--tenant", "11:17"]
@@ -282,6 +285,13 @@ try:
         if name in ("short", "restart"):
             inspect(name, 2, ["11:17"])
         elif name == "tenants":
+            if report.get("cross_partition", {}).get("status") != "passed":
+                raise RuntimeError("租户场景未完成单节点跨 part 目标 bucket 合并")
+            required_stages = {"updated-before-rewrite", "rewrite", "restart", "restart-rewrite"}
+            if not required_stages.issubset(report.get("stages", [])):
+                raise RuntimeError("租户场景缺少动态配置更新或重启阶段")
+            manifest["results"][name].update(startup_config=report["startup_config"], runtime_config=report["runtime_config"],
+                                            cross_partition=report["cross_partition"])
             inspect(name, 6, ["11:17", "11:18", "12:17"])
         elif name == "long":
             inspect(name, 160, ["11:17"], long_required_coverage)

@@ -74,6 +74,10 @@ type Storage struct {
 	maxBackfillAgeMsecs         int64
 	denyQueriesOutsideRetention bool
 	downsamplingEnabled         bool
+	// downsamplingConfig 原子发布不可变配置；每次归并只读取一次，查询使用 part 自身配置。
+	downsamplingConfig atomic.Pointer[DownsamplingConfig]
+	// downsamplingConfigLock 串行校验并安装 API 更新，禁止基础分辨率变更。
+	downsamplingConfigLock sync.Mutex
 
 	// lock file for exclusive access to the storage on the given path.
 	flockF *os.File
@@ -191,8 +195,10 @@ type OpenOptions struct {
 	TrackMetricNamesStats       bool
 	IDBPrefillStart             time.Duration
 	LogNewSeries                bool
-	// DownsamplingEnabled 启用固定 5m 和 1h 分辨率的文件降采样；与非零 dedup interval 互斥。
+	// DownsamplingEnabled 启用文件降采样，要求 dedup interval 为零。
 	DownsamplingEnabled bool
+	// DownsamplingConfig 指定固定基础分辨率和可更新的租户附加分辨率；nil 表示仅保留 5m 基础。
+	DownsamplingConfig *DownsamplingConfig
 }
 
 // MustOpenStorage opens storage on the given path with the given retentionMsecs.
@@ -229,6 +235,14 @@ func MustOpenStorage(path string, opts OpenOptions) *Storage {
 		idbPrefillStartSeconds:      idbPrefillStart.Milliseconds() / 1000,
 	}
 	s.logNewSeries.Store(opts.LogNewSeries)
+	config := opts.DownsamplingConfig
+	if config == nil {
+		config = defaultDownsamplingConfig()
+	}
+	if !validDownsampleResolution(config.BaseResolutionMs()) || config.MaxResolutionsPerTenant() < 1 {
+		logger.Panicf("[downsampling] FATAL: invalid storage downsampling configuration")
+	}
+	s.downsamplingConfig.Store(config.clone())
 
 	fs.MustMkdirIfNotExist(path)
 
@@ -258,6 +272,9 @@ func MustOpenStorage(path string, opts OpenOptions) *Storage {
 		fs.MustClose(s.flockF)
 		s.flockF = nil
 		logger.Panicf("[downsampling] FATAL: cannot open storage at %q: %s", path, err)
+	}
+	if opts.DownsamplingEnabled {
+		mustPersistDownsamplingBase(path, config)
 	}
 
 	// Pre-create snapshots directory if it is missing.

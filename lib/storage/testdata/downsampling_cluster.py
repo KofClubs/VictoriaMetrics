@@ -10,7 +10,7 @@ import urllib.request
 
 
 class ClusterRuntime:
-    def __init__(self, binaries, root, storage, downsampling, tenant, unused_port):
+    def __init__(self, binaries, root, storage, downsampling, tenant, unused_port, downsampling_config=None):
         self.root = root
         self.tenant = tenant
         self.processes = {}
@@ -38,7 +38,11 @@ class ClusterRuntime:
                          "-dedup.minScrapeInterval=0", "-search.disableCache=true", "-search.latencyOffset=0s"] + common,
         }
         if downsampling:
-            self.commands["vmstorage"].append("-storage.downsampling.enabled=true")
+            if downsampling_config is None:
+                downsampling_config = {"base_resolution": "5m", "tenant_resolutions": [
+                    {"tenant": self.tenant, "resolutions": ["1h"]}]}
+            self.commands["vmstorage"].extend(["-storage.downsampling.enabled=true",
+                "-storage.downsampling.config=" + json.dumps(downsampling_config, separators=(",", ":"))])
         self.write_manifest()
 
     @property
@@ -76,7 +80,7 @@ class ClusterRuntime:
             return self.http["vmselect"] + "/select/" + tenant + "/prometheus" + path
         return self.http["vmstorage"] + path
 
-    def request(self, path, params=None, data=None):
+    def request(self, path, params=None, data=None, method=None):
         rows = 0
         if path == "/api/v1/import":
             assert data is not None, "写入请求缺少数据"
@@ -89,7 +93,7 @@ class ClusterRuntime:
         url = self.url(path)
         if params:
             url += "?" + urllib.parse.urlencode(params)
-        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=120) as response:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data, method=method), timeout=120) as response:
             result = response.read().decode()
         if path == "/api/v1/import":
             self.expected_rows += rows

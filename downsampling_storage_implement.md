@@ -1,122 +1,106 @@
 # 降采样存储实现说明
 
-本文说明当前模块职责、调用链和资源归属。数据语义与文件格式见[设计文档](downsampling_storage_design.md)，审查重点见[审查说明](downsampling_storage_review.md)，测试入口与覆盖范围见[测试说明](downsampling_storage_test.md)。
+本文说明当前模块职责、调用链和资源归属。数据语义及文件格式见[设计文档](downsampling_storage_design.md)，审查重点见[审查说明](downsampling_storage_review.md)，测试入口见[测试说明](downsampling_storage_test.md)。
 
 ## 代码导航
 
-| 代码 | 职责 |
+| 文件 | 职责 |
 |---|---|
-| [downsample_block.go](lib/storage/downsample_block.go) | 定义分辨率、特征、bucket 样本及多特征解码结果，实现分桶、同 bucket 样本合并、NaN 规范化和解码缓冲复用；定义原始 block 行数与缓冲池容量上限，校验分辨率、header 及其排序，比较共享时间戳描述和租户。 |
-| [downsample_metaindex_row.go](lib/storage/downsample_metaindex_row.go) | 仅定义 metaindex 行类型及编码长度，实现行的 `marshal`／`unmarshal`。 |
-| [downsample_reader.go](lib/storage/downsample_reader.go) | 仅供归并使用，统一读取原始内存 part、原始磁盘 part 和降采样磁盘 part；按分辨率和 TSID 遍历索引，将原生 `Block` 解码为五特征结果。 |
-| [downsample_writer.go](lib/storage/downsample_writer.go) | 从 bucket 样本生成单特征原生 `Block`，组织 spill、最终文件及索引，以 metadata 标记写入完成，完成 `Finish`／`Abort`；定义单列编码负载大小上限，负责输出编码大小估算、写入空间检查、空间算术及 `errDownsampleNoSpace`。 |
-| [downsample_merger.go](lib/storage/downsample_merger.go) | 组织源 reader，收集当前 TSID 的完整时间范围，按 bucket 累加样本并调用 writer。 |
-| [downsample_part.go](lib/storage/downsample_part.go) | 定义格式版本、index／metaindex 文件标识，以及 index、metaindex、metadata 大小上限；仅依据 metadata 探测格式，打开时校验实际数据文件，建立文件句柄及 metaindex，按 metaindex 约束解码原生 block header，根据源 part 统计估算目标大小。 |
-| [downsample_partition.go](lib/storage/downsample_partition.go) | 处理启动预检查、分区及活动清单发现、文件选源、降采样作业与清单发布；管理进程级磁盘预算、预留和缓存有效期内的额度释放。 |
-| [downsample_query.go](lib/storage/downsample_query.go) | 解析分辨率与特征，编解码降采样查询协议；为原有 part 搜索读取选定列的 index，后续筛选及 BlockRef 读取复用原有逻辑。 |
+| [downsample_config.go](lib/storage/downsample_config.go) | 严格解析 JSON，保存不可变配置快照，提供租户分辨率访问、运行时更新，以及基础分辨率的持久化和启动检查。 |
+| [downsample_block.go](lib/storage/downsample_block.go) | 定义五种特征、bucket 样本和多特征解码缓冲；实现分桶、样本合并、NaN 规范化、header 校验，以及复用原生 Block 的无损时间戳编码。 |
+| [downsample_metaindex_row.go](lib/storage/downsample_metaindex_row.go) | 定义 metaindex 行及其编解码。 |
+| [downsample_reader.go](lib/storage/downsample_reader.go) | 仅供归并使用，统一读取原始内存、原始磁盘和降采样磁盘 part，顺序扫描指定分辨率的索引并解码共享时间戳及五特征。 |
+| [downsample_writer.go](lib/storage/downsample_writer.go) | 接收 bucket 样本，逐列复用原生 Block；管理各分辨率 spill、文件排序、索引、空间检查和 Finish／Abort。 |
+| [downsample_merger.go](lib/storage/downsample_merger.go) | 建立一次基础 reader 堆，按 TSID 聚合基础样本，再推导本租户的额外分辨率；管理任务状态和源物理行统计。 |
+| [downsample_part.go](lib/storage/downsample_part.go) | 定义格式、metadata 和大小限制，探测格式并校验全部索引与文件范围，建立原有查询读取对象，估算输出空间。 |
+| [downsample_partition.go](lib/storage/downsample_partition.go) | 启动检查、活动清单发现、选源、作业、发布、保留期限及进程级磁盘预算。 |
+| [downsample_query.go](lib/storage/downsample_query.go) | 解析选择参数、编解码 RPC，按租户和 part 选择最大可用整除分辨率，跨 part／partition 聚合目标 bucket。 |
 
-这八个文件按降采样存储职责组织。底层新增组件包括临时字节流 [spill_writer.go](lib/filestream/spill_writer.go) 和供归并及打开校验使用的偏移读取 [reader_at.go](lib/filestream/reader_at.go)；最终文件使用原有 `filestream.WriteCloser`。共用实现包括原生编解码 [block.go](lib/storage/block.go)、part 引用生命周期 [part.go](lib/storage/part.go)、归并调度及刷盘 [partition.go](lib/storage/partition.go)、查询遍历 [part_search.go](lib/storage/part_search.go)、查询文件读取 [fs/reader_at.go](lib/fs/reader_at.go) 和 RPC 分派 [vmselectapi/server.go](lib/vmselectapi/server.go)。
+这九个文件按存储职责组织。底层专属组件为 [spill_writer.go](lib/filestream/spill_writer.go) 和 [reader_at.go](lib/filestream/reader_at.go)；最终文件直接使用原有 `filestream.WriteCloser`。共享 [block.go](lib/storage/block.go)、[fs/reader_at.go](lib/fs/reader_at.go)、part 引用计数与回收规则保持原有实现。
 
-block 中的 `downsampleMaxRawRows` 和 `downsampleMaxPooledRows` 分别限制原始输入 block 的行数和对象池保留的行容量；writer 中的 `downsampleMaxColumnSize` 限制已编码的单列负载。`prepareBlockPayload` 检查行数与编码的组合，并限制压缩负载的展开大小，`checkDownsampleExtent` 检查负载偏移、大小及文件边界。
+reader、writer、merger 的声明顺序为类型、调用入口、内部辅助、对象池。`Init`、`NextHeader`、`ReadBlock`、`Close`、`Merge`、`WriteSamples` 为调用入口；原生读取辅助、清理辅助和 `reset` 使用小写名称。heap 与文件接口保留接口要求的方法名。
 
-reader、writer、merger 的函数按类型声明、面向调用方的生命周期与主操作、内部辅助、对象池排列。方法可见性沿用原始存储类型的职责划分：`Init`、`NextHeader`、`ReadBlock`、`Close`、`Merge`、`WriteSamples` 等调用入口使用大写名称，内部辅助使用小写名称。reader 的原生 block 读取辅助及 merger 的 `reset` 仅供内部调用。heap 和文件接口方法保留接口要求的名称。
+## 配置与快照
 
-配置入口位于 [vmstorage/main.go](app/vmstorage/main.go) 和 `storage.OpenOptions.DownsamplingEnabled`。开关默认关闭；启用时要求 dedup 间隔为零。内存 part 使用原始格式，文件目标进入降采样路径。
+[vmstorage/main.go](app/vmstorage/main.go) 解析 `-storage.downsampling.enabled` 和 `-storage.downsampling.config`，传入 `storage.OpenOptions`。默认关闭；启用时要求 `dedup.minScrapeInterval=0`，未提供 JSON 时默认仅含 5m 基础分辨率。
+
+`DownsamplingConfig` 保存基础分辨率和按租户排序的额外分辨率；额外分辨率必须是更大的整数倍。Parse 同时检查输入 JSON 和最坏 metadata 编码的 64 KiB 边界，后者包含规范化后的完整配置及最大长度的数值字段，不另设租户或分辨率数量上限。公开访问器返回副本，存储内部只读借用快照。`Storage.UpdateDownsamplingConfig` 校验基础分辨率不变，然后原子替换配置；`GET／PUT /internal/downsampling/config` 是对应的运行时接口。更新只影响新任务，重启后的租户配置来自启动 JSON。基础分辨率独立持久化到 `metadata/downsampling.json`，启动时同时检查该文件和活动降采样 part。
+
+`mergeDownsampleParts` 开始时取得一次配置指针，空间预算、writer 和 merger 共用该快照。writer 的 `partTenants` 记录实际写入租户；Finish 将配置缩小到这些租户，写入 metadata；实际分辨率由 metaindex 的有序区段确定。读取旧 part 及查询时使用其自身配置，不能套用最新租户配置解释已有列。
 
 ## 文件归并调用链
 
-`partition.mergePartsWithDownsampling` 先确定目标类型。降采样已启用且目标为文件时，调用 `mergeDownsampleParts`；目标仍为内存 part 时使用原始数据归并路径。
+`partition.mergePartsWithDownsampling` 对文件目标进入 `mergeDownsampleParts`，内存目标继续原始归并。文件作业依次执行：
 
-一次文件作业按以下顺序执行：
+1. 取得配置快照，估算最终文件与 spill 的空间，预留进程级磁盘预算，初始化 writer。
+2. `initSources` 为每个源初始化一个基础 reader，校验降采样源基础分辨率一致，再建立一次 TSID 堆。
+3. `collectSources` 收集当前 TSID 的全部基础首列 header，按值缓存到各 reader，并汇总时间范围及输入行数；首列游标前进到下一 TSID 或 EOF。删除的 TSID 只统计，不缓存 header 或读取 payload。
+4. `mergeTSID` 根据完整时间范围与源行数选择密集槽或稀疏 bucket 映射，随后 `readSource` 按缓存 header 解码一次基础输入，累加到 `currentTSIDBaseBucketSamples`。旧额外列不读取。
+5. 基础结果按 bucket 排序后直接交给 `WriteSamples`；`aggregateSamples` 从这份完整结果逐次推导本租户的额外分辨率，复用一份输出缓冲。所有分辨率完成后才处理下一 TSID。
+6. `Merge` 返回前释放 reader 和解码缓冲，按值返回基础输入物理行统计；外层以同一个取消信号调用 `Finish(stopCh)`，再次检查取消，重新打开并验证非空目标，最后提交清单。
 
-1. 根据源 part 统计估算目标与 spill 所需磁盘空间，取得进程级预算预留，再取得并初始化 `downsampleWriter`。
-2. 调用 `downsampleMerger.Merge`。先处理 5m，再处理 1h；每个分辨率建立源 reader 堆，并按 TSID 顺序处理。
-3. `collectSources` 顺序遍历当前 TSID 的所有相关首列 header，汇总最小、最大时间戳，按值追加到各源 reader 的 `currentTSIDBlockHeaders`，同时把首列索引游标推进到下一 TSID 或源末尾。已删除 TSID 只累计统计，不保存 header 或读取 payload。
-4. `mergeTSID` 按完整时间范围计算 bucket 槽数，分配或复用 `currentTSIDBucketSamples`，清空当前有效槽位。
-5. `readSource` 遍历已保存的 header，调用同一源 reader 的 `ReadBlock(decoded, header)` 直接读取 payload；其他四列索引顺序对齐，不改变堆所使用的首列 header，也不重复读取首列索引。每个已解码输入样本按时间戳定位槽位，经保留期限和精度检查后调用 `downsampleSample.Merge`。当前源消费完成或读取失败时清空其 header 缓存长度。
-6. `partWriter.WriteSamples` 接收当前 TSID 的 bucket 样本，跳过空槽，按有效行数及精度拆块并写出。
-7. `Merge` 返回前通过 `reset` 归还全部 reader 和多特征解码缓冲，清除本次作业状态。外层使用返回的源物理行统计，调用 writer 的 `Finish`，再检查调用方持有的取消信号。
-8. 非空目标由 `openDownsamplePart` 重新打开并校验，然后进入清单提交。空目标由 writer 删除，发布过程只处理应移除的源。
-
-实际降采样数据读取顺序为 `resolution → TSID → 源 part → Block 批次 → feature`。归并过程中，每个源在当前分辨率内的各列索引只向前读取；原始源仍按 5m、1h 分别读取一次索引和数据。最终 values 与 index 的顺序由 writer 的 spill 转置确定，详见设计文档。值列读取在五个特征区段之间按偏移切换，不是整个 values 文件的连续顺序扫描，也不会将整个特征列一次性读入内存。
+原始和降采样输入各读一次基础索引与数据。值列仍按逻辑 block 在五个特征区段间发起偏移读取；时间戳在一次多特征解码中只读、解码一次。最终列顺序由 writer 的 spill 读回确定。
 
 ## Merger 工作状态
 
-| 字段 | 保存的状态及释放时机 |
+| 字段 | 内容与生命周期 |
 |---|---|
-| `currentResolutionReaders` | 当前分辨率取得的全部源 reader，包括初始化失败和已出堆的实例；用于统一归还。 |
-| `currentResolutionReaderHeap` | 尚未读完索引的源 reader，按 TSID 排序；每个分辨率重新建立。 |
-| `currentTSIDReaders` | 当前 TSID 涉及的源 reader 借用列表；每次收集前清空，归还 reader 前移除引用。 |
-| `currentTSIDBucketSamples` | 当前 TSID、当前分辨率的 bucket 样本；有效长度由 header 时间范围决定，容量可复用。 |
-| `currentSourceBlock` | 当前源 block 的多特征解码缓冲；每次 `ReadBlock` 重设内容，`Merge` 返回前由 `reset` 归还。 |
-| `partWriter` | 借用外层创建的目标 writer；merger 调用 `WriteSamples`，外层负责 `Finish`／`Abort`。 |
-| `stopCh` | 当前作业的取消信号；`Merge` 返回前清除引用，外层仍使用传入的信号检查发布前取消。 |
-| `mergeStats` | 当前作业累计的源物理行统计；跨分辨率累计，按值返回后由 `reset` 清零。 |
+| `baseResolutionReaders` | 本次作业取得的全部源 reader，包括出堆或初始化失败的实例，统一释放。 |
+| `baseResolutionReaderHeap` | 尚未读完基础索引的 reader，按完整 TSID 排序，整次归并只建一次。 |
+| `currentTSIDReaders` | 当前 TSID 的源 reader 借用列表，每次收集前清空。 |
+| `currentTSIDBaseBucketSamples` | 当前 TSID 的基础聚合结果；密集时间范围按槽排列，稀疏范围只保留实际 bucket。 |
+| `currentTSIDBaseBucketIndexes` | 稀疏范围中 bucket 到实际槽号的映射，排序后释放。 |
+| `currentTSIDResolutionSamples` | 当前额外分辨率的非空 bucket，跨额外分辨率复用。 |
+| `currentSourceBlock` | 当前输入 block 的共享时间列和五个数值列，任务结束归还。 |
+| `mergeMemoryLimiter`、`mergeMemoryBytes` | 本次任务使用的进程预算及实际持有额度；非阻塞申请，返回前清理并归还。 |
+| `currentTSIDBaseSamplesMemory`、`currentTSIDResolutionSamplesMemory`、`currentTSIDBucketIndexesMemory` | 分别记录基础／派生样本容量与稀疏映射预留，扩容或释放时对应更新，防止遗漏和重复归还。 |
+| `partWriter`、`stopCh` | 外层 writer 和取消信号的借用引用，返回前清除。 |
+| `mergeStats` | 基础输入物理行统计；原始输入每行计一次，降采样基础输入按五特征换算，旧额外列不重复计数。 |
 
-`downsampleDecodedResolutionFeaturesBlock` 只组织解码结果。原始数据源读取时展开五特征，但此时尚未分桶；聚合和 NaN 规范化统一发生在 `downsampleSample.Merge`。该方法在复制或计算后扫描一次五个结果值，同时处理输入标记和运算产生的 NaN。reader 不增加解码后的规范化扫描；writer 直接提取聚合结果到 `currentFeatureValues`，交给原生 decimal／`Block` 编码，不再规范化，也不接收另一个五列输出缓冲。
+`downsampleSample.Merge` 统一合并数值并规范化 NaN；reader 和 writer 不重复规范化。基础贡献的保留边界由当前配置与源 part 配置共同计算，避免粗粒度 bucket 尚有效时丢失其基础前缀。所有额外结果完整聚合这份基础输入，不再单独裁剪保留前缀，确保查询选择任一可用源分辨率时贡献一致。降采样启用时，内存原始归并透传 `downsampleRetentionStart` 计算的保守边界；所有 part 清理由 `partExpired` 判断，整月清理由 `retentionExpired` 核对当前配置和活动 part 的旧配置。原始 merger 和关闭降采样时的清理规则保持原有实现。
 
-merger 的清理入口分为两层：`closeResolutionReaders` 归还当前分辨率的全部源 reader，供分辨率切换使用；每个源的索引与 payload 共用同一个 reader。`reset` 在此基础上归还解码缓冲，并清空作业状态。归还对象前先清除持有引用；归还 merger 对象池时再次检查空状态，不重复归还已经释放的资源。
+`reset` 通过 `closeBaseReaders` 清除借用引用、归还全部源 reader，然后归还解码对象并清空作业状态。基础及派生样本、稀疏映射和 header 缓存解除引用后归还内存额度，不把未计费的大数组留在 merger 池中。reader 指针切片清空引用后仍保留底层容量；关闭或归还前先移除持有引用，后续清理不重复释放。
 
 ## Reader 与原生 Block
 
-`downsampleReader` 仅由归并任务持有，统一访问原始内存、原始磁盘和降采样磁盘数据源；part 打开校验及查询不使用该 reader。`Init(p, resolution)` 顺序扫描内存中的 metaindex，为该分辨率建立完整索引区间，不执行二分定位。`NextHeader` 只推进 last 或原始索引；merger 在 TSID 变化时结束当前 TSID 的 header 收集，再按保存的 header 读取数据。reader 不提供 TSID 定位或时间窗口。同一 part 再次 `Init` 时复用文件句柄和工作缓冲；换 part 时先释放旧 reader 自有资源。
+`downsampleReader` 仅由归并持有，查询及 part 打开校验不使用它。`Init(p, resolution)` 顺序扫描 metaindex，设置各特征的完整索引范围。`NextHeader` 只推进 last 或原始索引，`Header` 在下一次推进后失效；merger 必须按值保存。`ReadBlock(decoded, header)` 按保存的 header 读取，即使首列已推进至下一 TSID 或 EOF，也不改变堆使用的 header。
 
-磁盘读取使用 `filestream.ReadAtCloser`：原始磁盘和降采样磁盘源均由 reader 自行打开 timestamps、values、index 三个文件，不借用 part 的查询读取对象。实际打开、普通文件检查和偏移读取封装在 `filestream.ReaderAt` 中，不增加文件缓冲或顺序游标。内存源通过现有内存缓冲接口读取。reader 的生存期由调用方持有的 part 引用覆盖。
+磁盘源由 reader 自行打开并关闭 timestamps、values、index 三个 `filestream.ReadAtCloser`；内存源读取已有缓冲。reader 不借用 part 的查询对象，也不持有裸文件。调用方的 part 引用覆盖 reader 生命周期。
 
-`detectDownsampleFormat` 只通过偏移 reader 读取 metadata 并校验 JSON、版本及必需字段，不读取 metaindex 或检查 `.bin` 文件。`openDownsamplePart` 使用独立临时偏移 reader 校验实际文件的标识、文件边界及索引，返回前关闭全部校验文件并合并关闭错误。通过校验后，part 的 `timestampsFile`、`valuesFile`、`indexFile` 统一使用原有 `fs.ReaderAt`，供查询读取并由 `part.MustClose` 释放；part 不保存额外的降采样文件句柄。
+首列通过原生 `Block.UnmarshalData` 解码；后四列顺序对齐 header、核对共享时间戳描述，再由 `readNativeValues` 仅读取并解码数值。五个内嵌 `downsampleIndexCursor` 只保存索引位置与工作缓冲，不持有独立文件或进入对象池。`currentTSIDBlockHeaders` 消费后清空长度，Close 时释放容量；全部文件关闭错误合并返回，重复 Close 不再次关闭。
 
-多特征 `ReadBlock(decoded, header)` 使用调用方按值保存的首列 header，直接调用内部方法 `readNativeBlock`，完整读取并解码原生 `Block`，不修改首列索引游标或当前 `Header`。后续四列只向前推进到对应 header，核对同一时间戳描述，再由 `readNativeValues` 只读取 values，直接调用原有 `encoding.UnmarshalValues` 解码，复用首列的已解码时间戳。`readNativeValues` 负责清除上一列的值、校验时间戳与数值行数一致，并清理编码缓冲和重置读取位置；共享的 `block.go` 保持原有实现。复用范围仅限当前多特征批次；下一次调用从首列重新读取。单列查询由 `partSearch` 直接定位原生 header，交给 `BlockRef` 和原生 `Block` 独立读取、解码 payload。
+`NextHeader` 推进及其余特征向前对齐时检查当前任务的取消信号，避免跳过长索引区段时一直处理已取消任务。新目标的打开校验接收同一个 stopCh，在入口、metaindex 扫描、索引组遍历和基础列对齐过程中检查；取消会关闭已经打开的校验句柄并阻止发布。共享文件 I/O 或同步操作本身不能在调用中途由该信号打断。
 
-reader 的 `currentResolutionFeatureIndexes` 内嵌五个 `downsampleIndexCursor` 值，分别推进 last、sum、count、min、max 的 header，并在 `ReadBlock` 时核对对应关系；原始源只使用 last 对应的游标。游标仅保存索引位置、header 和当前 index block 的缓冲，不持有文件或源 part，不单独分配 reader，也不进入独立对象池。全部索引与 payload 由外层 reader 访问，part 的 metaindex 常驻于 part 对象。源与分辨率分别由 `currentSourcePart`、`currentResolution` 标识；`currentFeatureBlock` 复用原生解码状态，`currentBlockDecompressedPayload` 仅用于限长解压。跨 index 校验直接使用已解码索引的末尾 header，结束偏移按需计算，不另存重复的 header 或有效性标志。
-
-`currentTSIDBlockHeaders` 独立保存当前 TSID 的首列 header 值，不引用会被下一 index 解码覆盖的切片。它只缓存 header，容量随单个 TSID 的 block 数增长，消费后清空长度，当前分辨率内可复用。`Init` 重设索引遍历和 header 缓存长度；`Close` 释放整个 header 缓存，关闭全部自有文件并合并关闭错误，清除源引用和各游标状态，并按既有限额保留其他工作缓冲。调用文件关闭前先解除引用，重复关闭不会再次释放；初始化失败通过统一的错误出口执行 `Close`。
+part 打开校验使用独立临时偏移 reader，校验并关闭后，查询统一使用原有 `timestampsFile`、`valuesFile`、`indexFile` 三个 `fs.ReaderAt`，由 `part.MustClose` 管理。
 
 ## Writer 与文件资源
 
-空间检查按数据和资源归属分工：part 中的 `estimateDownsamplePartSize` 汇总源行数，writer 中的 `estimateDownsampleOutputSize` 估算最终编码与 spill 共存的大小，空间加乘运算在溢出时饱和到最大值。partition 中的 `downsampleSpaceBudget`、`downsampleDiskBudget` 和 `reserveDownsampleSpace` 管理跨任务预留及缓存有效期内的额度释放。writer 通过 `checkDownsampleWriteSpace`、`checkDownsampleFinishSpace` 和 `checkDownsamplePathSpace` 复查物理空间，空间不足通过 `errDownsampleNoSpace` 识别。
+`Init(path, compressLevel, config)` 接收当前任务的配置快照。`WriteSamples` 只读借用输入，拒绝租户未配置的分辨率，跳过空槽，按精度变化或 8192 个有效样本拆块。每批提取一份时间戳，逐特征复用浮点缓冲、decimal 整数缓冲和同一个 `currentFeatureBlock`。数值保留源精度，时间戳经 `marshalDownsampleBlock` 无损编码，五列编码时间戳逐字节及 header 描述一致。
 
-`WriteSamples` 借用输入样本，逐块提取一份有效时间戳和一个特征的浮点值，再交给原生 `Block` 编码。输入切片不会被修改或长期持有。每个输出 block 最多 8192 行；精度变化会开始新 block，五列使用一致的行边界。
+`partResolutionSpills` 按实际分辨率保存五个 spill、相对时间列长度和上一批次 header；各分辨率独立校验 TSID／时间顺序。last spill 保存 header、唯一时间列和 last 值，其余四个 spill 保存 header 和各自值列。文件名为 `.spill-<resolution毫秒数>-<feature>`，可以交错接收不同分辨率而不影响最终排序。
 
-最终文件字段直接使用 `filestream.WriteCloser`，通过原有 `MustCreate` 创建、`Write` 写入、`MustClose` 关闭。临时清单写入本次作业独占的临时子目录，关闭后 rename 到正式清单路径，再清理子目录。最终文件创建、缓冲刷出、同步和关闭保留共享 Must 语义，目录同步调用原有 `fs.MustSyncPath`；降采样不复制或修改这些实现。
+SpillWriter 按需增长内存，单个阈值默认 16 MiB，由 `-downsampling.spillMaxMemorySize` 配置，必须大于零，并在首次非空 Write 时固定。所有实例共享 `min(256 MiB, memory.Allowed()/10)` 的进程预算；扩容先预留完整新容量，旧容量在拷贝完成并解除引用后归还。预算不足时写出已有尾部、释放缓冲，再直接写文件，不等待其他任务。预算足够且数据未超过单个阈值时不创建文件；满块追加到同一个文件。Read 依次消费文件前缀和内存尾部，最终由 Close 释放内存额度、关闭及删除文件，临时文件不执行 fsync。
 
-`currentResolutionFeatureSpills` 保存当前分辨率各特征的 header 和 values。writer 逐列复用一个 `currentFeatureBlock`，每列编码并校验后立即写入对应 spill。首列编码时间戳独立复制到 `currentBlockTimestampsData`，用于核对后四列的编码结果；向最终文件只写一份，时间戳不进入 spill。`partHeader` 汇总整次写入统计，`previousBlockHeader` 保留上一批次编码前的时间边界，`currentIndexMetaindexRow` 与 `currentIndexBlockData` 共同描述尚未输出的 index block。
+`Finish(stopCh)` 对实际分辨率排序，再按五特征读回 spill；入口、各 feature 和各条 header 前检查取消，四个 bin 同步后、metadata 创建前再次检查。取消触发统一 Abort，保留取消错误，尚存句柄各关闭一次并删除目标目录；无需取消的调用使用 `Finish(nil)`。last 时间列写入最终 timestamps，五列相对时间偏移转换为最终偏移，values 和 index 依序输出。index 满、租户变化或特征结束时写 metaindex 行。消费完每个 spill 后先清除引用，再关闭并合并读回、关闭错误。
 
-`SpillWriter` 的内存阈值由 `downsampling.spillMaxMemorySize` 配置，默认 16 MiB，缓冲按需分配。数据不超过阈值时不创建临时文件；满块之后还有数据写入时，才在目标 part 目录中创建 `.spill-<feature>` 并写出该满块。后续满块追加到同一个文件，单次超大输入也分段处理，最后一段保留在内存中。默认配置下，五个 spill 当前持有的缓冲容量合计最多 80 MiB；扩容时待 GC 的旧分配、其他缓冲和并发任务另行占用内存。
+四个 `.bin` 文件完成并通过原有 MustClose 同步关闭、part 目录同步后，才直接创建 metadata.json，写入本 part 的配置快照与统计，再同步关闭文件及目录。降采样 metadata 只含五个原生统计字段和有效的 downsampling_config，构成写入完成标志；外层仍须打开校验和提交 parts.json。配置字段缺失或为 null 时按原始 metadata 校验，非 null 但配置无效则报错。
 
-文件权限使用 `0666` 并受 umask 影响。`Read` 核验文件前缀长度后回到起点，依次读取文件和内存尾部，要求回调完整消费字节流；可重复读取，不改变已存字节或释放资源。调用方在成功或失败后显式执行 `Close`，释放内存、关闭并删除临时文件，不同步临时文件。写入失败在内部封闭 spill 并尝试清理；删除失败保留路径，后续 `Close` 可再次尝试。满块直接写文件；只有文件读回缓冲使用独立池，归还时解除文件引用。内存尾部不入池。I/O 统计区分逻辑读写与实际文件读写，纯内存路径没有实际文件 I/O。
+最终文件使用共享 filestream.WriteCloser，创建、缓冲刷出、同步、关闭及目录同步保留原有 Must 语义。writer 的 reset 仅清理内存状态；Abort 释放自有文件与全部分辨率 spill，并删除未发布目录。目录删除失败保留路径，后续只重试未完成操作。普通写入、spill、校验或取消错误使整个目标失效，不允许继续写入或发布。
 
-切换分辨率或调用 `Finish` 时，writer 按特征依次读回 spill，写入最终 values 和 index。非空目标的 `Finish` 先读回并清理全部 spill，完成四个 `.bin` 文件，关闭并同步这四个文件，再同步目标 part 目录。随后通过原有 `MustCreate` 直接创建 `metadata.json` 并写入完整 JSON，通过 `MustClose` 同步并关闭文件，最后同步 part 目录和父目录。
+归并还共享 `min(256 MiB, memory.Allowed()/16)` 的进程预算，覆盖当前 TSID 的 header、基础样本、派生样本和稀疏 bucket 映射；切片按实际容量计费，稀疏映射预留 1 KiB 加每项 256 字节。申请失败立即返回错误，外层清理未发布目标，不等待其他归并释放内存。三类内存预算相互独立，只约束各自的新增工作分配，不是进程 RSS、共享缓冲、mmap 或系统页缓存的硬上限。
 
-合法且完整的 metadata 通过 `FormatVersion` 区分降采样格式，作为 part 写入完成标志；原始 metadata 不含该版本字段。`Finish` 不修改活动集合，外层仍须重新打开并校验目标、检查取消，再提交 `parts.json`。格式检测必须解析并校验完整 metadata，不能只检查文件是否存在；活动集合的发布仍以 `parts.json` 的原子重命名为准。
+空间估算包含最终文件和 spill 中各一份共享时间列，按当前配置的单租户最大分辨率数保守估算每条输入的输出量；该磁盘估算系数不等于 writer 的分辨率并集大小。饱和算术防止溢出。partition 管理进程级额度，writer 在写入和读回时重新检查可用磁盘空间，不能预先将源文件计为空闲空间。
 
-writer 的 `reset` 只清理逻辑状态和工作缓冲，文件清理由 `Finish` 或 `Abort` 明确执行。尚有未完成目标或待删除目录时，`Init` 拒绝覆盖当前清理责任。消费 spill 后先清除 writer 中的引用，再统一关闭并合并读取、关闭错误；残留文件由目标目录的清理兜底。`Abort` 释放文件和 spill 时清除对应引用；目录删除失败保留路径，并累积清理错误而不覆盖首次工作错误。再次清理只重试目录删除。
+## 发布与查询
 
-## 发布与失败处理
+`parts.json` 原子 rename 是活动集合提交点。提交前失败保留源与旧清单并清理目标；提交后返回错误仍保留已发布目标、使内存集合与清单一致，并保留旧源磁盘文件。正常提交后，原始和降采样旧源均标记可删除，最后一个引用释放后按 `decRef → part.MustClose → fs.MustRemoveDir` 回收。查询持有旧 part 时延迟删除，不新增查询与归并间的共享锁。
 
-| 阶段 | 当前处理 |
-|---|---|
-| reader 或归并校验失败 | 错误终止归并，关闭并归还 reader，由外层调用 `Abort` 清理未发布目标。reader 返回错误不直接设置 `writer.err`。 |
-| writer 自身校验、写入或收尾失败 | writer 在内部失败处理中记录错误，禁止继续调用 `WriteSamples` 或 `Finish`，并尝试 `Abort`；清理包含四个数据文件、spill 及 metadata，外层仍负责清理未发布目标。 |
-| `parts.json` rename 前 | 使用副本构造候选 part 集合。临时目录创建、接口返回的写入错误、取消检查或 rename 失败时，不替换活动集合；清理本次临时目录及目标。 |
-| `parts.json` rename 后 | 将目标视为已发布。后续返回错误时，内存活动集合与清单保持一致，保留目标及旧源磁盘文件，不 Abort 目标；实际目录同步使用共享 Must 语义。 |
-| 发布成功 | 标记源可删除并释放引用；原始和降采样磁盘源均通过 `decRef → part.MustClose → fs.MustRemoveDir` 回收，未结束的查询引用延迟关闭和删除。 |
-| 后台归并或周期刷盘失败 | 调度识别 `errDownsampleMergeFailed`，结束当前降采样任务。提交前失败的源仍在活动集合中。 |
-| 最终刷盘失败 | 对仍在内存的源单独按原始格式落盘，不修改共享降采样开关；即使已无剩余内存源，也再次同步当前清单目录。 |
+后台降采样普通失败结束当前任务。关闭或快照所需的最终刷盘失败时，剩余内存源按原始格式持久化。共享文件 Must 操作、启动检查、原始数据最终持久化和程序不变量保留原有错误语义；专属返回错误使用英文 `[downsampling]` 前缀，保留原始原因和清理错误。
 
-降采样作业中的普通错误通过返回值处理，清理错误与原错误合并返回。最终文件创建、关闭及目录同步、源 part 回收、原始数据最终持久化、启动打开及程序不变量仍使用各自现有的 `Must`／FATAL 处理；持续文件系统故障也可能使清理或最终持久化失败。具体边界见审查说明。
+HTTP 的 resolution／feature 经 EvalConfig、SearchQuery、`search_downsampling_v2` 沿原 Init 参数表透传。`partSearch.initDownsampleQuery` 逐 part、逐租户选择能整除目标分辨率的最大实际源列。目标可以是未配置的更粗分辨率，同一 part 不能同时贡献基础列与额外列。
 
-降采样专属错误和日志使用英文，消息以 `[downsampling]` 开头。底层错误通过 `%w` 保留原因，多个独立错误通过 `errors.Join` 汇总，取消和空间不足仍可通过 `errors.Is` 识别。
+原有 index 缓存、TSID 堆、BlockRef 和 fs.ReaderAt 负责定位与读取。`tableSearch` 使用 `downsampleQueryState` 聚合当前 TSID 在所有 part／partition 的同 bucket 单特征贡献，完整聚合后过滤输出时间范围，生成独立不可变的原生编码 Block。输入范围扩展至完整 bucket；时间戳无损，值保留源精度。聚合入口、构建排序键及输出过滤循环沿用原有 deadline 和 pace 检查，失败时不输出未完成的 TSID。排序仍是一次同步调用，其规模受 bucket 预算约束。
 
-## 查询调用链
+查询 bucket 共享 `min(256 MiB, memory.Allowed()/20)` 的进程预算，首次创建映射预留 1 KiB，每个 bucket 另按 256 字节保守计费，涵盖映射扩容和排序键。一次 tableSearch 按历史最大 bucket 数持有额度，TSID 切换不提前归还仍可能由映射或切片持有的容量；reset 解除引用后统一归还。预算不足直接返回错误，使用原有查询错误处理，不等待其他查询。
 
-HTTP 层在 [prometheus/downsample_query.go](app/vmselect/prometheus/downsample_query.go) 分别解析 `query.resolution` 和 `query.feature`，两者必须同时提供。结果为 `DownsampleQuery{ResolutionMs, Feature}`；未提供两个参数时为 `nil`。重复参数、空值、不支持的分辨率或特征，以及旧参数 `query.field` 均返回错误。
-
-该选择经 PromQL 的 `EvalConfig`、`SearchQuery`，在 [netstorage.go](app/vmselect/netstorage/netstorage.go) 的 `execSearchQueryRequest` 内直接选择 `search_downsampling_v2` 并编码查询负载，再传至 vmstorage。未指定降采样时继续使用 `search_v7`。存储层沿原有 `Search.Init → tableSearch.Init → partitionSearch.Init → partSearch.Init` 逐层透传同一个 `*DownsampleQuery`；选择参数追加在各层原有参数表末尾。
-
-`partSearch` 根据分辨率和特征取得对应 metaindex 范围，直接读取目标 index 并使用原有 `ibCache`。缓存未命中时调用 `p.indexFile.MustReadAt`；index 解码后仍是原生 `blockHeader`，后续 TSID／时间范围筛选、`BlockRef` 构造以及 `Block` 的 payload 读取与解码复用原有逻辑。三个查询文件读取对象均为 `fs.ReaderAt`，沿用 mmap、页驻留状态检查、系统调用回退、读取统计以及 `fs.disableMmap`、`fs.disableMincore` 配置。查询文件 I/O 与原始查询使用相同的 `Must` 语义。
-
-查询持有原有 part 引用，不创建 `downsampleReader`；后者的全部实例仅在归并任务内使用。归并独占自身的工作缓冲与文件读取对象，原有 `isInMerge` 防止重复选取正在合并的源。发布目标后，旧 part 退出活动集合，但仍由尚未结束的查询引用保持存活，最后一个引用释放才关闭文件及删除可丢弃的目录。文件读取期间不新增查询与归并之间的共享锁，两条路径仍会竞争磁盘带宽、CPU 和系统页缓存。
-
-指定分辨率和特征时只读取已落盘的降采样 part；未指定时查询原始 part，并跳过降采样 part。降采样请求禁用未区分分辨率和特征的结果缓存，保留原有索引缓存。该路径不在查询时将原始数据转换为降采样记录，也不为跨 part 的重叠降采样记录执行专门的 bucket 再聚合。
-
-`processBlocksInternal` 统一调用原有 `collectResults(partialSearchResults, ...)`，降采样与原始请求共用部分结果、副本容错、跳过慢副本及错误分类策略。结果是否完整由原有配置和节点响应决定；HTTP 与 RPC 的通用错误、超时及写出流程沿用原有处理，不保存降采样错误前缀状态。降采样参数和协议负载仍由各自的解析与校验入口检查。
+指定降采样只读取降采样 part，原始查询只读取原始 part。结果缓存因未区分选择参数而禁用，索引缓存保留。RPC 仍由原有 `execSearchQueryRequest` 发送，`collectResults` 统一处理节点错误、部分响应、副本和慢副本策略，不增加通用错误前缀或要求全部节点成功。

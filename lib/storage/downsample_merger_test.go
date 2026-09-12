@@ -2,8 +2,10 @@ package storage
 
 import (
 	"errors"
+	"fmt"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/uint64set"
 	"math"
 	"os"
@@ -12,7 +14,204 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unsafe"
 )
+
+func TestDownsampleMergerTenantResolutions(t *testing.T) {
+	config, err := ParseDownsamplingConfig([]byte(`{"base_resolution":"5m","tenant_resolutions":[{"tenant":"1:0","resolutions":["1h"]},{"tenant":"2:0","resolutions":["30m","2h"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := ParseDownsamplingConfig([]byte(`{"base_resolution":"5m","tenant_resolutions":[{"tenant":"1:0","resolutions":["30m","2h"]},{"tenant":"3:0","resolutions":["1h"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const base int64 = 1704067200000
+	var rows, late []rawRow
+	for tenant := uint32(1); tenant <= 3; tenant++ {
+		for metricID := uint64(1); metricID <= 2; metricID++ {
+			tsid := TSID{AccountID: tenant, MetricID: uint64(tenant)*10 + metricID}
+			for i, offset := range []int64{1, 299999, 300001, 1799000, 1800500, 3599999, 3600001, 7199999, 7200001} {
+				rows = append(rows, rawRow{TSID: tsid, Timestamp: base + offset, Value: float64(i*3) - 7, PrecisionBits: 64})
+			}
+			late = append(late, rawRow{TSID: tsid, Timestamp: base + 310000, Value: 50, PrecisionBits: 64})
+		}
+	}
+	// 同一轮同时覆盖原始内存源、原始磁盘源；所有源都只在 base 上读取一次。
+	memorySource := newDownsampleTestRawPart(t, rows[:len(rows)/2])
+	diskSource := newDownsampleTestRawPart(t, rows[len(rows)/2:])
+	path := filepath.Join(t.TempDir(), "raw")
+	diskSource.mp.MustStoreToDisk(path)
+	diskPart := mustOpenFilePart(path)
+	defer diskPart.MustClose()
+	m := getDownsampleMerger()
+	defer putDownsampleMerger(m)
+	first, stats := runDownsampleTestMerge(t, m, []*partWrapper{memorySource, {p: diskPart}}, nil, 0, config)
+	if stats.rowsMerged != uint64(len(rows)) || stats.rowsDeleted != 0 {
+		t.Fatalf("raw source contributions were counted more than once: %+v", stats)
+	}
+	assertDownsampleTestRows(t, readDownsampleTestPart(t, first.p), referenceDownsampleTestRows(rows, nil, 0, config))
+	if got := fmt.Sprint(downsamplePartResolutionsForTest(first.p)); got != "[300000 1800000 3600000 7200000]" {
+		t.Fatalf("unexpected resolution sections: %s", got)
+	}
+	// 更新配置后新增、删除和替换租户分辨率；旧 part 的粗列不得参与下一轮求和。
+	latePart, _ := runDownsampleTestMerge(t, m, []*partWrapper{newDownsampleTestRawPart(t, late)}, nil, 0, updated)
+	second, stats := runDownsampleTestMerge(t, m, []*partWrapper{first, latePart}, nil, 0, updated)
+	wantInput := downsampleBasePhysicalRowsForTest(first.p) + downsampleBasePhysicalRowsForTest(latePart.p)
+	if stats.rowsMerged != wantInput {
+		t.Fatalf("read derived columns while merging old and new configurations: got %d; want %d", stats.rowsMerged, wantInput)
+	}
+	all := append(append([]rawRow(nil), rows...), late...)
+	want := referenceDownsampleTestRows(all, nil, 0, updated)
+	assertDownsampleTestRows(t, readDownsampleTestPart(t, second.p), want)
+	third, _ := runDownsampleTestMerge(t, m, []*partWrapper{second}, nil, 0, updated)
+	assertDownsampleTestRows(t, readDownsampleTestPart(t, third.p), want)
+	// 更新和重写没有改变仍被持有的旧 part 的配置或数据。
+	assertDownsampleTestRows(t, readDownsampleTestPart(t, first.p), referenceDownsampleTestRows(rows, nil, 0, config))
+}
+
+func TestDownsampleMergerArbitraryBaseAndSparseRange(t *testing.T) {
+	for _, base := range []string{"1ms", "10m"} {
+		t.Run(base, func(t *testing.T) {
+			config, err := ParseDownsamplingConfig([]byte(fmt.Sprintf(`{"base_resolution":%q,"tenant_resolutions":[{"tenant":"1:0","resolutions":["30m","2h"]}]}`, base)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			rows := []rawRow{
+				{TSID: TSID{AccountID: 1, MetricID: 1}, Timestamp: minUnixMilli, Value: 2, PrecisionBits: 64},
+				{TSID: TSID{AccountID: 1, MetricID: 1}, Timestamp: minUnixMilli + config.BaseResolutionMs(), Value: 3, PrecisionBits: 64},
+				{TSID: TSID{AccountID: 1, MetricID: 1}, Timestamp: maxUnixMilli, Value: 7, PrecisionBits: 64},
+			}
+			m := &downsampleMerger{}
+			defer m.reset()
+			output, _ := runDownsampleTestMerge(t, m, []*partWrapper{newDownsampleTestRawPart(t, rows)}, nil, 0, config)
+			assertDownsampleTestRows(t, readDownsampleTestPart(t, output.p), referenceDownsampleTestRows(rows, nil, 0, config))
+			if cap(m.currentTSIDBaseBucketSamples) > 16 {
+				t.Fatalf("allocated empty time range for three samples: %d", cap(m.currentTSIDBaseBucketSamples))
+			}
+		})
+	}
+}
+
+func TestDownsampleMergerDerivedCancellationAndPrecision(t *testing.T) {
+	var m downsampleMerger
+	defer m.reset()
+	samples := []downsampleSample{
+		{timestamp: minUnixMilli + 1, precisionBits: 8, values: [countOfDownsampleFeatures]float64{2, 2, 1, 2, 2}},
+		{timestamp: minUnixMilli + 300001, precisionBits: 64, values: [countOfDownsampleFeatures]float64{3, 3, 1, 3, 3}},
+	}
+	if _, err := m.aggregateSamples(nil, samples, downsampleResolution1h, nil); err == nil {
+		t.Fatal("accepted different precisions in one derived bucket")
+	}
+	stopCh := make(chan struct{})
+	close(stopCh)
+	if _, err := m.aggregateSamples(nil, samples, downsampleResolution1h, stopCh); !errors.Is(err, errForciblyStopped) {
+		t.Fatalf("derived aggregation ignored cancellation: %v", err)
+	}
+	if _, err := m.Merge(nil, nil, nil, nil, 0); err == nil {
+		t.Fatal("accepted an uninitialized writer")
+	}
+}
+
+func TestDownsampleMergerMemoryBudget(t *testing.T) {
+	const base int64 = 1704067200000
+	sampleBytes := uint64(unsafe.Sizeof(downsampleSample{}))
+	headerBytes := uint64(unsafe.Sizeof(blockHeader{}))
+	for _, tc := range []struct {
+		name    string
+		limit   uint64
+		offsets []int64
+		extra   bool
+	}{
+		{"headers", headerBytes - 1, []int64{0}, false},
+		{"dense", headerBytes + 3*sampleBytes, []int64{0, 1, 2, 3}, false},
+		{"sparse", headerBytes + downsampleSparseBucketIndexBaseBytes + downsampleSparseBucketIndexBytes + sampleBytes, []int64{0, 1000}, false},
+		{"derived", headerBytes + 5*sampleBytes, []int64{0, 1, 2, 3}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configJSON := `{"base_resolution":"1ms"}`
+			if tc.extra {
+				configJSON = `{"base_resolution":"1ms","tenant_resolutions":[{"tenant":"1:0","resolutions":["2ms"]}]}`
+			}
+			config, err := ParseDownsamplingConfig([]byte(configJSON))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var rows []rawRow
+			for _, offset := range tc.offsets {
+				rows = append(rows, rawRow{TSID: TSID{AccountID: 1, MetricID: 1}, Timestamp: base + offset, Value: 2, PrecisionBits: 64})
+			}
+			source := newDownsampleTestRawPart(t, rows)
+			limiter := &memory.Limiter{MaxSize: tc.limit}
+			m := downsampleMerger{mergeMemoryLimiter: limiter}
+			var w downsampleWriter
+			path := filepath.Join(t.TempDir(), "target")
+			if err := w.Init(path, 1, config); err != nil {
+				t.Fatal(err)
+			}
+			defer w.Abort()
+			if _, err := m.Merge([]*partWrapper{source}, &w, nil, nil, 0); err == nil || !strings.Contains(err.Error(), "merge memory budget exceeded") {
+				t.Fatalf("expected a bounded-memory failure, got %v", err)
+			}
+			if m.mergeMemoryBytes != 0 || cap(m.currentTSIDBaseBucketSamples) != 0 || cap(m.currentTSIDResolutionSamples) != 0 || m.currentTSIDBaseBucketIndexes != nil {
+				t.Fatal("failed merge retained charged allocations")
+			}
+			if !limiter.Get(tc.limit) {
+				t.Fatal("failed merge leaked memory budget")
+			}
+			limiter.Put(tc.limit)
+			if err := w.Abort(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("failed output remains: %v", err)
+			}
+		})
+	}
+}
+
+func TestDownsampleMergerMemoryGrowthAndSharedBudget(t *testing.T) {
+	sampleBytes := uint64(unsafe.Sizeof(downsampleSample{}))
+	limiter := &memory.Limiter{MaxSize: 3 * sampleBytes}
+	a := downsampleMerger{mergeMemoryLimiter: limiter}
+	b := downsampleMerger{mergeMemoryLimiter: limiter}
+	defer a.reset()
+	defer b.reset()
+	var err error
+	a.currentTSIDBaseBucketSamples, err = growDownsampleMergeSlice[downsampleSample](&a, nil, 1, &a.currentTSIDBaseSamplesMemory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.currentTSIDBaseBucketSamples[0].timestamp = 123
+	b.currentTSIDBaseBucketSamples, err = growDownsampleMergeSlice[downsampleSample](&b, nil, 1, &b.currentTSIDBaseSamplesMemory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 新容量虽只有两项，扩容时另一个任务和当前旧数组仍持有额度。
+	if _, err := growDownsampleMergeSlice(&a, a.currentTSIDBaseBucketSamples, 2, &a.currentTSIDBaseSamplesMemory); err == nil {
+		t.Fatal("growth ignored another merge or the old allocation")
+	}
+	if a.currentTSIDBaseBucketSamples[0].timestamp != 123 || a.mergeMemoryBytes != sampleBytes {
+		t.Fatal("failed growth changed existing state")
+	}
+	if err := b.reset(); err != nil {
+		t.Fatal(err)
+	}
+	a.currentTSIDBaseBucketSamples, err = growDownsampleMergeSlice(&a, a.currentTSIDBaseBucketSamples, 2, &a.currentTSIDBaseSamplesMemory)
+	if err != nil || a.currentTSIDBaseBucketSamples[0].timestamp != 123 {
+		t.Fatalf("growth after release failed: %v", err)
+	}
+	if a.mergeMemoryBytes != 2*sampleBytes {
+		t.Fatal("growth did not release old allocation")
+	}
+	if err := a.reset(); err != nil {
+		t.Fatal(err)
+	}
+	if !limiter.Get(limiter.MaxSize) {
+		t.Fatal("reset leaked a shared reservation")
+	}
+	limiter.Put(limiter.MaxSize)
+}
 
 func TestDownsampleMergerMoreThan1024Sources(t *testing.T) {
 	const (
@@ -70,7 +269,7 @@ func TestDownsampleMergerRepeatedMerge(t *testing.T) {
 	assertDownsampleTestRows(t, readDownsampleTestPart(t, first.p), referenceDownsampleTestRows(rows, nil, 0))
 
 	second, stats := runDownsampleTestMerge(t, m, []*partWrapper{first, newDownsampleTestRawPart(t, late)}, nil, 0)
-	if stats.rowsMerged != first.p.ph.RowsCount+uint64(len(late)) || stats.rowsDeleted != 0 {
+	if stats.rowsMerged != downsampleBasePhysicalRowsForTest(first.p)+uint64(len(late)) || stats.rowsDeleted != 0 {
 		t.Fatalf("mixed source physical row statistics changed: %+v", stats)
 	}
 	all := append(append([]rawRow(nil), rows...), late...)
@@ -78,7 +277,7 @@ func TestDownsampleMergerRepeatedMerge(t *testing.T) {
 	assertDownsampleTestRows(t, readDownsampleTestPart(t, second.p), want)
 	// 每轮只使用每个源的目标分辨率，不能把同源的两份表示重复统计。
 	third, stats := runDownsampleTestMerge(t, m, []*partWrapper{second}, nil, 0)
-	if stats.rowsMerged != second.p.ph.RowsCount || stats.rowsDeleted != 0 {
+	if stats.rowsMerged != downsampleBasePhysicalRowsForTest(second.p) || stats.rowsDeleted != 0 {
 		t.Fatalf("summary rewrite must count each feature Block row: %+v", stats)
 	}
 	assertDownsampleTestRows(t, readDownsampleTestPart(t, third.p), want)
@@ -131,7 +330,7 @@ func TestDownsampleMergerSourcePrecision(t *testing.T) {
 			if tc.wantError {
 				w := getDownsampleWriter()
 				defer putDownsampleWriter(w)
-				if err := w.Init(filepath.Join(t.TempDir(), "mixed"), -5); err != nil {
+				if err := w.Init(filepath.Join(t.TempDir(), "mixed"), -5, downsampleTestConfig(t)); err != nil {
 					t.Fatal(err)
 				}
 				defer w.Abort()
@@ -182,7 +381,7 @@ func TestDownsampleMergerSourcePrecision(t *testing.T) {
 					}
 				}
 				sources = []*partWrapper{output}
-				wantMerged = output.p.ph.RowsCount
+				wantMerged = downsampleBasePhysicalRowsForTest(output.p)
 			}
 		})
 	}
@@ -229,56 +428,56 @@ func TestDownsampleMergerDynamicBucketRange(t *testing.T) {
 	}
 	m := getDownsampleMerger()
 	defer putDownsampleMerger(m)
-	type observedRange struct {
-		metricID   uint64
-		resolution int64
-		buckets    int
-	}
-	// 63 天含首尾 bucket：5m 为 18145，1h 为 1513；短序列不受 part 范围影响。
-	wantRanges := []observedRange{
-		{1, downsampleResolution5m, 2}, {2, downsampleResolution5m, 18145}, {3, downsampleResolution5m, 2},
-		{1, downsampleResolution1h, 1}, {2, downsampleResolution1h, 1513}, {3, downsampleResolution1h, 2},
-	}
 	wantMerged := uint64(len(all))
 	// raw 首次聚合和 summary 重写都按当前分辨率的 header 范围开槽。
 	for round := 0; round < 2; round++ {
 		w := getDownsampleWriter()
 		defer putDownsampleWriter(w)
 		path := filepath.Join(t.TempDir(), "part")
-		if err := w.Init(path, -5); err != nil {
+		if err := w.Init(path, -5, downsampleTestConfig(t)); err != nil {
 			t.Fatal(err)
 		}
 		defer w.Abort()
-		var observed []observedRange
-		w.timestampsWriter = &downsampleStateObserverWriter{WriteCloser: w.timestampsWriter, observe: func() {
-			observed = append(observed, observedRange{w.currentFeatureBlock.bh.TSID.MetricID, w.currentResolution, len(m.currentTSIDBucketSamples)})
-		}}
-		stats, err := m.Merge(sources, w, nil, nil, 0)
-		if err != nil {
+		m.partWriter = w
+		m.currentSourceBlock = getDownsampleDecodedResolutionFeaturesBlock()
+		if err := m.initSources(sources, downsampleResolution5m); err != nil {
+			t.Fatal(err)
+		}
+		for len(m.baseResolutionReaderHeap) > 0 {
+			tsid := m.baseResolutionReaderHeap[0].Header().TSID
+			tr, err := m.collectSources(&tsid, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.mergeTSID(&tsid, downsampleResolution5m, tr, 0); err != nil {
+				t.Fatal(err)
+			}
+			wantBuckets := 2
+			if tsid == long {
+				wantBuckets = 5 // 63 天中只有五个实际 base bucket，空白不分配槽。
+			}
+			if len(m.currentTSIDBaseBucketSamples) != wantBuckets {
+				t.Fatalf("TSID %d: got %d base slots; want %d", tsid.MetricID, len(m.currentTSIDBaseBucketSamples), wantBuckets)
+			}
+		}
+		stats := m.mergeStats
+		if err := m.reset(); err != nil {
 			t.Fatal(err)
 		}
 		if stats.rowsMerged != wantMerged || stats.rowsDeleted != 0 {
 			t.Fatalf("round %d: unexpected source statistics: %+v; want %d merged rows", round, stats, wantMerged)
 		}
-		if len(observed) != len(wantRanges) {
-			t.Fatalf("round %d: unexpected output ranges: got %+v; want %+v", round, observed, wantRanges)
-		}
-		for i, want := range wantRanges {
-			if observed[i] != want {
-				t.Fatalf("round %d output %d used the wrong TSID bucket range: got %+v; want %+v", round, i, observed[i], want)
-			}
-		}
-		if _, err := w.Finish(); err != nil {
+		if _, err := w.Finish(nil); err != nil {
 			t.Fatal(err)
 		}
-		p, err := openDownsamplePart(path)
+		p, err := openDownsamplePart(path, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer p.MustClose()
 		assertDownsampleTestRows(t, readDownsampleTestPart(t, p), referenceDownsampleTestRows(all, nil, 0))
 		sources = []*partWrapper{{p: p}}
-		wantMerged = p.ph.RowsCount
+		wantMerged = downsampleBasePhysicalRowsForTest(p)
 	}
 
 	// 同一 merger 再处理长序列的一个点，前一作业的桶和统计不能带入新结果。
@@ -304,14 +503,63 @@ func TestDownsampleMergerRetentionAndDeletedMetricID(t *testing.T) {
 	defer putDownsampleMerger(m)
 	raw := newDownsampleTestRawPart(t, rows)
 	output, stats := runDownsampleTestMerge(t, m, []*partWrapper{raw}, &deleted, deadline)
-	want := referenceDownsampleTestRows(rows, &deleted, deadline)
+	want := referenceDownsampleTestRows(rows, &deleted, 0) // base 前缀仍为未过期的 1h bucket 提供贡献。
 	assertDownsampleTestRows(t, readDownsampleTestPart(t, output.p), want)
 	if stats.rowsDeleted != 1 || stats.rowsMerged != 2 {
 		t.Fatalf("unexpected physical source statistics: merged=%d deleted=%d", stats.rowsMerged, stats.rowsDeleted)
 	}
-	// 5m 的早期贡献已经移除，后续 merge 仍须从完整 1h 表示保留该贡献。
+	// base 保留完整的 1h 前缀，后续 merge 只读取 base 仍能重建全部贡献。
 	merged, _ := runDownsampleTestMerge(t, m, []*partWrapper{output}, &deleted, deadline)
 	assertDownsampleTestRows(t, readDownsampleTestPart(t, merged.p), want)
+}
+
+func TestDownsampleMergerRetainedPrefixThroughQueryDivisor(t *testing.T) {
+	previous, err := ParseDownsamplingConfig([]byte(`{"base_resolution":"5m","tenant_resolutions":[{"tenant":"7:11","resolutions":["2h"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := ParseDownsamplingConfig([]byte(`{"base_resolution":"5m","tenant_resolutions":[{"tenant":"7:11","resolutions":["1h"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const base int64 = 1704067200000
+	tsid := TSID{AccountID: 7, ProjectID: 11, MetricID: 1}
+	rows := []rawRow{
+		{TSID: tsid, Timestamp: base + 60000, Value: 2, PrecisionBits: 64},
+		{TSID: tsid, Timestamp: base + 61*60000, Value: 3, PrecisionBits: 64},
+		{TSID: tsid, Timestamp: base + 91*60000, Value: 7, PrecisionBits: 64},
+	}
+	m := getDownsampleMerger()
+	defer putDownsampleMerger(m)
+	source, _ := runDownsampleTestMerge(t, m, []*partWrapper{newDownsampleTestRawPart(t, rows)}, nil, 0, previous)
+	deadline := base + 90*60000
+	output, _ := runDownsampleTestMerge(t, m, []*partWrapper{source}, nil, deadline, current)
+	// 旧 2h 配置保留第一小时的 BASE 前缀。新 1h 列也必须完整表达它，
+	// 否则查询 2h 选择最大的已存储因子 1h 时，会绕过仍存在的 BASE 贡献。
+	assertDownsampleTestRows(t, readDownsampleTestPart(t, output.p), referenceDownsampleTestRows(rows, nil, 0, current))
+	wantValues := []float64{7, 12, 3, 2, 7}
+	for feature := uint8(0); feature < countOfDownsampleFeatures; feature++ {
+		query := DownsampleQuery{ResolutionMs: 2 * downsampleResolution1h, Feature: feature}
+		tr := TimeRange{deadline, base + 2*downsampleResolution1h - 1}
+		ts := newDownsampleQueryTableFixture(t, []*part{output.p}, []TSID{tsid}, query, tr)
+		var timestamps []int64
+		var values []float64
+		for ts.NextBlock() {
+			var b Block
+			ts.BlockRef.MustReadBlock(&b)
+			if err := b.UnmarshalData(); err != nil {
+				t.Fatal(err)
+			}
+			timestamps, values = b.AppendRowsWithTimeRangeFilter(timestamps, values, tr)
+		}
+		if err := ts.Error(); err != nil {
+			t.Fatal(err)
+		}
+		ts.reset()
+		if len(timestamps) != 1 || timestamps[0] != rows[2].Timestamp || len(values) != 1 || values[0] != wantValues[feature] {
+			t.Fatalf("retained prefix lost through query divisor: feature=%d timestamps=%v values=%v", feature, timestamps, values)
+		}
+	}
 }
 
 func TestDownsampleMergerEmptyTSIDBeforeRetainedTSID(t *testing.T) {
@@ -378,7 +626,7 @@ func TestDownsampleMergerSummaryPhysicalStatistics(t *testing.T) {
 	var deleted uint64set.Set
 	deleted.Add(9)
 	output, stats := runDownsampleTestMerge(t, m, []*partWrapper{summary}, &deleted, 0)
-	if stats.rowsMerged != 10 || stats.rowsDeleted != 10 || output.p.ph.RowsCount != 10 || output.p.ph.BlocksCount != 10 {
+	if stats.rowsMerged != 5 || stats.rowsDeleted != 5 || output.p.ph.RowsCount != 10 || output.p.ph.BlocksCount != 10 {
 		t.Fatalf("unexpected retained/deleted physical rows: stats=%+v, part=%+v", stats, output.p.ph)
 	}
 	assertDownsampleTestRows(t, readDownsampleTestPart(t, output.p), referenceDownsampleTestRows(rows, &deleted, 0))
@@ -420,7 +668,7 @@ func TestDownsampleMergerCancellation(t *testing.T) {
 	w := getDownsampleWriter()
 	defer putDownsampleWriter(w)
 	path := filepath.Join(t.TempDir(), "cancelled")
-	if err := w.Init(path, -5); err != nil {
+	if err := w.Init(path, -5, downsampleTestConfig(t)); err != nil {
 		t.Fatal(err)
 	}
 	stopCh := make(chan struct{})
@@ -462,7 +710,7 @@ func TestDownsampleMergerSharedPrecisionAndColumnScales(t *testing.T) {
 		}
 		path := filepath.Join(t.TempDir(), "source")
 		w := getDownsampleWriter()
-		if err := w.Init(path, -5); err != nil {
+		if err := w.Init(path, -5, downsampleTestConfig(t)); err != nil {
 			putDownsampleWriter(w)
 			t.Fatal(err)
 		}
@@ -470,12 +718,12 @@ func TestDownsampleMergerSharedPrecisionAndColumnScales(t *testing.T) {
 			putDownsampleWriter(w)
 			t.Fatal(err)
 		}
-		if _, err := w.Finish(); err != nil {
+		if _, err := w.Finish(nil); err != nil {
 			putDownsampleWriter(w)
 			t.Fatal(err)
 		}
 		putDownsampleWriter(w)
-		p, err := openDownsamplePart(path)
+		p, err := openDownsamplePart(path, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -586,7 +834,13 @@ func TestDownsampleMergerSharedPrecisionAndColumnScales(t *testing.T) {
 			}
 		}()
 		expected = roundTripDownsampleTestReferenceBlock(t, expected)
-		assertDownsampleTestRows(t, readDownsampleTestPart(t, output.p), downsampleTestBlockRows(expected))
+		got := readDownsampleTestPart(t, output.p)
+		for key := range got {
+			if key.resolution != expected.resolution {
+				delete(got, key)
+			}
+		}
+		assertDownsampleTestRows(t, got, downsampleTestBlockRows(expected))
 		sources = []*partWrapper{output}
 	}
 }
@@ -604,9 +858,9 @@ func TestDownsampleMergerResetClosesAllReaders(t *testing.T) {
 			// first 已出堆，但仍由 readers 持有；清理不能只遍历 heap。
 			activeReaders := []*downsampleReader{first, second}
 			m := downsampleMerger{
-				currentResolutionReaders:    []*downsampleReader{first, second},
-				currentTSIDReaders:          activeReaders,
-				currentResolutionReaderHeap: downsampleReaderHeap{second},
+				baseResolutionReaders:    []*downsampleReader{first, second},
+				currentTSIDReaders:       activeReaders,
+				baseResolutionReaderHeap: downsampleReaderHeap{second},
 			}
 			var err error
 			switch operation {
@@ -624,7 +878,7 @@ func TestDownsampleMergerResetClosesAllReaders(t *testing.T) {
 				t.Fatalf("%s lost reader close error: %v", operation, err)
 			}
 			assertDownsampleFilesClosed(t, files)
-			if len(m.currentResolutionReaders) != 0 || len(m.currentTSIDReaders) != 0 || len(m.currentResolutionReaderHeap) != 0 {
+			if len(m.baseResolutionReaders) != 0 || len(m.currentTSIDReaders) != 0 || len(m.baseResolutionReaderHeap) != 0 {
 				t.Fatal("merger retained closed readers")
 			}
 			for _, r := range activeReaders {
@@ -643,7 +897,35 @@ func TestDownsampleMergerResetClosesAllReaders(t *testing.T) {
 func TestDownsampleMergerReadsIndexesOnce(t *testing.T) {
 	// 降采样源的每列包含两个 index，长 TSID 横跨这两个 index。
 	downsamplePart := newDownsampleIterationPart(t)
+	// 已存储的 1h fixture 特意与 base 内容不同；归并必须忽略它并从 base 重建。
 	want := readDownsampleTestPart(t, downsamplePart)
+	for key := range want {
+		if key.resolution != downsampleResolution5m {
+			delete(want, key)
+		}
+	}
+	var baseKeys []downsampleTestKey
+	for key := range want {
+		baseKeys = append(baseKeys, key)
+	}
+	sort.Slice(baseKeys, func(i, j int) bool {
+		if baseKeys[i].tsid != baseKeys[j].tsid {
+			return baseKeys[i].tsid.Less(&baseKeys[j].tsid)
+		}
+		return baseKeys[i].bucket < baseKeys[j].bucket
+	})
+	for _, key := range baseKeys {
+		point := want[key]
+		coarseKey := downsampleTestKey{key.tsid, downsampleResolution1h, point.timestamp / downsampleResolution1h}
+		previous, exists := want[coarseKey]
+		if exists {
+			point.values[downsampleFeatureSum] += previous.values[downsampleFeatureSum]
+			point.values[downsampleFeatureCount] += previous.values[downsampleFeatureCount]
+			point.values[downsampleFeatureMin] = math.Min(point.values[downsampleFeatureMin], previous.values[downsampleFeatureMin])
+			point.values[downsampleFeatureMax] = math.Max(point.values[downsampleFeatureMax], previous.values[downsampleFeatureMax])
+		}
+		want[coarseKey] = point
+	}
 	const base int64 = 1704067200000
 	var rawRows []rawRow
 	for metricID := uint64(1); metricID <= 3; metricID++ {
@@ -671,20 +953,20 @@ func TestDownsampleMergerReadsIndexesOnce(t *testing.T) {
 	}
 	var w downsampleWriter
 	path := filepath.Join(t.TempDir(), "output")
-	if err := w.Init(path, 1); err != nil {
+	if err := w.Init(path, 1, downsampleTestConfig(t)); err != nil {
 		t.Fatal(err)
 	}
 	defer w.Abort()
 	// 使用与 Merge 相同的收集和聚合入口，在初始化后观察各源的真实 index 读取。
 	m := downsampleMerger{partWriter: &w, currentSourceBlock: getDownsampleDecodedResolutionFeaturesBlock()}
 	defer m.reset()
-	for _, resolution := range downsampleResolutions {
+	for _, resolution := range []int64{downsampleResolution5m} {
 		if err := m.initSources(sources, resolution); err != nil {
 			t.Fatal(err)
 		}
 		var indexFiles []*downsampleIndexReadTestFile
 		var expectedOffsets [][]int64
-		for _, reader := range m.currentResolutionReaders {
+		for _, reader := range m.baseResolutionReaders {
 			p := reader.currentSourcePart
 			if p.path == "" {
 				continue
@@ -707,10 +989,10 @@ func TestDownsampleMergerReadsIndexesOnce(t *testing.T) {
 			indexFiles = append(indexFiles, file)
 			expectedOffsets = append(expectedOffsets, offsets)
 		}
-		for len(m.currentResolutionReaderHeap) > 0 {
-			tsid := m.currentResolutionReaderHeap[0].Header().TSID
+		for len(m.baseResolutionReaderHeap) > 0 {
+			tsid := m.baseResolutionReaderHeap[0].Header().TSID
 			isDeleted := deleted.Has(tsid.MetricID)
-			tr, err := m.collectSources(&tsid, resolution, isDeleted)
+			tr, err := m.collectSources(&tsid, isDeleted)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -760,7 +1042,7 @@ func TestDownsampleMergerReadsIndexesOnce(t *testing.T) {
 	}
 	var sourceRows uint64
 	for _, source := range sources {
-		sourceRows += source.p.ph.RowsCount
+		sourceRows += downsampleBasePhysicalRowsForTest(source.p)
 	}
 	if m.mergeStats.rowsMerged+m.mergeStats.rowsDeleted != sourceRows {
 		t.Fatalf("source rows were lost or counted twice: %+v; want %d", m.mergeStats, sourceRows)
@@ -768,19 +1050,35 @@ func TestDownsampleMergerReadsIndexesOnce(t *testing.T) {
 	if err := m.reset(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Finish(); err != nil {
+	if _, err := w.Finish(nil); err != nil {
 		t.Fatal(err)
 	}
-	output, err := openDownsamplePart(path)
+	output, err := openDownsamplePart(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer output.MustClose()
-	assertDownsampleTestRows(t, readDownsampleTestPart(t, output), want)
+	got := readDownsampleTestPart(t, output)
+	if len(got) != len(want) {
+		t.Fatalf("got %d rows; want %d", len(got), len(want))
+	}
+	for key, expected := range want {
+		actual, exists := got[key]
+		if !exists || actual.timestamp != expected.timestamp || actual.precisionBits != expected.precisionBits {
+			t.Fatalf("unexpected sample at %+v", key)
+		}
+		for feature, value := range expected.values {
+			// 大数经原生 decimal 编解码会有末位舍入；本测试检查索引只读一次及正确选源。
+			tolerance := 4 * math.Abs(math.Nextafter(value, math.Inf(1))-value)
+			if math.Abs(actual.values[feature]-value) > tolerance {
+				t.Fatalf("wrong feature %d at %+v: got %g; want %g", feature, key, actual.values[feature], value)
+			}
+		}
+	}
 }
 
 func TestDownsampleMergerClosesBeforeReturning(t *testing.T) {
-	for _, scenario := range []string{"success", "close_error", "write_and_close_error", "cancel_and_close_error"} {
+	for _, scenario := range []string{"success", "read_failure", "cancel"} {
 		t.Run(scenario, func(t *testing.T) {
 			const base int64 = 1704067200000
 			mp := getInmemoryPart()
@@ -790,96 +1088,39 @@ func TestDownsampleMergerClosesBeforeReturning(t *testing.T) {
 			putInmemoryPart(mp)
 			p := mustOpenFilePart(sourcePath)
 			defer p.MustClose()
+			if scenario == "read_failure" {
+				if err := os.WriteFile(filepath.Join(sourcePath, indexFilename), []byte("corrupt"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			var m downsampleMerger
-			defer m.reset()
 			var w downsampleWriter
-			targetPath := filepath.Join(t.TempDir(), "target")
-			if err := w.Init(targetPath, 1); err != nil {
+			if err := w.Init(filepath.Join(t.TempDir(), "target"), 1, downsampleTestConfig(t)); err != nil {
 				t.Fatal(err)
 			}
 			defer w.Abort()
 			stopCh := make(chan struct{})
-			writeErr := errors.New("injected output write failure")
-			var files []filestream.ReadAtCloser
-			var closeNames []string
-			var activeReaders []*downsampleReader
-			w.timestampsWriter = &downsampleCloseTestWriter{WriteCloser: w.timestampsWriter, beforeWrite: func() error {
-				if w.currentResolution != downsampleResolution1h || files != nil {
-					return nil
-				}
-				// The last output batch is already read. Wrap the actual source files
-				// to inject cleanup errors and count every Close without changing reads.
-				if len(m.currentResolutionReaderHeap) != 0 || len(m.currentResolutionReaders) != 1 || m.currentResolutionReaders[0].currentSourcePart != p {
-					t.Fatal("exhausted source reader must leave the heap but remain owned until cleanup")
-				}
-				if len(m.currentTSIDReaders) != 1 || m.currentTSIDReaders[0] != m.currentResolutionReaders[0] {
-					t.Fatal("active reader must borrow the same instance held by the complete readers list")
-				}
-				activeReaders = m.currentTSIDReaders
-				readers := m.currentResolutionReaders
-				for _, r := range readers {
-					timestamps := &downsampleCloseTestFile{ReadAtCloser: r.timestampsReader}
-					r.timestampsReader = timestamps
-					r.valuesReader = &downsampleCloseTestFile{ReadAtCloser: r.valuesReader}
-					r.indexReader = &downsampleCloseTestFile{ReadAtCloser: r.indexReader}
-					files = append(files, r.timestampsReader, r.valuesReader, r.indexReader)
-					if scenario != "success" {
-						closeNames = append(closeNames, timestamps.Path())
-						timestamps.closeErr = os.ErrClosed
-					}
-				}
-				if scenario == "write_and_close_error" {
-					return writeErr
-				}
-				if scenario == "cancel_and_close_error" {
-					close(stopCh)
-				}
-				return nil
-			}}
+			if scenario == "cancel" {
+				close(stopCh)
+			}
 			stats, err := m.Merge([]*partWrapper{{p: p}}, &w, stopCh, nil, 0)
-			if len(files) != 3 {
-				t.Fatal("test did not reach the final batch with the source reader")
+			if (err == nil) != (scenario == "success") {
+				t.Fatalf("unexpected merge result: %v", err)
 			}
-			assertDownsampleFilesClosed(t, files)
-			if len(m.currentResolutionReaders) != 0 || len(m.currentTSIDReaders) != 0 || len(m.currentResolutionReaderHeap) != 0 {
-				t.Fatal("Merge returned with live readers")
+			if scenario == "cancel" && !errors.Is(err, errForciblyStopped) {
+				t.Fatalf("lost cancellation: %v", err)
 			}
-			for _, r := range activeReaders {
-				if r != nil {
-					t.Fatal("Merge left a returned reader in the active readers backing array")
-				}
-			}
-			if stats.rowsMerged != 1 || m.mergeStats != (downsampleMergeStats{}) || m.stopCh != nil || m.currentSourceBlock != nil || m.partWriter != nil {
-				t.Fatalf("Merge lost returned statistics or retained task state: returned=%+v; retained=%+v", stats, m.mergeStats)
+			if len(m.baseResolutionReaders) != 0 || len(m.baseResolutionReaderHeap) != 0 || len(m.currentTSIDReaders) != 0 || m.currentSourceBlock != nil || m.partWriter != nil || m.stopCh != nil {
+				t.Fatal("Merge returned with retained reader or task state")
 			}
 			if scenario == "success" {
-				if err != nil {
+				if stats.rowsMerged != 1 {
+					t.Fatalf("lost merge statistics: %+v", stats)
+				}
+				if _, err := w.Finish(nil); err != nil {
 					t.Fatal(err)
 				}
-				// The caller still owns cancellation; Merge must not close its channel.
 				close(stopCh)
-			} else {
-				if !errors.Is(err, os.ErrClosed) {
-					t.Fatalf("Merge succeeded or lost cleanup error: %v", err)
-				}
-				for _, name := range closeNames {
-					if !strings.Contains(err.Error(), name) {
-						t.Fatalf("lost one reader's close failure: %v", err)
-					}
-				}
-				if scenario == "write_and_close_error" && !errors.Is(err, writeErr) {
-					t.Fatalf("cleanup hid output failure: %v", err)
-				}
-				if scenario == "cancel_and_close_error" && !errors.Is(err, errForciblyStopped) {
-					t.Fatalf("cleanup hid cancellation: %v", err)
-				}
-			}
-			// The owner aborts any unpublished output once Merge reports failure.
-			if err := w.Abort(); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := os.Stat(targetPath); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("Abort left the unpublished target: %v", err)
 			}
 		})
 	}
@@ -904,7 +1145,7 @@ func BenchmarkDownsampleMerge(b *testing.B) {
 				}
 				var sourceRows uint64
 				for _, source := range sources {
-					sourceRows += source.p.ph.RowsCount
+					sourceRows += downsampleBasePhysicalRowsForTest(source.p)
 				}
 				m := getDownsampleMerger()
 				defer putDownsampleMerger(m)
@@ -917,13 +1158,13 @@ func BenchmarkDownsampleMerge(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					path := filepath.Join(root, "output-"+strconv.Itoa(i))
 					b.StartTimer()
-					if err := w.Init(path, -5); err != nil {
+					if err := w.Init(path, -5, downsampleTestConfig(b)); err != nil {
 						b.Fatal(err)
 					}
 					if _, err := m.Merge(sources, w, nil, nil, 0); err != nil {
 						b.Fatal(err)
 					}
-					if _, err := w.Finish(); err != nil {
+					if _, err := w.Finish(nil); err != nil {
 						b.Fatal(err)
 					}
 					b.StopTimer()

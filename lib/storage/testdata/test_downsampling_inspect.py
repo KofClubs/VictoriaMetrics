@@ -43,7 +43,7 @@ def varint(value):
 class Fixture:
     """只编码固定磁盘字段，不复用被测 decoder 或 VictoriaMetrics 序列化。"""
 
-    def __init__(self, zstd, *, index_limit=2, zero=False, simple=False):
+    def __init__(self, zstd, *, index_limit=2, zero=False, simple=False, resolution_tenants=None):
         self.zstd = zstd
         self.indexes = []
         self.timestamps = bytearray()
@@ -57,9 +57,20 @@ class Fixture:
         identities = [(a, 0), (a, 4), (a, 8), (b, 0), (c, 0), (d, 0)]
         if simple:
             identities = [(a, 0)]
-        for resolution in (300000, 3600000):
+        if resolution_tenants is None:
+            resolution_tenants = {300000: {(7, 11), (7, 12), (8, 11)}, 3600000: {(7, 11), (7, 12), (8, 11)}}
+        self.resolutions = sorted(resolution_tenants)
+        tenant_extras = {}
+        for resolution in self.resolutions[1:]:
+            for tenant in resolution_tenants[resolution]:
+                tenant_extras.setdefault(tenant, []).append(str(resolution) + "ms")
+        self.config = {"base_resolution": str(self.resolutions[0]) + "ms", "tenant_resolutions": [
+            {"tenant": "%d:%d" % tenant, "resolutions": values} for tenant, values in sorted(tenant_extras.items())]}
+        for resolution in self.resolutions:
             timestamps = []
             for tsid, bucket in identities:
+                if tsid[:2] not in resolution_tenants[resolution]:
+                    continue
                 rows = 1 if zero or tsid == d else 3
                 minimum = 1704067200000 + bucket * resolution
                 maximum = minimum + (rows - 1) * resolution
@@ -136,9 +147,7 @@ class Fixture:
             maximum = high if maximum is None else max(maximum, high)
         metadata = {"RowsCount": physical_rows, "BlocksCount": physical_blocks,
                     "MinTimestamp": minimum, "MaxTimestamp": maximum, "MinDedupInterval": 0,
-                    "FormatVersion": 2, "SemanticsVersion": 2, "Mode": "downsampling",
-                    "Resolutions": [300000, 3600000], "BucketOrigin": 0,
-                    "NumericCodec": "decimal-values", "Retention": "bucket-end"}
+                    "downsampling_config": self.config}
         metadata.update(self.metadata_changes)
         (path / "metadata.json").write_text(json.dumps(metadata))
         (path / "metaindex.bin").write_bytes(self.frame(meta, b"VMDSMI"))
@@ -195,6 +204,92 @@ class InspectTests(unittest.TestCase):
         for item in summary["coverage_evidence"]["same_tsid_across_indexes"]:
             self.assertEqual(item["previous_feature"], item["next_feature"])
             self.assertEqual(item["previous_resolution"], item["next_resolution"])
+
+    def test_dynamic_sparse_tenant_resolutions_and_base_coverage(self):
+        layout = {30000: {(7, 11), (7, 12), (8, 11)}, 60000: {(7, 11)},
+                  90000: {(7, 12)}, 120000: {(7, 11)}}
+        fixture = Fixture(self.zstd, resolution_tenants=layout)
+        # 配置允许某个 extra，但实际没有写入该列，也是合法的稀疏 part。
+        fixture.config["tenant_resolutions"].append({"tenant": "8:11", "resolutions": ["5m"]})
+        report = self.parse(fixture)
+        self.assertEqual(report["resolutions_ms"], [30000, 60000, 90000, 120000])
+        self.assertEqual({key: len(value) for key, value in report["physical_tsids_by_resolution"].items()},
+                         {"30s": 4, "1m": 2, "90s": 1, "2m": 2})
+        self.assertFalse(report["physical_tsid_sets_equal_between_resolutions"])
+        self.assertTrue(report["extra_resolution_tsids_have_base"])
+        self.assertEqual(len(inspect.summarize([report])["partitions"][0]["physical_tsids_by_resolution"]), 4)
+        fixture = Fixture(self.zstd, resolution_tenants=layout)
+        for resolution, _, headers in fixture.indexes:
+            if resolution == 60000:
+                for header in headers:
+                    if int.from_bytes(header[24:32], "big") == 101:
+                        uint(header, 24, 8, 555)
+        self.reject(fixture, "缺少 base 数据")
+        fixture = Fixture(self.zstd, resolution_tenants=layout)
+        fixture.config["tenant_resolutions"] = []
+        self.reject(fixture, "不属于该租户配置")
+        fixture = Fixture(self.zstd, resolution_tenants=layout)
+        fixture.indexes = [entry for entry in fixture.indexes if entry[0] != 30000]
+        self.reject(fixture, "缺少基础分辨率")
+
+    def test_config_and_actual_resolution_validation(self):
+        fixture = Fixture(self.zstd)
+        fixture.write(self.path)
+        metadata = json.loads((self.path / "metadata.json").read_text())
+        for mutation in (
+            lambda value: value.pop("MinDedupInterval"),
+            lambda value: value.update(unexpected=1),
+            lambda value: value["downsampling_config"].update(base_resolution="0ms"),
+            lambda value: value["downsampling_config"]["tenant_resolutions"][0].update(resolutions=["7m"]),
+            lambda value: value["downsampling_config"]["tenant_resolutions"].append(
+                {"tenant": "7:11", "resolutions": ["1h"]}),
+        ):
+            malformed = copy.deepcopy(metadata)
+            mutation(malformed)
+            with self.assertRaises(ValueError):
+                inspect.validate_metadata(malformed)
+        for duration, milliseconds in (("5m0s", 300000), ("1h0m0s", 3600000), ("1.5s", 1500), ("1d", 86400000)):
+            self.assertEqual(inspect.resolution_ms(duration), milliseconds)
+        for duration in ("", "0ms", "-1m", "1.5ms", "1mgarbage"):
+            with self.assertRaises(ValueError):
+                inspect.resolution_ms(duration)
+
+    def test_metadata_configuration_is_the_only_format_marker(self):
+        raw = {"RowsCount": 3, "BlocksCount": 1, "MinTimestamp": 0,
+               "MaxTimestamp": 1, "MinDedupInterval": 15000}
+        self.assertFalse(inspect.validate_metadata(raw))
+        self.assertFalse(inspect.validate_metadata({**raw, "downsampling_config": None}))
+        for config in ({}, "5m", [], {"tenant_resolutions": []}):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                inspect.validate_metadata({**raw, "downsampling_config": config})
+        for malformed in ({}, {**raw, "RowsCount": 0}, {**raw, "MinTimestamp": 2}):
+            with self.subTest(metadata=malformed), self.assertRaises(ValueError):
+                inspect.validate_metadata(malformed)
+        fixture = Fixture(self.zstd)
+        fixture.write(self.path)
+        metadata = json.loads((self.path / "metadata.json").read_text())
+        self.assertEqual(set(metadata), {"RowsCount", "BlocksCount", "MinTimestamp", "MaxTimestamp",
+                                        "MinDedupInterval", "downsampling_config"})
+        self.assertTrue(inspect.validate_metadata(metadata))
+        for field in ("RowsCount", "BlocksCount", "MinTimestamp", "MaxTimestamp", "MinDedupInterval"):
+            for missing in (False, True):
+                malformed = copy.deepcopy(metadata)
+                if missing:
+                    malformed.pop(field)
+                else:
+                    malformed[field] = None
+                with self.subTest(field=field, missing=missing), self.assertRaises(ValueError):
+                    inspect.validate_metadata(malformed)
+        # 无配置或 null 的文件即使统计恰为五的倍数，文件检查器仍拒绝当成 DS 解析。
+        for missing in (False, True):
+            changed = copy.deepcopy(metadata)
+            if missing:
+                changed.pop("downsampling_config")
+            else:
+                changed["downsampling_config"] = None
+            (self.path / "metadata.json").write_text(json.dumps(changed))
+            with self.assertRaisesRegex(ValueError, "不是降采样格式"):
+                inspect.inspect_part("2024_01", self.path, self.zstd)
 
     def test_feature_switch_is_not_cross_index_coverage(self):
         for zero in (False, True):
@@ -322,6 +417,9 @@ class InspectTests(unittest.TestCase):
             with self.subTest(offset=offset, value=value):
                 fixture = Fixture(self.zstd)
                 uint(fixture.indexes[0][2][0], offset, width, value)
+                if offset == 80:
+                    # 保留合法的顶层统计，让错误确实进入原生 header 行数检查。
+                    fixture.metadata_changes["RowsCount"] = 160
                 self.reject(fixture, "无效|超出|大小矛盾|上限|codec")
 
     def test_cli_report_and_failed_coverage(self):

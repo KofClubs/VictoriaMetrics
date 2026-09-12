@@ -42,10 +42,13 @@ type partSearch struct {
 
 	// 当前查询分辨率和特征对应的剩余 metaindex；不持有 merge reader 或额外文件句柄。
 	dsMetaindex []downsampleMetaindexRow
+	// dsMetaindexRanges 按租户 TSID 顺序保存后续索引区间，各租户只选择一个已持久化的源分辨率。
+	dsMetaindexRanges [][]downsampleMetaindexRow
 }
 
 func (ps *partSearch) reset() {
 	ps.dsMetaindex = nil
+	ps.dsMetaindexRanges = nil
 	ps.BlockRef.reset()
 	ps.p = nil
 	ps.tsids = nil
@@ -89,15 +92,10 @@ func (ps *partSearch) Init(p *part, tsids []TSID, tr TimeRange, downsampleQuery 
 			ps.err = io.EOF
 			return
 		}
-		rows := p.dsMetaindex
-		start := sort.Search(len(rows), func(i int) bool {
-			return rows[i].ResolutionMs > downsampleQuery.ResolutionMs ||
-				(rows[i].ResolutionMs == downsampleQuery.ResolutionMs && rows[i].feature >= downsampleQuery.Feature)
-		})
-		end := start + sort.Search(len(rows)-start, func(i int) bool {
-			return rows[start+i].ResolutionMs > downsampleQuery.ResolutionMs || rows[start+i].feature > downsampleQuery.Feature
-		})
-		ps.dsMetaindex = rows[start:end]
+		if err := ps.initDownsampleQuery(downsampleQuery); err != nil {
+			ps.err = err
+			return
+		}
 	} else if p.dsMetadata != nil {
 		ps.err = io.EOF
 		return

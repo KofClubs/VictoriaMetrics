@@ -135,8 +135,16 @@ func (vms *VMStorage) InitSearch(qt *querytracer.Tracer, sq *storage.SearchQuery
 
 func (vms *VMStorage) initSearch(qt *querytracer.Tracer, sq *storage.SearchQuery, marshal marshalFunc, deadline uint64) (vmselectapi.BlockIterator, error) {
 	tr := sq.GetTimeRange()
+	filterTimeRange := tr
+	if sq.DownsampleQuery != nil {
+		var err error
+		filterTimeRange, err = sq.DownsampleQuery.SourceTimeRange(tr)
+		if err != nil {
+			return nil, err
+		}
+	}
 	maxMetrics := vms.getMaxMetrics(sq.MaxMetrics)
-	tfss, err := vms.setupTfss(qt, sq, tr, maxMetrics, deadline)
+	tfss, err := vms.setupTfss(qt, sq, filterTimeRange, maxMetrics, deadline)
 	if err != nil {
 		return nil, err
 	}

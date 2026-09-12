@@ -35,12 +35,16 @@ type downsampleReader struct {
 	currentResolutionFeatureIndexes [countOfDownsampleFeatures]downsampleIndexCursor
 	// currentTSIDBlockHeaders 按值保存首次顺序扫描得到的当前 TSID 首列 header，供确定完整时间范围后直接读取；消费后清空，Close 时释放容量。
 	currentTSIDBlockHeaders []blockHeader
+	// currentTSIDBlockHeadersMemory 由当前 merger 记录和归还 header 容量额度；Close 前由 merger 清零。
+	currentTSIDBlockHeadersMemory uint64
 	// currentBlockDecompressedPayload 复用单个时间戳或值 payload 的限长解压缓冲，不缓存整个文件。
 	currentBlockDecompressedPayload []byte
 	// currentFeatureBlock 复用当前特征的原生解码工作区；一次 ReadBlock 的五列共用其时间戳。
 	currentFeatureBlock Block
 	// readErr 保存当前索引遍历错误，使后续迭代停止；Init 开始新的分辨率扫描时清除。
 	readErr error
+	// stopCh 借用当前归并的取消信号，长距离跳过旧特征索引时也及时退出；Close 清除。
+	stopCh <-chan struct{}
 }
 
 // downsampleIndexCursor 仅保存一个特征当前 index block 的迭代和校验状态。
@@ -252,6 +256,9 @@ func (r *downsampleReader) readFeatureHeader(currentBlockHeader *blockHeader, fe
 	}
 	c := &r.currentResolutionFeatureIndexes[feature]
 	for c.currentBlockHeader.RowsCount == 0 || downsampleHeaderLess(&c.currentBlockHeader, h) {
+		if err := checkDownsampleStopped(r.stopCh); err != nil {
+			return blockHeader{}, err
+		}
 		if !c.nextHeader(r) {
 			if r.readErr != nil {
 				return blockHeader{}, r.readErr
@@ -279,6 +286,10 @@ func (c *downsampleIndexCursor) nextHeader(r *downsampleReader) bool {
 	previousBlockHeader := c.currentBlockHeader
 	c.currentBlockHeader = blockHeader{}
 	if r.readErr != nil || r.currentSourcePart == nil {
+		return false
+	}
+	if err := checkDownsampleStopped(r.stopCh); err != nil {
+		r.readErr = err
 		return false
 	}
 	if c.nextBlockHeader >= len(c.currentIndexBlockHeaders) {

@@ -69,7 +69,7 @@ def capture(server, stage, samples, base, summary):
         expected = {metric: aggregate(samples, metric, milliseconds) for metric in (METRIC, CONTROL_METRIC)}
         for feature in FEATURES:
             for query_type in ("matrix", "range"):
-                params = {"nocache": "1", "query.resolution": resolution, "query.feature": feature}
+                params = {"nocache": "1", "resolution": resolution, "feature": feature}
                 start = base + milliseconds - 1
                 if query_type == "matrix":
                     path = "/api/v1/query"

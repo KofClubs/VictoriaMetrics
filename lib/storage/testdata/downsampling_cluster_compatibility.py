@@ -85,11 +85,11 @@ def main():
                                                          name + ":native-range"))
                 if new_select:
                     params = {"query": metric + "[300001ms]", "time": (base + 300000) / 1000,
-                              "nocache": "1", "query.resolution": "5m", "query.feature": "sum"}
+                              "nocache": "1", "resolution": "5m", "feature": "sum"}
                     summary["checks"].append(assert_downsample_query_rejected(
                         server, "/api/v1/query", params, "unsupported-downsampling-v2-matrix"))
                     params = {"query": metric, "start": start / 1000, "end": end / 1000, "step": "16s",
-                              "nocache": "1", "query.resolution": "5m", "query.feature": "sum"}
+                              "nocache": "1", "resolution": "5m", "feature": "sum"}
                     summary["checks"].append(assert_downsample_query_rejected(
                         server, "/api/v1/query_range", params, "unsupported-downsampling-v2-range"))
             finally:
